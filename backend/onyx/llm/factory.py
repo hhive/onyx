@@ -93,6 +93,7 @@ def get_llm_for_persona(
         sub2api_llm = _get_sub2api_llm_for_user(
             user=user,
             db_session=db_session,
+            model_override=llm_override.model_version if llm_override else None,
             temperature=llm_override.temperature if llm_override else None,
             additional_headers=additional_headers,
         )
@@ -291,6 +292,7 @@ def llm_from_provider(
 def _get_sub2api_llm_for_user(
     user: User,
     db_session: Any,
+    model_override: str | None = None,
     timeout: int | None = None,
     temperature: float | None = None,
     additional_headers: dict[str, str] | None = None,
@@ -301,7 +303,7 @@ def _get_sub2api_llm_for_user(
 
     return get_llm(
         provider=LlmProviderNames.OPENAI_COMPATIBLE,
-        model=credential.text_model_name,
+        model=model_override or credential.text_model_name,
         deployment_name=None,
         api_key=credential.api_key.get_value(apply_mask=False),
         api_base=credential.api_base_url,

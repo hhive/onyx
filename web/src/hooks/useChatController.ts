@@ -78,6 +78,7 @@ import { useAppParams } from "@/hooks/appNavigation";
 import { projectFilesToFileDescriptors } from "@/app/app/services/fileUtils";
 
 const SYSTEM_MESSAGE_ID = -3;
+const GENERIC_CHAT_ERROR_MESSAGE = "There was an error with the response.";
 
 export interface OnSubmitProps {
   message: string;
@@ -1073,12 +1074,12 @@ export default function useChatController({
                         ...errorNode,
                         messageId:
                           assistantMessageIds[errorModelIndex] ?? undefined,
-                        message: streamingError.error,
+                        message: GENERIC_CHAT_ERROR_MESSAGE,
                         type: "error",
-                        stackTrace: streamingError.stack_trace || null,
-                        errorCode: streamingError.error_code || null,
+                        stackTrace: null,
+                        errorCode: null,
                         isRetryable: streamingError.is_retryable ?? true,
-                        errorDetails: streamingError.details || null,
+                        errorDetails: null,
                         overridden_model:
                           selectedModels?.[errorModelIndex]?.modelName,
                         modelDisplayName:
@@ -1105,17 +1106,17 @@ export default function useChatController({
                 continue;
               } else {
                 // Single-model: kill the stream
-                error = streamingError.error;
-                stackTrace = streamingError.stack_trace || null;
-                errorCode = streamingError.error_code || null;
+                error = GENERIC_CHAT_ERROR_MESSAGE;
+                stackTrace = null;
+                errorCode = null;
                 isRetryable = streamingError.is_retryable ?? true;
-                errorDetails = streamingError.details || null;
+                errorDetails = null;
 
-                setUncaughtError(frozenSessionId, streamingError.error);
+                setUncaughtError(frozenSessionId, GENERIC_CHAT_ERROR_MESSAGE);
                 updateChatStateAction(frozenSessionId, "input");
                 updateSubmittedMessage(getCurrentSessionId(), "");
 
-                throw new Error(streamingError.error);
+                throw new Error(GENERIC_CHAT_ERROR_MESSAGE);
               }
             } else if (Object.hasOwn(packet, "message_id")) {
               finalMessage = packet as BackendMessage;
@@ -1232,7 +1233,7 @@ export default function useChatController({
         streamSucceeded = true;
       } catch (e: any) {
         console.log("Error:", e);
-        const errorMsg = e.message;
+        const errorMsg = error || GENERIC_CHAT_ERROR_MESSAGE;
         const userErrorNode: Message = {
           nodeId: initialUserNode.nodeId,
           message: currMessage,

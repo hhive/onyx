@@ -48,12 +48,23 @@ async def exchange_sub2api_launch_token(
         ) from e
 
     try:
-        return Sub2APILaunchExchangeResponse.from_sub2api_payload(payload)
+        return Sub2APILaunchExchangeResponse.from_sub2api_payload(
+            _extract_exchange_payload(payload)
+        )
     except (KeyError, TypeError, ValidationError) as e:
         raise OnyxError(
             OnyxErrorCode.BAD_GATEWAY,
             "Sub2API exchange endpoint returned an invalid payload.",
         ) from e
+
+
+def _extract_exchange_payload(payload: dict) -> dict:
+    if "data" in payload:
+        data = payload["data"]
+        if not isinstance(data, dict):
+            raise TypeError("Sub2API exchange response data must be an object.")
+        return data
+    return payload
 
 
 def _upstream_error(response: httpx.Response) -> OnyxError:

@@ -38,8 +38,10 @@ from onyx.db.llm import upsert_llm_provider
 from onyx.db.llm import validate_persona_ids_exist
 from onyx.db.models import User
 from onyx.db.persona import user_can_access_persona
+from onyx.db.sub2api_user_credentials import get_sub2api_credential_for_user
 from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
+from onyx.llm.constants import LlmProviderNames
 from onyx.llm.constants import PROVIDER_DISPLAY_NAMES
 from onyx.llm.constants import WELL_KNOWN_PROVIDER_NAMES
 from onyx.llm.factory import get_default_llm
@@ -76,6 +78,7 @@ from onyx.server.manage.llm.models import LLMProviderView
 from onyx.server.manage.llm.models import LMStudioFinalModelResponse
 from onyx.server.manage.llm.models import LMStudioModelsRequest
 from onyx.server.manage.llm.models import ModelConfigurationUpsertRequest
+from onyx.server.manage.llm.models import ModelConfigurationView
 from onyx.server.manage.llm.models import OllamaFinalModelResponse
 from onyx.server.manage.llm.models import OllamaModelDetails
 from onyx.server.manage.llm.models import OllamaModelsRequest
@@ -104,12 +107,106 @@ logger = setup_logger()
 admin_router = APIRouter(prefix="/admin/llm")
 basic_router = APIRouter(prefix="/llm")
 
+SUB2API_PROVIDER_ID = -2001
+SUB2API_PROVIDER_NAME = "sub2api"
+SUB2API_PROVIDER_DISPLAY_NAME = "Sub2API"
+
 
 def _mask_string(value: str) -> str:
     """Mask a string, showing first 4 and last 4 characters."""
     if len(value) <= 8:
         return "****"
     return value[:4] + "****" + value[-4:]
+
+
+def _fetch_sub2api_model_configurations(credential: Any) -> list[ModelConfigurationView]:
+    models: list[ModelConfigurationView] = []
+    api_base = (credential.api_base_url or "").strip().rstrip("/")
+    if api_base:
+        try:
+            response = httpx.get(
+                f"{api_base}/models",
+                headers={
+                    "Authorization": (
+                        "Bearer "
+                        + credential.api_key.get_value(apply_mask=False)
+                    ),
+                },
+                timeout=5.0,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            for item in payload.get("data", []):
+                model_id = (item.get("id") or item.get("name") or "").strip()
+                if not model_id or is_embedding_model(model_id):
+                    continue
+                models.append(
+                    ModelConfigurationView(
+                        name=model_id,
+                        is_visible=True,
+                        max_input_tokens=item.get("context_length"),
+                        supports_image_input=infer_vision_support(model_id),
+                        supports_reasoning=is_reasoning_model(
+                            model_id,
+                            item.get("name", model_id),
+                        ),
+                        display_name=item.get("name") or model_id,
+                    )
+                )
+        except Exception as e:
+            logger.warning("Failed to fetch sub2api models: %s", e)
+
+    default_model = (credential.text_model_name or "").strip()
+    if default_model and all(model.name != default_model for model in models):
+        models.insert(
+            0,
+            ModelConfigurationView(
+                name=default_model,
+                is_visible=True,
+                max_input_tokens=None,
+                supports_image_input=False,
+                supports_reasoning=is_reasoning_model(default_model, default_model),
+                display_name=default_model,
+            ),
+        )
+    return models
+
+
+def _build_sub2api_provider_descriptor(
+    db_session: Session,
+    user: User,
+) -> LLMProviderDescriptor | None:
+    credential = get_sub2api_credential_for_user(db_session, user.id)
+    if credential is None:
+        return None
+
+    model_configurations = _fetch_sub2api_model_configurations(credential)
+    if not model_configurations:
+        return None
+
+    return LLMProviderDescriptor(
+        id=SUB2API_PROVIDER_ID,
+        name=SUB2API_PROVIDER_NAME,
+        provider=LlmProviderNames.OPENAI_COMPATIBLE,
+        provider_display_name=SUB2API_PROVIDER_DISPLAY_NAME,
+        model_configurations=model_configurations,
+    )
+
+
+def _sub2api_default_text(
+    provider: LLMProviderDescriptor | None,
+    db_session: Session,
+    user: User,
+) -> DefaultModel | None:
+    if provider is None:
+        return None
+    credential = get_sub2api_credential_for_user(db_session, user.id)
+    if credential is None:
+        return None
+    model_name = (credential.text_model_name or "").strip()
+    if not model_name:
+        return None
+    return DefaultModel(provider_id=SUB2API_PROVIDER_ID, model_name=model_name)
 
 
 def _resolve_api_key(
@@ -710,6 +807,10 @@ def list_llm_provider_basics(
         ):
             accessible_providers.append(LLMProviderDescriptor.from_model(provider))
 
+    sub2api_provider = _build_sub2api_provider_descriptor(db_session, user)
+    if sub2api_provider is not None:
+        accessible_providers.insert(0, sub2api_provider)
+
     end_time = datetime.now(timezone.utc)
     duration = (end_time - start_time).total_seconds()
     logger.debug(
@@ -718,8 +819,9 @@ def list_llm_provider_basics(
 
     return LLMProviderResponse[LLMProviderDescriptor].from_models(
         providers=accessible_providers,
-        default_text=DefaultModel.from_model_config(
-            fetch_default_llm_model(db_session)
+        default_text=(
+            _sub2api_default_text(sub2api_provider, db_session, user)
+            or DefaultModel.from_model_config(fetch_default_llm_model(db_session))
         ),
         default_vision=DefaultModel.from_model_config(
             fetch_default_vision_model(db_session)
@@ -758,6 +860,14 @@ def get_valid_model_names_for_persona(
             for model_config in llm_provider_model.model_configurations:
                 if model_config.is_visible:
                     valid_models.append(model_config.name)
+
+    sub2api_provider = _build_sub2api_provider_descriptor(db_session, user)
+    if sub2api_provider is not None:
+        valid_models.extend(
+            model.name
+            for model in sub2api_provider.model_configurations
+            if model.is_visible
+        )
 
     return valid_models
 
@@ -808,6 +918,10 @@ def list_llm_providers_for_persona(
                 LLMProviderDescriptor.from_model(llm_provider_model)
             )
 
+    sub2api_provider = _build_sub2api_provider_descriptor(db_session, user)
+    if sub2api_provider is not None:
+        llm_provider_list.insert(0, sub2api_provider)
+
     end_time = datetime.now(timezone.utc)
     duration = (end_time - start_time).total_seconds()
     logger.debug(
@@ -824,7 +938,10 @@ def list_llm_providers_for_persona(
 
     # Build default_text and default_vision using persona overrides when available,
     # falling back to the global defaults.
-    default_text = DefaultModel.from_model_config(default_text_model)
+    default_text = (
+        _sub2api_default_text(sub2api_provider, db_session, user)
+        or DefaultModel.from_model_config(default_text_model)
+    )
     default_vision = DefaultModel.from_model_config(default_vision_model)
 
     if persona_default_provider:

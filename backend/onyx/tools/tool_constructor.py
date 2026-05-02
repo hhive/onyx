@@ -23,8 +23,8 @@ from onyx.db.search_settings import get_current_search_settings
 from onyx.db.sub2api_user_credentials import get_sub2api_credential_for_user
 from onyx.db.tools import get_builtin_tool
 from onyx.document_index.factory import get_default_document_index
+from onyx.image_gen.factory import ImageGenerationProviderName
 from onyx.image_gen.interfaces import ImageGenerationProviderCredentials
-from onyx.llm.constants import LlmProviderNames
 from onyx.llm.interfaces import LLM
 from onyx.llm.interfaces import LLMConfig
 from onyx.onyxbot.slack.models import SlackContext
@@ -120,7 +120,7 @@ def _get_user_sub2api_image_generation_config(
         return None
 
     return LLMConfig(
-        model_provider=LlmProviderNames.OPENAI_COMPATIBLE,
+        model_provider=ImageGenerationProviderName.OPENAI.value,
         model_name=credential.image_model_name,
         temperature=GEN_AI_TEMPERATURE,
         api_key=credential.api_key.get_value(apply_mask=False),

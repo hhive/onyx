@@ -68,7 +68,6 @@ from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
 from onyx.file_store.file_store import get_default_file_store
 from onyx.llm.constants import LlmProviderNames
-from onyx.llm.factory import get_default_llm
 from onyx.llm.factory import get_llm_for_persona
 from onyx.llm.factory import get_llm_token_counter
 from onyx.secondary_llm_flows.chat_session_naming import generate_chat_session_name
@@ -130,7 +129,7 @@ def _get_available_tokens_for_persona(
             - default_reserved_tokens
         )
 
-    llm = get_llm_for_persona(persona=persona, user=user)
+    llm = get_llm_for_persona(persona=persona, user=user, db_session=db_session)
     token_counter = get_llm_token_counter(llm)
 
     if persona.replace_base_system_prompt and persona.system_prompt:
@@ -421,10 +420,13 @@ def rename_chat_session(
         )
         return RenameChatSessionResponse(new_name=name)
 
-    llm = get_default_llm(
+    llm = get_llm_for_persona(
+        persona=None,
+        user=user,
+        db_session=db_session,
         additional_headers=extract_headers(
             request.headers, LITELLM_PASS_THROUGH_HEADERS
-        )
+        ),
     )
 
     check_llm_cost_limit_for_provider(

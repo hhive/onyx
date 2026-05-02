@@ -1,7 +1,7 @@
 from types import SimpleNamespace
 from uuid import uuid4
 
-from onyx.llm.constants import LlmProviderNames
+from onyx.image_gen.factory import ImageGenerationProviderName
 from onyx.tools import tool_constructor
 
 
@@ -44,7 +44,7 @@ def test_get_user_sub2api_image_generation_config_uses_user_credential(
     )
 
     assert result is not None
-    assert result.model_provider == LlmProviderNames.OPENAI_COMPATIBLE
+    assert result.model_provider == ImageGenerationProviderName.OPENAI.value
     assert result.model_name == "gpt-image-2"
     assert result.api_key == "sk-image-user"
     assert result.api_base == "https://sub2api.example.com/v1"
@@ -165,7 +165,7 @@ def test_construct_tools_prefers_user_sub2api_image_generation_config(
     assert result[7] == created_tools
     assert len(created_tools) == 1
     image_tool = created_tools[0]
-    assert image_tool.provider == LlmProviderNames.OPENAI_COMPATIBLE
+    assert image_tool.provider == ImageGenerationProviderName.OPENAI.value
     assert image_tool.model == "gpt-image-2"
     assert image_tool.image_generation_credentials.api_key == "sk-image-user"
     assert (

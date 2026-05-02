@@ -1,7 +1,7 @@
 """add sub2api user credential
 
 Revision ID: 4f2b7c8d9e10
-Revises: c7bf5721733e
+Revises: 14162713706c
 Create Date: 2026-05-02 00:36:00.000000
 
 """
@@ -14,7 +14,7 @@ from onyx.db.models import EncryptedString
 
 # revision identifiers, used by Alembic.
 revision = "4f2b7c8d9e10"
-down_revision = "c7bf5721733e"
+down_revision = "14162713706c"
 branch_labels = None
 depends_on = None
 

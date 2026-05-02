@@ -54,6 +54,34 @@ async def test_exchange_sub2api_launch_token_posts_token_with_shared_secret() ->
 
 
 @pytest.mark.asyncio
+async def test_exchange_sub2api_launch_token_accepts_standard_sub2api_response() -> None:
+    response = MagicMock()
+    response.raise_for_status = MagicMock()
+    response.json = MagicMock(
+        return_value={
+            "code": 0,
+            "message": "success",
+            "data": _exchange_payload(),
+        }
+    )
+
+    fake_client = MagicMock()
+    fake_client.post = AsyncMock(return_value=response)
+    fake_client.__aenter__ = AsyncMock(return_value=fake_client)
+    fake_client.__aexit__ = AsyncMock(return_value=None)
+
+    with patch.object(sub2api_client.httpx, "AsyncClient", return_value=fake_client):
+        result = await exchange_sub2api_launch_token(
+            token="launch-token",
+            base_url="https://sub2api.example.com/",
+            exchange_secret="shared-secret",
+        )
+
+    assert result.user.id == 42
+    assert result.credential.api_key == "sk-sub2api"
+
+
+@pytest.mark.asyncio
 async def test_exchange_sub2api_launch_token_rejects_missing_configuration() -> None:
     with pytest.raises(OnyxError) as exc:
         await exchange_sub2api_launch_token(

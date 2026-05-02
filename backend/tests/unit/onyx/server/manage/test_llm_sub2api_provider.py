@@ -1,0 +1,70 @@
+from types import SimpleNamespace
+from uuid import uuid4
+
+from onyx.llm.constants import LlmProviderNames
+from onyx.server.manage.llm import api as llm_api
+
+
+class _Secret:
+    def __init__(self, value: str) -> None:
+        self.value = value
+
+    def get_value(self, apply_mask: bool) -> str:
+        assert apply_mask is False
+        return self.value
+
+
+def test_list_llm_provider_basics_includes_user_sub2api_models(monkeypatch) -> None:
+    user = SimpleNamespace(id=uuid4(), role="basic")
+    credential = SimpleNamespace(
+        api_key=_Secret("sk-user"),
+        api_base_url="https://sub2api.example.com/v1",
+        text_model_name="gpt-5.5",
+    )
+
+    monkeypatch.setattr(llm_api, "fetch_existing_llm_providers", lambda *_args: [])
+    monkeypatch.setattr(llm_api, "fetch_default_llm_model", lambda *_args: None)
+    monkeypatch.setattr(llm_api, "fetch_default_vision_model", lambda *_args: None)
+    monkeypatch.setattr(llm_api, "fetch_user_group_ids", lambda *_args: set())
+    monkeypatch.setattr(
+        llm_api,
+        "get_sub2api_credential_for_user",
+        lambda _db_session, user_id: credential if user_id == user.id else None,
+    )
+    monkeypatch.setattr(
+        llm_api,
+        "_fetch_sub2api_model_configurations",
+        lambda _credential: [
+            llm_api.ModelConfigurationView(
+                name="gpt-5.4",
+                is_visible=True,
+                max_input_tokens=None,
+                supports_image_input=False,
+                supports_reasoning=False,
+                display_name="gpt-5.4",
+            ),
+            llm_api.ModelConfigurationView(
+                name="gpt-5.5",
+                is_visible=True,
+                max_input_tokens=None,
+                supports_image_input=False,
+                supports_reasoning=False,
+                display_name="gpt-5.5",
+            ),
+        ],
+    )
+
+    response = llm_api.list_llm_provider_basics(user=user, db_session=object())
+
+    assert response.default_text is not None
+    assert response.default_text.provider_id == llm_api.SUB2API_PROVIDER_ID
+    assert response.default_text.model_name == "gpt-5.5"
+    assert len(response.providers) == 1
+    provider = response.providers[0]
+    assert provider.id == llm_api.SUB2API_PROVIDER_ID
+    assert provider.name == llm_api.SUB2API_PROVIDER_NAME
+    assert provider.provider == LlmProviderNames.OPENAI_COMPATIBLE
+    assert [model.name for model in provider.model_configurations] == [
+        "gpt-5.4",
+        "gpt-5.5",
+    ]

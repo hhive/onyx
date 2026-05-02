@@ -94,7 +94,7 @@ export default async function Page(props: PageProps) {
     <div className="flex flex-col ">
       <AuthFlowContainer
         authState="login"
-        footerContent={ssoLoginFooterContent}
+        footerContent={ssoLoginFooterContent ?? <></>}
       >
         <LoginPage
           authUrl={authUrl}
