@@ -699,6 +699,7 @@ def build_chat_turn(
             user=user,
             llm_override=override,
             additional_headers=litellm_additional_headers,
+            db_session=db_session,
         )
         check_llm_cost_limit_for_provider(
             db_session=db_session,

@@ -34,7 +34,7 @@
 # For a complete production setup, refer to docker-compose.prod.yml
 # =============================================================================
 
-name: onyx
+name: onyx1
 
 services:
   api_server:

@@ -87,6 +87,33 @@ def test_create_image_generation_config_from_provider(
     )
 
 
+def test_create_openai_compatible_custom_config_persists_model_and_api_base(
+    setup_image_generation_tests: tuple[DATestUser, DATestLLMProvider],
+) -> None:
+    """Test creating the single OpenAI-compatible custom image model config."""
+    admin_user, _ = setup_image_generation_tests
+
+    config = ImageGenerationConfigManager.create(
+        image_provider_id="openai_compatible_custom",
+        model_name="custom-image-model",
+        provider="openai",
+        api_key="sk-compatible-key-12345",
+        api_base="https://image-proxy.example.com/v1",
+        is_default=False,
+        user_performing_action=admin_user,
+    )
+
+    assert config.image_provider_id == "openai_compatible_custom"
+    assert config.model_name == "custom-image-model"
+
+    credentials = ImageGenerationConfigManager.get_credentials(
+        image_provider_id=config.image_provider_id,
+        user_performing_action=admin_user,
+    )
+    assert credentials["api_base"] == "https://image-proxy.example.com/v1"
+    assert credentials["api_key"] == "sk-c****2345"
+
+
 def test_create_duplicate_config_fails(
     setup_image_generation_tests: tuple[DATestUser, DATestLLMProvider],
 ) -> None:

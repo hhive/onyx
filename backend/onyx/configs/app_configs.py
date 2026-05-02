@@ -26,6 +26,18 @@ APP_PORT = 8080
 # prefix from requests directed towards the API server. In these cases, set this to `/api`
 APP_API_PREFIX = os.environ.get("API_PREFIX", "")
 
+SUB2API_INTEGRATION_ENABLED = (
+    os.environ.get("SUB2API_INTEGRATION_ENABLED", "").lower() == "true"
+)
+SUB2API_BASE_URL = os.environ.get("SUB2API_BASE_URL", "")
+SUB2API_EXCHANGE_SECRET = os.environ.get("SUB2API_EXCHANGE_SECRET", "")
+SUB2API_DEFAULT_TEXT_MODEL = os.environ.get("SUB2API_DEFAULT_TEXT_MODEL", "gpt-5.5")
+SUB2API_DEFAULT_IMAGE_MODEL = os.environ.get(
+    "SUB2API_DEFAULT_IMAGE_MODEL",
+    "gpt-image-2",
+)
+SUB2API_ONYX_REDIRECT_PATH = os.environ.get("SUB2API_ONYX_REDIRECT_PATH", "/chat")
+
 # Certain services need to make HTTP requests to the API server, such as the MCP server and Discord bot
 API_SERVER_PROTOCOL = os.environ.get("API_SERVER_PROTOCOL", "http")
 API_SERVER_HOST = os.environ.get("API_SERVER_HOST", "127.0.0.1")

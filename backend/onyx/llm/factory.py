@@ -14,6 +14,7 @@ from onyx.db.llm import fetch_llm_provider_view
 from onyx.db.llm import fetch_user_group_ids
 from onyx.db.models import Persona
 from onyx.db.models import User
+from onyx.db.sub2api_user_credentials import get_sub2api_credential_for_user
 from onyx.llm.constants import LlmProviderNames
 from onyx.llm.interfaces import LLM
 from onyx.llm.multi_llm import LitellmLLM
@@ -86,7 +87,18 @@ def get_llm_for_persona(
     user: User,
     llm_override: LLMOverride | None = None,
     additional_headers: dict[str, str] | None = None,
+    db_session: Any | None = None,
 ) -> LLM:
+    if db_session is not None:
+        sub2api_llm = _get_sub2api_llm_for_user(
+            user=user,
+            db_session=db_session,
+            temperature=llm_override.temperature if llm_override else None,
+            additional_headers=additional_headers,
+        )
+        if sub2api_llm is not None:
+            return sub2api_llm
+
     if persona is None:
         logger.warning("No persona provided, using default LLM")
         return get_default_llm()
@@ -273,6 +285,33 @@ def llm_from_provider(
         additional_headers=additional_headers,
         max_input_tokens=max_input_tokens,
         model_kwargs=model_kwargs,
+    )
+
+
+def _get_sub2api_llm_for_user(
+    user: User,
+    db_session: Any,
+    timeout: int | None = None,
+    temperature: float | None = None,
+    additional_headers: dict[str, str] | None = None,
+) -> LLM | None:
+    credential = get_sub2api_credential_for_user(db_session, user.id)
+    if credential is None:
+        return None
+
+    return get_llm(
+        provider=LlmProviderNames.OPENAI_COMPATIBLE,
+        model=credential.text_model_name,
+        deployment_name=None,
+        api_key=credential.api_key.get_value(apply_mask=False),
+        api_base=credential.api_base_url,
+        api_version=None,
+        custom_config=None,
+        timeout=timeout,
+        temperature=temperature,
+        additional_headers=additional_headers,
+        max_input_tokens=128000,
+        model_kwargs={},
     )
 
 

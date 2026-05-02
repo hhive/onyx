@@ -1,14 +1,23 @@
 import React from "react";
 import { ImageGenFormBaseProps } from "@/refresh-pages/admin/ImageGenerationPage/forms/types";
 import { OpenAIImageGenForm } from "@/refresh-pages/admin/ImageGenerationPage/forms/OpenAIImageGenForm";
+import { OpenAICompatibleImageGenForm } from "@/refresh-pages/admin/ImageGenerationPage/forms/OpenAICompatibleImageGenForm";
 import { AzureImageGenForm } from "@/refresh-pages/admin/ImageGenerationPage/forms/AzureImageGenForm";
 import { VertexImageGenForm } from "@/refresh-pages/admin/ImageGenerationPage/forms/VertexImageGenForm";
+
+const OPENAI_COMPATIBLE_IMAGE_PROVIDER_ID = "openai_compatible_custom";
 
 /**
  * Factory function that routes to the correct provider-specific form
  * based on the imageProvider.provider_name.
  */
 export function getImageGenForm(props: ImageGenFormBaseProps): React.ReactNode {
+  if (
+    props.imageProvider.image_provider_id === OPENAI_COMPATIBLE_IMAGE_PROVIDER_ID
+  ) {
+    return <OpenAICompatibleImageGenForm {...props} />;
+  }
+
   const providerName = props.imageProvider.provider_name;
 
   switch (providerName) {

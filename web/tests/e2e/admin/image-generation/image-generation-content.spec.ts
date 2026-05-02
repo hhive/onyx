@@ -10,6 +10,7 @@ const PROVIDERS = [
   { id: "openai_gpt_image_1_5", title: "GPT Image 1.5" },
   { id: "openai_gpt_image_1", title: "GPT Image 1" },
   { id: "openai_dalle_3", title: "DALL-E 3" },
+  { id: "openai_compatible_custom", title: "OpenAI Compatible" },
   { id: "azure_dalle_3", title: "Azure OpenAI DALL-E 3" },
 ];
 
@@ -80,6 +81,74 @@ test.describe("Image Generation Provider Configuration", () => {
     console.log(
       "[image-gen-test] All provider modals opened and closed successfully"
     );
+  });
+
+  test("should configure OpenAI Compatible with custom model credentials", async ({
+    page,
+  }) => {
+    let testRequestBody: Record<string, unknown> | null = null;
+    let createRequestBody: Record<string, unknown> | null = null;
+
+    await page.route("**/api/admin/image-generation/test", async (route) => {
+      testRequestBody = route.request().postDataJSON();
+      await route.fulfill({ status: 200, json: {} });
+    });
+
+    await page.route("**/api/admin/image-generation/config", async (route) => {
+      if (route.request().method() === "POST") {
+        createRequestBody = route.request().postDataJSON();
+        await route.fulfill({
+          status: 200,
+          json: {
+            image_provider_id: "openai_compatible_custom",
+            model_configuration_id: 202,
+            model_name: "custom-image-model",
+            llm_provider_id: 303,
+            llm_provider_name: "Image Gen - openai_compatible_custom",
+            is_default: true,
+          },
+        });
+      } else {
+        await route.continue();
+      }
+    });
+
+    await openProviderModal(page, "openai_compatible_custom");
+
+    const modalDialog = page.getByRole("dialog", {
+      name: /connect openai compatible/i,
+    });
+    await expect(modalDialog).toBeVisible({ timeout: 10000 });
+
+    await modalDialog.getByLabel("Model Name").fill("custom-image-model");
+    await modalDialog
+      .getByLabel("Base URL")
+      .fill("https://image-proxy.example.com/v1");
+    await modalDialog.getByLabel("API Key").fill("sk-compatible-test-key");
+
+    const modalConnectButton = modalDialog.getByRole("button", {
+      name: "Connect",
+      exact: true,
+    });
+    await expect(modalConnectButton).toBeEnabled({ timeout: 5000 });
+    await modalConnectButton.click();
+
+    await expect.poll(() => testRequestBody).not.toBeNull();
+    await expect.poll(() => createRequestBody).not.toBeNull();
+
+    expect(testRequestBody).toMatchObject({
+      provider: "openai",
+      model_name: "custom-image-model",
+      api_base: "https://image-proxy.example.com/v1",
+      api_key: "sk-compatible-test-key",
+    });
+    expect(createRequestBody).toMatchObject({
+      image_provider_id: "openai_compatible_custom",
+      provider: "openai",
+      model_name: "custom-image-model",
+      api_base: "https://image-proxy.example.com/v1",
+      api_key: "sk-compatible-test-key",
+    });
   });
 
   test.describe("OpenAI DALL-E 3 Configuration", () => {

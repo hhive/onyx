@@ -5,9 +5,12 @@ This module loads model metadata enrichments before running tests
 so that the model_name_parser has access to the enriched data.
 """
 
+import os
 from collections.abc import Generator
 
 import pytest
+
+os.environ.setdefault("ONYX_SKIP_LITELLM_INIT", "true")
 
 from onyx.llm.litellm_singleton.config import load_model_metadata_enrichments
 from onyx.llm.model_name_parser import parse_litellm_model_name

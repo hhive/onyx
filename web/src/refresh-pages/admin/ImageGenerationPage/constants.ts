@@ -46,6 +46,14 @@ export const IMAGE_PROVIDER_GROUPS: ProviderGroup[] = [
         description:
           "OpenAI image generation model capable of generating rich and expressive images.",
       },
+      {
+        image_provider_id: "openai_compatible_custom",
+        model_name: "",
+        provider_name: "openai",
+        title: "OpenAI Compatible",
+        description:
+          "Connect a custom image model through an OpenAI Images API-compatible endpoint.",
+      },
     ],
   },
   {
