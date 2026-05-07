@@ -37,6 +37,7 @@ from onyx.llm.constants import LlmProviderNames
 from onyx.llm.interfaces import LLM
 from onyx.llm.interfaces import LLMUserIdentity
 from onyx.llm.interfaces import ToolChoiceOptions
+from onyx.llm.litellm_singleton.config import initialize_litellm
 from onyx.llm.utils import is_true_openai_model
 from onyx.prompts.chat_prompts import IMAGE_GEN_REMINDER
 from onyx.prompts.chat_prompts import OPEN_URL_REMINDER
@@ -646,11 +647,6 @@ def run_llm_loop(
             "chat_session_id": chat_session_id,
         },
     ):
-        # Fix some LiteLLM issues,
-        from onyx.llm.litellm_singleton.config import (
-            initialize_litellm,
-        )  # Here for lazy load LiteLLM
-
         initialize_litellm()
 
         # Normalize chat_files to a mutable list so we can extend it mid-loop

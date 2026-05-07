@@ -1179,6 +1179,7 @@ def _run_models(
                     all_injected_file_metadata=setup.all_injected_file_metadata,
                 )
             else:
+                token_counter = get_llm_token_counter(model_llm)
                 run_llm_loop(
                     emitter=model_emitter,
                     state_container=sc,
@@ -1189,7 +1190,7 @@ def _run_models(
                     persona=setup.persona,
                     user_memory_context=setup.user_memory_context,
                     llm=model_llm,
-                    token_counter=get_llm_token_counter(model_llm),
+                    token_counter=token_counter,
                     forced_tool_id=setup.forced_tool_id,
                     user_identity=setup.user_identity,
                     chat_session_id=str(setup.chat_session.id),

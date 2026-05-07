@@ -112,6 +112,28 @@ SUB2API_PROVIDER_NAME = "sub2api"
 SUB2API_PROVIDER_DISPLAY_NAME = "Sub2API"
 
 
+def _is_sub2api_embedding_model(model_id: str, model_type: str | None = None) -> bool:
+    """Filter embedding models without importing LiteLLM on the Sub2API list path."""
+    if isinstance(model_type, str) and model_type.lower() == "embedding":
+        return True
+
+    model_id_lower = model_id.lower()
+    return any(
+        pattern in model_id_lower
+        for pattern in (
+            "embed",
+            "embedding",
+            "bge-",
+            "e5-",
+            "jina-embeddings",
+            "mxbai-embed",
+            "text-similarity",
+            "text-search",
+            "voyage-",
+        )
+    )
+
+
 def _mask_string(value: str) -> str:
     """Mask a string, showing first 4 and last 4 characters."""
     if len(value) <= 8:
@@ -138,7 +160,10 @@ def _fetch_sub2api_model_configurations(credential: Any) -> list[ModelConfigurat
             payload = response.json()
             for item in payload.get("data", []):
                 model_id = (item.get("id") or item.get("name") or "").strip()
-                if not model_id or is_embedding_model(model_id):
+                if not model_id or _is_sub2api_embedding_model(
+                    model_id,
+                    item.get("mode") or item.get("type"),
+                ):
                     continue
                 models.append(
                     ModelConfigurationView(

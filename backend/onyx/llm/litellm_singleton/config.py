@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 
 import litellm
@@ -156,5 +157,6 @@ def load_model_metadata_enrichments() -> None:
 
 def initialize_litellm() -> None:
     configure_litellm_settings()
-    register_ollama_models()
+    if os.environ.get("ONYX_SKIP_LITELLM_OLLAMA_REGISTER", "").lower() != "true":
+        register_ollama_models()
     load_model_metadata_enrichments()

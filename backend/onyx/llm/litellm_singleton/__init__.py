@@ -9,9 +9,10 @@ import os
 import litellm
 
 from .config import initialize_litellm
-from .monkey_patches import apply_monkey_patches
 
 if os.environ.get("ONYX_SKIP_LITELLM_INIT", "").lower() != "true":
+    from .monkey_patches import apply_monkey_patches
+
     initialize_litellm()
     apply_monkey_patches()
 
