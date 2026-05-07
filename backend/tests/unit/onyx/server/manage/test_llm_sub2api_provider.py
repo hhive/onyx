@@ -39,7 +39,7 @@ def test_list_llm_provider_basics_includes_user_sub2api_models(monkeypatch) -> N
                 name="gpt-5.4",
                 is_visible=True,
                 max_input_tokens=None,
-                supports_image_input=False,
+                supports_image_input=True,
                 supports_reasoning=False,
                 display_name="gpt-5.4",
             ),
@@ -47,7 +47,7 @@ def test_list_llm_provider_basics_includes_user_sub2api_models(monkeypatch) -> N
                 name="gpt-5.5",
                 is_visible=True,
                 max_input_tokens=None,
-                supports_image_input=False,
+                supports_image_input=True,
                 supports_reasoning=False,
                 display_name="gpt-5.5",
             ),
@@ -68,3 +68,38 @@ def test_list_llm_provider_basics_includes_user_sub2api_models(monkeypatch) -> N
         "gpt-5.4",
         "gpt-5.5",
     ]
+    assert all(model.supports_image_input for model in provider.model_configurations)
+
+
+def test_fetch_sub2api_models_marks_all_non_embedding_models_vision_capable(
+    monkeypatch,
+) -> None:
+    credential = SimpleNamespace(
+        api_key=_Secret("sk-user"),
+        api_base_url="https://sub2api.example.com/v1",
+        text_model_name="fallback-model",
+    )
+
+    class _Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {
+                "data": [
+                    {"id": "gpt-5.5"},
+                    {"id": "claude-sonnet-4"},
+                    {"id": "text-embedding-3-large", "type": "embedding"},
+                ]
+            }
+
+    monkeypatch.setattr(llm_api.httpx, "get", lambda *_args, **_kwargs: _Response())
+
+    models = llm_api._fetch_sub2api_model_configurations(credential)
+
+    assert [model.name for model in models] == [
+        "fallback-model",
+        "gpt-5.5",
+        "claude-sonnet-4",
+    ]
+    assert all(model.supports_image_input for model in models)

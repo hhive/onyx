@@ -170,7 +170,7 @@ def _fetch_sub2api_model_configurations(credential: Any) -> list[ModelConfigurat
                         name=model_id,
                         is_visible=True,
                         max_input_tokens=item.get("context_length"),
-                        supports_image_input=infer_vision_support(model_id),
+                        supports_image_input=True,
                         supports_reasoning=is_reasoning_model(
                             model_id,
                             item.get("name", model_id),
@@ -189,7 +189,7 @@ def _fetch_sub2api_model_configurations(credential: Any) -> list[ModelConfigurat
                 name=default_model,
                 is_visible=True,
                 max_input_tokens=None,
-                supports_image_input=False,
+                supports_image_input=True,
                 supports_reasoning=is_reasoning_model(default_model, default_model),
                 display_name=default_model,
             ),

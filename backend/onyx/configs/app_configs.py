@@ -891,6 +891,30 @@ MAX_FILE_SIZE_BYTES = int(
     os.environ.get("MAX_FILE_SIZE_BYTES") or 2 * 1024 * 1024 * 1024
 )  # 2GB in bytes
 
+# User-uploaded file retention for no-vector-db/Lite deployments. The periodic
+# poller marks matching UserFile rows as DELETING and lets the existing delete
+# drain loop remove index records, stored file bytes, and plaintext copies.
+USER_FILE_RETENTION_CLEANUP_ENABLED = (
+    os.environ.get("USER_FILE_RETENTION_CLEANUP_ENABLED", "true").lower() == "true"
+)
+USER_FILE_RETENTION_DAYS = max(
+    0, int(os.environ.get("USER_FILE_RETENTION_DAYS") or 7)
+)
+USER_FILE_RETENTION_MAX_TOTAL_BYTES = max(
+    0,
+    int(os.environ.get("USER_FILE_RETENTION_MAX_TOTAL_BYTES") or 2 * 1024 * 1024 * 1024),
+)
+USER_FILE_RETENTION_TARGET_TOTAL_BYTES = max(
+    0,
+    int(
+        os.environ.get("USER_FILE_RETENTION_TARGET_TOTAL_BYTES")
+        or 1 * 1024 * 1024 * 1024
+    ),
+)
+USER_FILE_RETENTION_RUN_HOUR_UTC = min(
+    23, max(0, int(os.environ.get("USER_FILE_RETENTION_RUN_HOUR_UTC") or 4))
+)
+
 # Maximum embedded images allowed in a single file. PDFs (and other formats)
 # with thousands of embedded images can OOM the user-file-processing worker
 # because every image is decoded with PIL and then sent to the vision LLM.

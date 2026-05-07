@@ -237,6 +237,19 @@ def _construct_tools_impl(
                 tool_is_available = False
 
             if not tool_is_available:
+                has_user_sub2api_image_config = (
+                    tool_cls.__name__ == ImageGenerationTool.__name__
+                    and _get_user_sub2api_image_generation_config(
+                        llm=llm,
+                        db_session=db_session,
+                        user=user,
+                    )
+                    is not None
+                )
+                if has_user_sub2api_image_config:
+                    tool_is_available = True
+
+            if not tool_is_available:
                 logger.debug(
                     "Skipping tool %s because it is not available",
                     tool_cls.__name__,

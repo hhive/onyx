@@ -106,7 +106,7 @@ def test_construct_tools_prefers_user_sub2api_image_generation_config(
 
         @classmethod
         def is_available(cls, _db_session) -> bool:
-            return True
+            return False
 
     def get_built_in_tool_by_id(_tool_id):
         return FakeImageGenerationTool

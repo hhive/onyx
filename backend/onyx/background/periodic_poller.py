@@ -17,6 +17,12 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from dataclasses import field
+from datetime import datetime
+from datetime import timedelta
+from datetime import timezone
+from uuid import UUID
+
+from sqlalchemy import func
 
 from onyx.utils.logger import setup_logger
 
@@ -107,6 +113,135 @@ def _run_scheduled_eval() -> None:
 
 
 _CACHE_CLEANUP_INTERVAL_SECONDS = 300
+_USER_FILE_RETENTION_CHECK_INTERVAL_SECONDS = 60
+_USER_FILE_RETENTION_LAST_RUN_KV_KEY = (
+    "periodic_poller:user_file_retention_cleanup:last_run_date"
+)
+
+
+def select_user_file_ids_for_retention_cleanup(
+    *,
+    db_session,
+    retention_days: int,
+    max_total_bytes: int,
+    target_total_bytes: int,
+    now: datetime,
+) -> list[UUID]:
+    """Return user files to delete under age and total-size retention rules."""
+    from onyx.db.enums import UserFileStatus
+    from onyx.db.models import FileContent
+    from onyx.db.models import UserFile
+
+    cutoff = now - timedelta(days=retention_days)
+    rows = (
+        db_session.query(
+            UserFile.id,
+            UserFile.created_at,
+            func.coalesce(FileContent.file_size, 0).label("file_size"),
+        )
+        .outerjoin(FileContent, FileContent.file_id == UserFile.file_id)
+        .filter(UserFile.status.notin_([UserFileStatus.DELETING, UserFileStatus.FAILED]))
+        .order_by(UserFile.created_at.asc(), UserFile.id.asc())
+        .all()
+    )
+
+    selected_ids: list[UUID] = []
+    selected_id_set: set[UUID] = set()
+    remaining_total_bytes = sum(int(row.file_size or 0) for row in rows)
+
+    for row in rows:
+        created_at = row.created_at
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        if created_at < cutoff:
+            selected_ids.append(row.id)
+            selected_id_set.add(row.id)
+            remaining_total_bytes -= int(row.file_size or 0)
+
+    if max_total_bytes <= 0 or remaining_total_bytes <= max_total_bytes:
+        return selected_ids
+
+    target = min(target_total_bytes, max_total_bytes)
+    for row in rows:
+        if row.id in selected_id_set:
+            continue
+        selected_ids.append(row.id)
+        selected_id_set.add(row.id)
+        remaining_total_bytes -= int(row.file_size or 0)
+        if remaining_total_bytes <= target:
+            break
+
+    return selected_ids
+
+
+def _run_user_file_retention_cleanup() -> None:
+    from onyx.configs.app_configs import USER_FILE_RETENTION_CLEANUP_ENABLED
+    from onyx.configs.app_configs import USER_FILE_RETENTION_DAYS
+    from onyx.configs.app_configs import USER_FILE_RETENTION_MAX_TOTAL_BYTES
+    from onyx.configs.app_configs import USER_FILE_RETENTION_RUN_HOUR_UTC
+    from onyx.configs.app_configs import USER_FILE_RETENTION_TARGET_TOTAL_BYTES
+    from onyx.db.engine.sql_engine import get_session_with_current_tenant
+    from onyx.db.enums import UserFileStatus
+    from onyx.db.models import KVStore
+    from onyx.db.models import UserFile
+
+    if not USER_FILE_RETENTION_CLEANUP_ENABLED:
+        return
+
+    now = datetime.now(timezone.utc)
+    if now.hour != USER_FILE_RETENTION_RUN_HOUR_UTC:
+        return
+
+    with get_session_with_current_tenant() as db_session:
+        today = now.date().isoformat()
+        last_run_row = (
+            db_session.query(KVStore)
+            .filter_by(key=_USER_FILE_RETENTION_LAST_RUN_KV_KEY)
+            .first()
+        )
+        if last_run_row and last_run_row.value == today:
+            return
+
+        file_ids = select_user_file_ids_for_retention_cleanup(
+            db_session=db_session,
+            retention_days=USER_FILE_RETENTION_DAYS,
+            max_total_bytes=USER_FILE_RETENTION_MAX_TOTAL_BYTES,
+            target_total_bytes=USER_FILE_RETENTION_TARGET_TOTAL_BYTES,
+            now=now,
+        )
+        if not file_ids:
+            if last_run_row:
+                last_run_row.value = today
+            else:
+                db_session.add(
+                    KVStore(key=_USER_FILE_RETENTION_LAST_RUN_KV_KEY, value=today)
+                )
+            db_session.commit()
+            logger.info("Periodic poller - User file retention cleanup found no files")
+            return
+
+        (
+            db_session.query(UserFile)
+            .filter(UserFile.id.in_(file_ids))
+            .update(
+                {UserFile.status: UserFileStatus.DELETING},
+                synchronize_session=False,
+            )
+        )
+        if last_run_row:
+            last_run_row.value = today
+        else:
+            db_session.add(KVStore(key=_USER_FILE_RETENTION_LAST_RUN_KV_KEY, value=today))
+        db_session.commit()
+
+    logger.info(
+        f"Periodic poller - Marked {len(file_ids)} user file(s) for retention cleanup"
+    )
+    from shared_configs.contextvars import CURRENT_TENANT_ID_CONTEXTVAR
+
+    tenant_id = CURRENT_TENANT_ID_CONTEXTVAR.get()
+    if tenant_id:
+        _run_drain_loops(tenant_id)
 
 
 def _build_periodic_tasks() -> list[_PeriodicTaskDef]:
@@ -144,6 +279,14 @@ def _build_periodic_tasks() -> list[_PeriodicTaskDef]:
                 run_fn=_run_scheduled_eval,
             )
         )
+    tasks.append(
+        _PeriodicTaskDef(
+            name="user-file-retention-cleanup",
+            interval_seconds=_USER_FILE_RETENTION_CHECK_INTERVAL_SECONDS,
+            lock_id=PERIODIC_TASK_LOCK_BASE + 3,
+            run_fn=_run_user_file_retention_cleanup,
+        )
+    )
     return tasks
 
 

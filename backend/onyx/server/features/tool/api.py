@@ -14,6 +14,7 @@ from onyx.db.engine.sql_engine import get_session
 from onyx.db.enums import Permission
 from onyx.db.models import Tool
 from onyx.db.models import User
+from onyx.db.sub2api_user_credentials import get_sub2api_credential_for_user
 from onyx.db.tools import create_tool__no_commit
 from onyx.db.tools import delete_tool__no_commit
 from onyx.db.tools import get_tool_by_id
@@ -31,6 +32,9 @@ from onyx.tools.tool_implementations.custom.openapi_parsing import (
 )
 from onyx.tools.tool_implementations.custom.openapi_parsing import (
     validate_openapi_schema,
+)
+from onyx.tools.tool_implementations.images.image_generation_tool import (
+    ImageGenerationTool,
 )
 
 router = APIRouter(prefix="/tool")
@@ -250,7 +254,7 @@ def get_custom_tool(
 @router.get("", tags=PUBLIC_API_TAGS)
 def list_tools(
     db_session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.BASIC_ACCESS)),
+    user: User = Depends(require_permission(Permission.BASIC_ACCESS)),
 ) -> list[ToolSnapshot]:
     tools = get_tools(db_session, only_enabled=True, only_connected_mcp=True)
 
@@ -263,7 +267,20 @@ def list_tools(
         if tool.in_code_tool_id:
             try:
                 tool_cls = get_built_in_tool_by_id(tool.in_code_tool_id)
-                if not tool_cls.is_available(db_session):
+                tool_is_available = tool_cls.is_available(db_session)
+                if (
+                    not tool_is_available
+                    and tool.in_code_tool_id == ImageGenerationTool.__name__
+                ):
+                    credential = get_sub2api_credential_for_user(db_session, user.id)
+                    tool_is_available = bool(
+                        credential
+                        and credential.api_key
+                        and credential.api_base_url
+                        and credential.image_model_name
+                    )
+
+                if not tool_is_available:
                     continue
             except KeyError:
                 # If tool ID not found in registry, include it by default

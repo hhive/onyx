@@ -217,6 +217,12 @@ class TestInferVisionSupport:
         """Test Bifrost GPT-4o models are recognized as vision-capable."""
         assert infer_vision_support("openai/gpt-4o") is True
 
+    def test_openai_compatible_bare_gpt_models_have_vision(self) -> None:
+        """Test OpenAI-compatible model IDs without provider prefixes."""
+        assert infer_vision_support("gpt-4o") is True
+        assert infer_vision_support("gpt-4.1") is True
+        assert infer_vision_support("gpt-5.5") is True
+
     def test_mistral_no_vision(self) -> None:
         """Test Mistral doesn't have vision (not in known list)."""
         assert infer_vision_support("mistral.mistral-large") is False

@@ -502,6 +502,11 @@ class LitellmLLM(LLM):
 
         # Temperature
         temperature = 1 if is_reasoning else self._temperature
+        model_name_lower = (self.config.deployment_name or self.config.model_name).lower()
+        if model_name_lower.startswith("gpt-5") and not model_name_lower.startswith(
+            "gpt-5.1"
+        ):
+            temperature = 1
 
         if stream and not is_vertex_model_rejecting_output_config:
             optional_kwargs["stream_options"] = {"include_usage": True}
