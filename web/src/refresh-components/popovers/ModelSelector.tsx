@@ -131,7 +131,7 @@ export default function ModelSelector({
     <Popover open={open} onOpenChange={handleOpenChange}>
       <div
         data-testid="model-selector"
-        className="flex items-center justify-end gap-1 p-1"
+        className="flex min-w-0 max-w-full items-center justify-end gap-1 p-1"
       >
         {!atMax && (
           <Button
@@ -159,7 +159,7 @@ export default function ModelSelector({
                 className="h-5"
               />
             )}
-            <div className="flex items-center shrink-0">
+            <div className="flex min-w-0 items-center overflow-hidden">
               {selectedModels.map((model, index) => {
                 const ProviderIcon = getModelIcon(
                   model.provider,
@@ -173,7 +173,7 @@ export default function ModelSelector({
                         ? modelKey(model.provider, model.modelName)
                         : "single-model-pill"
                     }
-                    className="flex items-center"
+                    className="flex min-w-0 max-w-[12rem] items-center overflow-hidden"
                   >
                     {index > 0 && (
                       <Separator
@@ -188,6 +188,7 @@ export default function ModelSelector({
                       state="empty"
                       variant="select-input"
                       size="lg"
+                      width="full"
                       onClick={(e: React.MouseEvent) => {
                         if (isMultiModel) {
                           const target = e.target as HTMLElement;

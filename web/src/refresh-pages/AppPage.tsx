@@ -894,13 +894,15 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
                         ) &&
                         liveAgent &&
                         !llmManager.isLoadingProviders && (
-                          <ModelSelector
-                            llmManager={llmManager}
-                            selectedModels={multiModel.selectedModels}
-                            onAdd={multiModel.addModel}
-                            onRemove={multiModel.removeModel}
-                            onReplace={multiModel.replaceModel}
-                          />
+                          <div className="hidden sm:block">
+                            <ModelSelector
+                              llmManager={llmManager}
+                              selectedModels={multiModel.selectedModels}
+                              onAdd={multiModel.addModel}
+                              onRemove={multiModel.removeModel}
+                              onReplace={multiModel.replaceModel}
+                            />
+                          </div>
                         )}
                     </Section>
                     <Spacer rem={1.5} />
@@ -967,10 +969,15 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
                           isSearch ? "h-[14px]" : "h-0"
                         )}
                       />
-                      {appFocus.isChat() &&
+                      {(appFocus.isChat() || appFocus.isNewSession()) &&
                         liveAgent &&
                         !llmManager.isLoadingProviders && (
-                          <div className="pb-1">
+                          <div
+                            className={cn(
+                              "pb-1",
+                              appFocus.isNewSession() && "sm:hidden"
+                            )}
+                          >
                             <ModelSelector
                               llmManager={llmManager}
                               selectedModels={multiModel.selectedModels}

@@ -532,7 +532,7 @@ const AppInputBar = React.memo(
       <div
         {...(isSearchMode ? { inert: true } : {})}
         className={cn(
-          "flex justify-between items-center w-full",
+          "flex justify-between items-center w-full min-w-0 gap-1 overflow-hidden",
           isSearchMode
             ? "opacity-0 p-0 h-0 overflow-hidden pointer-events-none"
             : "opacity-100 p-1 h-[2.75rem] pointer-events-auto",
@@ -540,7 +540,7 @@ const AppInputBar = React.memo(
         )}
       >
         {/* Bottom left controls */}
-        <div className="flex flex-row items-center">
+        <div className="flex min-w-0 flex-1 flex-row items-center">
           {/* (+) button - always visible */}
           <FilePickerPopover
             onFileClick={handleFileClick}
@@ -578,7 +578,7 @@ const AppInputBar = React.memo(
           <div
             data-testid="actions-container"
             className={cn(
-              "flex flex-row items-center",
+              "flex min-w-0 flex-row items-center overflow-hidden",
               controlsLoading && "invisible"
             )}
           >
@@ -659,7 +659,7 @@ const AppInputBar = React.memo(
         </div>
 
         {/* Bottom right controls */}
-        <div className="flex flex-row items-center gap-1">
+        <div className="flex shrink-0 flex-row items-center gap-1">
           {showMicButton &&
             (sttEnabled ? (
               <MicrophoneButton
@@ -809,16 +809,16 @@ const AppInputBar = React.memo(
               </div>
             </div>
 
-            <div className="flex flex-row items-center w-full">
+            <div className="flex flex-row items-center w-full min-w-0">
               <Popover
                 open={user?.preferences?.shortcut_enabled && showPrompts}
                 onOpenChange={setShowPrompts}
               >
                 <Popover.Anchor asChild>
-                  <div
-                    ref={textAreaWrapperRef}
-                    className="px-3 py-2 flex-1 flex h-[2.75rem]"
-                  >
+                    <div
+                      ref={textAreaWrapperRef}
+                      className="px-3 py-2 flex-1 min-w-0 flex h-[2.75rem]"
+                    >
                     <textarea
                       id="onyx-chat-input-textarea"
                       role="textarea"
