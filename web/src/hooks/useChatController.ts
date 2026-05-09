@@ -80,6 +80,127 @@ import { projectFilesToFileDescriptors } from "@/app/app/services/fileUtils";
 const SYSTEM_MESSAGE_ID = -3;
 const GENERIC_CHAT_ERROR_MESSAGE = "There was an error with the response.";
 
+interface UserFacingChatError {
+  message: string;
+  category: string;
+  originalError: string;
+}
+
+function classifyChatError(rawError: unknown): UserFacingChatError {
+  const originalError =
+    rawError instanceof Error
+      ? rawError.message
+      : typeof rawError === "string"
+        ? rawError
+        : String(rawError ?? "");
+  const normalized = originalError.toLowerCase();
+
+  const matchAny = (patterns: string[]) =>
+    patterns.some((pattern) => normalized.includes(pattern));
+
+  if (
+    matchAny([
+      "insufficient balance",
+      "insufficient quota",
+      "quota exceeded",
+      "quota exhausted",
+      "余额不足",
+      "额度",
+      "balance",
+    ])
+  ) {
+    return {
+      message:
+        "Balance or quota is insufficient. Please top up or check your usage limit.",
+      category: "quota",
+      originalError,
+    };
+  }
+
+  if (
+    matchAny([
+      "unauthorized",
+      "invalid api key",
+      "incorrect api key",
+      "authentication",
+      "permission denied",
+      "forbidden",
+      "401",
+      "403",
+    ])
+  ) {
+    return {
+      message:
+        "The model service authentication failed. Please contact the administrator to check the API key or channel configuration.",
+      category: "auth",
+      originalError,
+    };
+  }
+
+  if (
+    matchAny([
+      "rate limit",
+      "too many requests",
+      "429",
+      "requests per minute",
+      "rpm",
+    ])
+  ) {
+    return {
+      message:
+        "The request was rate limited. Please wait a moment and try again.",
+      category: "rate_limit",
+      originalError,
+    };
+  }
+
+  if (
+    matchAny([
+      "timeout",
+      "timed out",
+      "deadline exceeded",
+      "connection reset",
+      "connection refused",
+      "temporarily unavailable",
+      "503",
+      "504",
+    ])
+  ) {
+    return {
+      message:
+        "The model service timed out or is temporarily unavailable. Please try again later.",
+      category: "unavailable",
+      originalError,
+    };
+  }
+
+  if (
+    matchAny([
+      "model not found",
+      "model_not_found",
+      "does not exist",
+      "model unavailable",
+      "unsupported model",
+      "no such model",
+      "404",
+    ])
+  ) {
+    return {
+      message:
+        "The selected model is unavailable. Please switch models or try again later.",
+      category: "model_unavailable",
+      originalError,
+    };
+  }
+
+  const suffix = originalError ? ` Reason: ${originalError.slice(0, 180)}` : "";
+  return {
+    message: `${GENERIC_CHAT_ERROR_MESSAGE}${suffix}`,
+    category: "unknown",
+    originalError,
+  };
+}
+
 export interface OnSubmitProps {
   message: string;
   //from chat input bar
@@ -1051,6 +1172,12 @@ export default function useChatController({
               (packet as any).error != null
             ) {
               const streamingError = packet as StreamingError;
+              const userFacingError = classifyChatError(streamingError.error);
+              const packetErrorDetails = {
+                ...(streamingError.details || {}),
+                category: userFacingError.category,
+                original_error: userFacingError.originalError,
+              };
 
               // In multi-model mode, route per-model errors to the specific model's
               // node instead of killing the entire stream. Other models keep streaming.
@@ -1074,12 +1201,15 @@ export default function useChatController({
                         ...errorNode,
                         messageId:
                           assistantMessageIds[errorModelIndex] ?? undefined,
-                        message: GENERIC_CHAT_ERROR_MESSAGE,
+                        message: userFacingError.message,
                         type: "error",
-                        stackTrace: null,
+                        stackTrace:
+                          streamingError.stack_trace ||
+                          userFacingError.originalError ||
+                          null,
                         errorCode: null,
                         isRetryable: streamingError.is_retryable ?? true,
-                        errorDetails: null,
+                        errorDetails: packetErrorDetails,
                         overridden_model:
                           selectedModels?.[errorModelIndex]?.modelName,
                         modelDisplayName:
@@ -1106,17 +1236,20 @@ export default function useChatController({
                 continue;
               } else {
                 // Single-model: kill the stream
-                error = GENERIC_CHAT_ERROR_MESSAGE;
-                stackTrace = null;
+                error = userFacingError.message;
+                stackTrace =
+                  streamingError.stack_trace ||
+                  userFacingError.originalError ||
+                  null;
                 errorCode = null;
                 isRetryable = streamingError.is_retryable ?? true;
-                errorDetails = null;
+                errorDetails = packetErrorDetails;
 
-                setUncaughtError(frozenSessionId, GENERIC_CHAT_ERROR_MESSAGE);
+                setUncaughtError(frozenSessionId, userFacingError.message);
                 updateChatStateAction(frozenSessionId, "input");
                 updateSubmittedMessage(getCurrentSessionId(), "");
 
-                throw new Error(GENERIC_CHAT_ERROR_MESSAGE);
+                throw new Error(userFacingError.message);
               }
             } else if (Object.hasOwn(packet, "message_id")) {
               finalMessage = packet as BackendMessage;
@@ -1233,7 +1366,14 @@ export default function useChatController({
         streamSucceeded = true;
       } catch (e: any) {
         console.log("Error:", e);
-        const errorMsg = error || GENERIC_CHAT_ERROR_MESSAGE;
+        const fallbackError = classifyChatError(e);
+        const errorMsg = error || fallbackError.message;
+        const resolvedStackTrace =
+          stackTrace || fallbackError.originalError || null;
+        const resolvedErrorDetails = errorDetails || {
+          category: fallbackError.category,
+          original_error: fallbackError.originalError,
+        };
         const userErrorNode: Message = {
           nodeId: initialUserNode.nodeId,
           message: currMessage,
@@ -1254,10 +1394,10 @@ export default function useChatController({
               type: "error" as const,
               packets: [],
               packetCount: 0,
-              stackTrace,
+              stackTrace: resolvedStackTrace,
               errorCode,
               isRetryable,
-              errorDetails,
+              errorDetails: resolvedErrorDetails,
               is_generating: false,
             })
           : [
@@ -1270,10 +1410,10 @@ export default function useChatController({
                 parentNodeId: initialUserNode.nodeId,
                 packets: [],
                 packetCount: 0,
-                stackTrace: stackTrace,
+                stackTrace: resolvedStackTrace,
                 errorCode: errorCode,
                 isRetryable: isRetryable,
-                errorDetails: errorDetails,
+                errorDetails: resolvedErrorDetails,
               },
             ];
 

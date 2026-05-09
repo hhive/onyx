@@ -134,6 +134,69 @@ def _is_sub2api_embedding_model(model_id: str, model_type: str | None = None) ->
     )
 
 
+def _model_capability_values(item: dict[str, Any]) -> set[str]:
+    capabilities = item.get("capabilities") or item.get("capability") or []
+    if isinstance(capabilities, str):
+        capabilities = [capabilities]
+    if isinstance(capabilities, dict):
+        capabilities = [
+            key for key, enabled in capabilities.items() if enabled is not False
+        ]
+    if not isinstance(capabilities, list):
+        return set()
+
+    return {str(capability).lower().replace("-", "_") for capability in capabilities}
+
+
+def _is_sub2api_image_generation_model(
+    model_id: str,
+    model_type: str | None = None,
+    item: dict[str, Any] | None = None,
+) -> bool:
+    """Filter image generation models out of the chat model selector."""
+    type_value = (
+        model_type.lower().replace("-", "_") if isinstance(model_type, str) else ""
+    )
+    if type_value in {
+        "image",
+        "images",
+        "image_generation",
+        "image_generation_model",
+    }:
+        return True
+
+    if item is not None:
+        capabilities = _model_capability_values(item)
+        if capabilities.intersection(
+            {
+                "image_generation",
+                "generate_image",
+                "image_output",
+                "text_to_image",
+            }
+        ):
+            return True
+
+    model_id_lower = model_id.lower()
+    return any(
+        pattern in model_id_lower
+        for pattern in (
+            "gpt-image",
+            "dall-e",
+            "imagen",
+            "flux",
+            "stable-diffusion",
+            "sdxl",
+            "midjourney",
+            "recraft",
+            "ideogram",
+            "seedream",
+            "kolors",
+            "wanx",
+        )
+    )
+
+
 def _mask_string(value: str) -> str:
     """Mask a string, showing first 4 and last 4 characters."""
     if len(value) <= 8:
@@ -160,9 +223,16 @@ def _fetch_sub2api_model_configurations(credential: Any) -> list[ModelConfigurat
             payload = response.json()
             for item in payload.get("data", []):
                 model_id = (item.get("id") or item.get("name") or "").strip()
+                model_type = item.get("mode") or item.get("type")
                 if not model_id or _is_sub2api_embedding_model(
                     model_id,
-                    item.get("mode") or item.get("type"),
+                    model_type,
+                ):
+                    continue
+                if _is_sub2api_image_generation_model(
+                    model_id,
+                    model_type,
+                    item,
                 ):
                     continue
                 models.append(

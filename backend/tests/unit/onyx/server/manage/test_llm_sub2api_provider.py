@@ -71,7 +71,7 @@ def test_list_llm_provider_basics_includes_user_sub2api_models(monkeypatch) -> N
     assert all(model.supports_image_input for model in provider.model_configurations)
 
 
-def test_fetch_sub2api_models_marks_all_non_embedding_models_vision_capable(
+def test_fetch_sub2api_models_filters_non_chat_models_and_marks_chat_models_vision_capable(
     monkeypatch,
 ) -> None:
     credential = SimpleNamespace(
@@ -90,6 +90,12 @@ def test_fetch_sub2api_models_marks_all_non_embedding_models_vision_capable(
                     {"id": "gpt-5.5"},
                     {"id": "claude-sonnet-4"},
                     {"id": "text-embedding-3-large", "type": "embedding"},
+                    {"id": "gpt-image-2", "type": "image"},
+                    {
+                        "id": "custom-image-model",
+                        "capabilities": ["image_generation"],
+                    },
+                    {"id": "dall-e-3"},
                 ]
             }
 
@@ -103,3 +109,15 @@ def test_fetch_sub2api_models_marks_all_non_embedding_models_vision_capable(
         "claude-sonnet-4",
     ]
     assert all(model.supports_image_input for model in models)
+
+
+def test_sub2api_image_generation_model_detection_uses_type_capabilities_and_name() -> None:
+    assert llm_api._is_sub2api_image_generation_model("model-a", "image")
+    assert llm_api._is_sub2api_image_generation_model(
+        "model-b",
+        None,
+        {"capabilities": {"image_generation": True}},
+    )
+    assert llm_api._is_sub2api_image_generation_model("gpt-image-2")
+    assert llm_api._is_sub2api_image_generation_model("dall-e-3")
+    assert not llm_api._is_sub2api_image_generation_model("gpt-5.5")
