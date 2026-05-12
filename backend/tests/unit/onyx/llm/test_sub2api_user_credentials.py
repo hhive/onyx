@@ -40,6 +40,7 @@ def test_get_sub2api_llm_for_user_uses_user_credential(monkeypatch) -> None:
         "get_llm",
         lambda **kwargs: calls.append(kwargs) or "llm",
     )
+    monkeypatch.setattr(factory, "SUB2API_LLM_BASE_URL", "")
 
     result = factory._get_sub2api_llm_for_user(user, db_session)
 
@@ -60,6 +61,39 @@ def test_get_sub2api_llm_for_user_uses_user_credential(monkeypatch) -> None:
             "model_kwargs": {},
         }
     ]
+
+
+def test_get_sub2api_llm_for_user_uses_internal_base_url_override(
+    monkeypatch,
+) -> None:
+    user = SimpleNamespace(id=uuid4())
+    credential = SimpleNamespace(
+        api_key=_Secret("sk-user"),
+        api_base_url="https://sub2api.example.com/v1",
+        text_model_name="gpt-5.5",
+    )
+    calls = []
+
+    monkeypatch.setattr(
+        factory,
+        "get_sub2api_credential_for_user",
+        lambda _session, _user_id: credential,
+    )
+    monkeypatch.setattr(
+        factory,
+        "get_llm",
+        lambda **kwargs: calls.append(kwargs) or "llm",
+    )
+    monkeypatch.setattr(
+        factory,
+        "SUB2API_LLM_BASE_URL",
+        "http://127.0.0.1:8080/v1",
+    )
+
+    result = factory._get_sub2api_llm_for_user(user, object())
+
+    assert result == "llm"
+    assert calls[0]["api_base"] == "http://127.0.0.1:8080/v1"
 
 
 def test_get_llm_for_persona_uses_selected_model_with_sub2api_credential(

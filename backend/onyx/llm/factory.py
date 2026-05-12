@@ -2,6 +2,7 @@ from collections.abc import Callable
 from typing import Any
 
 from onyx.auth.schemas import UserRole
+from onyx.configs.app_configs import SUB2API_LLM_BASE_URL
 from onyx.configs.model_configs import GEN_AI_TEMPERATURE
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.enums import LLMModelFlowType
@@ -301,12 +302,14 @@ def _get_sub2api_llm_for_user(
     if credential is None:
         return None
 
+    api_base = SUB2API_LLM_BASE_URL.strip() or credential.api_base_url
+
     return get_llm(
         provider=LlmProviderNames.OPENAI_COMPATIBLE,
         model=model_override or credential.text_model_name,
         deployment_name=None,
         api_key=credential.api_key.get_value(apply_mask=False),
-        api_base=credential.api_base_url,
+        api_base=api_base,
         api_version=None,
         custom_config=None,
         timeout=timeout,
