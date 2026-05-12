@@ -456,7 +456,20 @@ def rename_chat_session(
             "chat_session_id": str(chat_session_id),
         },
     ):
-        new_name = generate_chat_session_name(chat_history=simple_chat_history, llm=llm)
+        try:
+            new_name = generate_chat_session_name(
+                chat_history=simple_chat_history, llm=llm
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to generate chat session name. "
+                "Skipping automatic rename. model=%s api_base=%s error_type=%s error=%s",
+                llm.config.model_name,
+                llm.config.api_base,
+                type(e).__name__,
+                str(e),
+            )
+            return RenameChatSessionResponse(new_name="")
 
     update_chat_session(
         db_session=db_session,

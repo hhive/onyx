@@ -95,3 +95,66 @@ def test_rename_chat_session_uses_user_llm_when_name_generated(monkeypatch) -> N
 
     assert response.new_name == "generated name"
     assert updates[0]["description"] == "generated name"
+
+
+def test_rename_chat_session_skips_update_when_name_generation_fails(
+    monkeypatch,
+) -> None:
+    expected_db_session = object()
+    user = SimpleNamespace(id="user-id")
+    request = SimpleNamespace(headers={})
+    rename_req = SimpleNamespace(name=None, chat_session_id="chat-id")
+    expected_llm = SimpleNamespace(
+        config=SimpleNamespace(
+            api_key="sk-user",
+            model_name="gpt-5.5",
+            api_base="https://xiaoni-ai.top/v1",
+        )
+    )
+
+    monkeypatch.setattr(
+        chat_backend,
+        "get_llm_for_persona",
+        lambda **_kwargs: expected_llm,
+    )
+    monkeypatch.setattr(
+        chat_backend,
+        "check_llm_cost_limit_for_provider",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        chat_backend,
+        "create_chat_history_chain",
+        lambda **_kwargs: ["hello"],
+    )
+    monkeypatch.setattr(chat_backend, "get_llm_token_counter", lambda _llm: len)
+    monkeypatch.setattr(
+        chat_backend,
+        "convert_chat_history_basic",
+        lambda **kwargs: kwargs["chat_history"],
+    )
+
+    def generate_chat_session_name(*, chat_history, llm):
+        raise RuntimeError("OpenAIException - Your request was blocked.")
+
+    monkeypatch.setattr(
+        chat_backend,
+        "generate_chat_session_name",
+        generate_chat_session_name,
+    )
+    updates = []
+    monkeypatch.setattr(
+        chat_backend,
+        "update_chat_session",
+        lambda **kwargs: updates.append(kwargs),
+    )
+
+    response = chat_backend.rename_chat_session(
+        rename_req=rename_req,
+        request=request,
+        user=user,
+        db_session=expected_db_session,
+    )
+
+    assert response.new_name == ""
+    assert updates == []
