@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from onyx.auth.oauth_token_manager import OAuthTokenManager
 from onyx.chat.emitter import Emitter
 from onyx.configs.app_configs import DISABLE_VECTOR_DB
+from onyx.configs.app_configs import SUB2API_LLM_BASE_URL
 from onyx.configs.model_configs import GEN_AI_TEMPERATURE
 from onyx.context.search.models import BaseFilters
 from onyx.context.search.models import PersonaSearchInfo
@@ -119,12 +120,14 @@ def _get_user_sub2api_image_generation_config(
     if credential is None:
         return None
 
+    api_base = SUB2API_LLM_BASE_URL.strip() or credential.api_base_url
+
     return LLMConfig(
         model_provider=ImageGenerationProviderName.OPENAI.value,
         model_name=credential.image_model_name,
         temperature=GEN_AI_TEMPERATURE,
         api_key=credential.api_key.get_value(apply_mask=False),
-        api_base=credential.api_base_url,
+        api_base=api_base,
         api_version=None,
         deployment_name=credential.image_model_name,
         max_input_tokens=llm.config.max_input_tokens,

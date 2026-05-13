@@ -17,6 +17,8 @@ class _Secret:
 def test_get_user_sub2api_image_generation_config_uses_user_credential(
     monkeypatch,
 ) -> None:
+    monkeypatch.setattr(tool_constructor, "SUB2API_LLM_BASE_URL", "")
+
     user = SimpleNamespace(id=uuid4())
     credential = SimpleNamespace(
         api_key=_Secret("sk-image-user"),
@@ -53,9 +55,51 @@ def test_get_user_sub2api_image_generation_config_uses_user_credential(
     assert result.max_input_tokens == 8192
 
 
+def test_get_user_sub2api_image_generation_config_prefers_sub2api_llm_base_url(
+    monkeypatch,
+) -> None:
+    configured_base_url = " http://sub2api.internal:8080/v1 "
+    monkeypatch.setattr(
+        tool_constructor,
+        "SUB2API_LLM_BASE_URL",
+        configured_base_url,
+    )
+
+    user = SimpleNamespace(id=uuid4())
+    credential = SimpleNamespace(
+        api_key=_Secret("sk-image-user"),
+        api_base_url="https://sub2api.example.com/v1",
+        image_model_name="gpt-image-2",
+    )
+    llm = SimpleNamespace(config=SimpleNamespace(max_input_tokens=8192))
+    db_session = object()
+
+    def get_credential(session, user_id):
+        assert session is db_session
+        assert user_id == user.id
+        return credential
+
+    monkeypatch.setattr(
+        tool_constructor,
+        "get_sub2api_credential_for_user",
+        get_credential,
+    )
+
+    result = tool_constructor._get_user_sub2api_image_generation_config(
+        llm=llm,
+        db_session=db_session,
+        user=user,
+    )
+
+    assert result is not None
+    assert result.api_base == configured_base_url.strip()
+
+
 def test_construct_tools_prefers_user_sub2api_image_generation_config(
     monkeypatch,
 ) -> None:
+    monkeypatch.setattr(tool_constructor, "SUB2API_LLM_BASE_URL", "")
+
     user = SimpleNamespace(
         id=uuid4(),
         oauth_accounts=[],
