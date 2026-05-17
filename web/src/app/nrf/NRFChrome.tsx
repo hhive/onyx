@@ -14,6 +14,7 @@ import MinimalMarkdown from "@/components/chat/MinimalMarkdown";
 import { useSettingsContext } from "@/providers/SettingsProvider";
 import type { AppMode } from "@/providers/QueryControllerProvider";
 import useAppFocus from "@/hooks/useAppFocus";
+import { APP_DISPLAY_NAME } from "@/lib/constants";
 import { useQueryController } from "@/providers/QueryControllerProvider";
 import { usePaidEnterpriseFeaturesEnabled } from "@/components/settings/usePaidEnterpriseFeaturesEnabled";
 import { useSidebarState } from "@/layouts/sidebar-layouts";
@@ -71,9 +72,9 @@ export default function NRFChrome() {
 
   const customFooterContent =
     settings?.enterpriseSettings?.custom_lower_disclaimer_content ||
-    `[Onyx ${
+    `${APP_DISPLAY_NAME} ${
       settings?.webVersion || "dev"
-    }](https://www.onyx.app/) - Open Source AI Platform`;
+    } - Open Source AI Platform`;
 
   const showModeToggle =
     isPaidEnterpriseFeaturesEnabled &&

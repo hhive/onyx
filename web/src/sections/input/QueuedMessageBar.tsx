@@ -60,7 +60,7 @@ function QueuedMessageBar({
                 {showAwaitingLabel && (
                   <div className="flex-shrink-0 whitespace-nowrap">
                     <Text font="secondary-body" color="text-02">
-                      Select a response to continue
+                      选择一个回复后继续
                     </Text>
                   </div>
                 )}
@@ -70,13 +70,13 @@ function QueuedMessageBar({
                       ↵
                     </span>
                     <Text font="secondary-body" color="text-02">
-                      edit ·
+                      编辑 ·
                     </Text>
                     <span className="translate-y-[1.5px] text-text-02 text-[0.7rem]">
                       ⌫
                     </span>
                     <Text font="secondary-body" color="text-02">
-                      remove
+                      移除
                     </Text>
                   </div>
                 )}
@@ -84,7 +84,7 @@ function QueuedMessageBar({
                   icon={SvgTrash}
                   prominence="tertiary"
                   size="xs"
-                  tooltip="Remove queued message"
+                  tooltip="移除排队消息"
                   onClick={(e) => {
                     e.stopPropagation();
                     onDiscard(index);

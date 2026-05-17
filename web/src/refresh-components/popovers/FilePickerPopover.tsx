@@ -78,7 +78,7 @@ function FileLineItem({
           <IconButton
             icon={SvgExternalLink}
             onClick={noProp(() => onFileClick(projectFile))}
-            tooltip="View File"
+            tooltip="查看文件"
             disabled={disableActionButton}
             internal
             className="hidden group-hover/LineItem:flex"
@@ -127,10 +127,10 @@ function FilePickerPopoverContents({
         <LineItem
           key="upload-files"
           icon={SvgUploadSquare}
-          description="Upload a file from your device"
+          description="从你的设备上传文件"
           onClick={triggerUploadPicker}
         >
-          Upload Files
+          上传文件
         </LineItem>,
 
         // Separator
@@ -140,7 +140,7 @@ function FilePickerPopoverContents({
         hasFiles && (
           <div key="recent-files" className="pt-1">
             <Text as="p" text02 secondaryBody className="py-1 px-3">
-              Recent Files
+              最近文件
             </Text>
           </div>
         ),
@@ -158,7 +158,7 @@ function FilePickerPopoverContents({
         // Rest of the files
         shouldShowMoreFilesButton && (
           <LineItem icon={SvgMoreHorizontal} onClick={openRecentFilesModal}>
-            All Recent Files
+            全部最近文件
           </LineItem>
         ),
       ]}
@@ -212,7 +212,7 @@ export default function FilePickerPopover({
     deleteUserFile(file.id)
       .then((result) => {
         if (!result.has_associations) {
-          toast.success("File deleted successfully");
+          toast.success("文件已删除");
           setCurrentMessageFiles((prev) =>
             prev.filter((f) => f.id !== file.id)
           );
@@ -226,15 +226,15 @@ export default function FilePickerPopover({
           );
           let projects = result.project_names.join(", ");
           let assistants = result.assistant_names.join(", ");
-          let message = "Cannot delete file. It is associated with";
+          let message = "无法删除文件，它关联了";
           if (projects) {
-            message += ` projects: ${projects}`;
+            message += ` 项目：${projects}`;
           }
           if (projects && assistants) {
-            message += " and ";
+            message += " 和 ";
           }
           if (assistants) {
-            message += `assistants: ${assistants}`;
+            message += `智能体：${assistants}`;
           }
 
           toast.error(message);
@@ -245,7 +245,7 @@ export default function FilePickerPopover({
         setRecentFilesSnapshot((prev) =>
           prev.map((f) => (f.id === file.id ? { ...f, status: lastStatus } : f))
         );
-        toast.error("Failed to delete file. Please try again.");
+        toast.error("删除文件失败，请重试。");
         // Useful for debugging; safe in client components
         console.error("Failed to delete file", error);
       });
@@ -264,8 +264,8 @@ export default function FilePickerPopover({
 
       <recentFilesModal.Provider>
         <UserFilesModal
-          title="Recent Files"
-          description="Upload files or pick from your recent files."
+          title="最近文件"
+          description="上传文件或从最近文件中选择。"
           recentFiles={recentFilesSnapshot}
           onPickRecent={(file) => {
             onPickRecent && onPickRecent(file);

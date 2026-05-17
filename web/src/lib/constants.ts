@@ -12,6 +12,8 @@ export const HOST_URL = process.env.WEB_DOMAIN || "http://localhost:3000";
 
 export const INTERNAL_URL = process.env.INTERNAL_URL || "http://localhost:8080";
 
+export const APP_DISPLAY_NAME = "小逆talk";
+
 // Documentation URLs
 export const DOCS_BASE_URL = "https://docs.onyx.app";
 export const DOCS_ADMINS_PATH = `${DOCS_BASE_URL}/admins`;
@@ -98,10 +100,10 @@ export const MAX_CHARACTERS_AGENT_DESCRIPTION = 500;
 export const MAX_STARTER_MESSAGES = 4;
 export const MAX_CHARACTERS_STARTER_MESSAGE = 200;
 export const STARTER_MESSAGES_EXAMPLES = [
-  "Give me an overview of some documents.",
-  "Find the latest sales report.",
-  "Compile a list of our engineering goals for this quarter.",
-  "Summarize my goals for today.",
+  "帮我概览这些文档。",
+  "查找最新的销售报告。",
+  "整理本季度的工程目标。",
+  "总结我今天的目标。",
 ];
 
 //Credential form data key constants
@@ -114,7 +116,7 @@ export const CREDENTIAL_JSON = "credential_json";
 
 export const MODAL_ROOT_ID = "modal-root";
 
-export const UNNAMED_CHAT = "New Chat";
+export const UNNAMED_CHAT = "新聊天";
 
 export const DEFAULT_AGENT_ID = 0;
 export const GENERAL_ASSISTANT_ID = -1;

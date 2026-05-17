@@ -30,7 +30,7 @@ export default function BackButton({
         }
       }}
     >
-      Back
+      返回
     </Button>
   );
 }

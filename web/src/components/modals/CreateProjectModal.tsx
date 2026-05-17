@@ -38,7 +38,7 @@ export default function CreateProjectModal({
       route({ projectId: newProject.id });
       modal.toggle(false);
     } catch (e) {
-      toast.error(`Failed to create the project ${name}`);
+      toast.error(`创建项目 ${name} 失败`);
     }
   }
 
@@ -50,26 +50,26 @@ export default function CreateProjectModal({
         <Modal.Content width="sm">
           <Modal.Header
             icon={SvgFolderPlus}
-            title="Create New Project"
-            description="Use projects to organize your files and chats in one place, and add custom instructions for ongoing work."
+            title="新建项目"
+            description="用项目集中整理文件和聊天，并为持续工作添加自定义指令。"
             onClose={() => modal.toggle(false)}
           />
           <Modal.Body>
-            <InputVertical title="Project Name" withLabel>
+            <InputVertical title="项目名称" withLabel>
               <InputTypeIn
                 value={projectName}
                 onChange={(e) => setProjectName(e.target.value)}
-                placeholder="What are you working on?"
+                placeholder="你正在做什么？"
                 showClearButton
               />
             </InputVertical>
           </Modal.Body>
           <Modal.Footer>
             <Button prominence="secondary" onClick={() => modal.toggle(false)}>
-              Cancel
+              取消
             </Button>
             <Button disabled={!projectName.trim()} onClick={handleSubmit}>
-              Create Project
+              创建项目
             </Button>
           </Modal.Footer>
         </Modal.Content>

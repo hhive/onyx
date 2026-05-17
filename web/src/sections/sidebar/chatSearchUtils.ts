@@ -37,7 +37,7 @@ export function formatDisplayTime(isoDate: string): string {
   const diffMs = now.getTime() - date.getTime();
 
   if (diffMs < 0) {
-    return "just now";
+    return "刚刚";
   }
 
   const diffMins = Math.floor(diffMs / (1000 * 60));
@@ -46,17 +46,17 @@ export function formatDisplayTime(isoDate: string): string {
 
   // Just now (less than 1 minute)
   if (diffMins < 1) {
-    return "just now";
+    return "刚刚";
   }
 
   // X mins ago (1-59 minutes)
   if (diffMins < 60) {
-    return `${diffMins} ${diffMins === 1 ? "min" : "mins"} ago`;
+    return `${diffMins} 分钟前`;
   }
 
   // X hours ago (1-23 hours)
   if (diffHours < 24) {
-    return `${diffHours} ${diffHours === 1 ? "hour" : "hours"} ago`;
+    return `${diffHours} 小时前`;
   }
 
   // Check if yesterday
@@ -67,16 +67,16 @@ export function formatDisplayTime(isoDate: string): string {
     date.getMonth() === yesterday.getMonth() &&
     date.getFullYear() === yesterday.getFullYear()
   ) {
-    return "yesterday";
+    return "昨天";
   }
 
   // X days ago (2-7 days)
   if (diffDays <= 7) {
-    return `${diffDays} ${diffDays === 1 ? "day" : "days"} ago`;
+    return `${diffDays} 天前`;
   }
 
   // Month Day format (e.g., "October 23")
-  return date.toLocaleDateString("en-US", {
+  return date.toLocaleDateString("zh-CN", {
     month: "long",
     day: "numeric",
   });

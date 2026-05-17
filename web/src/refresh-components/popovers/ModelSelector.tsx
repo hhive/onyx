@@ -138,7 +138,7 @@ export default function ModelSelector({
             prominence="tertiary"
             icon={SvgPlusCircle}
             size="sm"
-            tooltip="Add Model"
+            tooltip="添加模型"
             onClick={(e: React.MouseEvent) => {
               anchorRef.current = e.currentTarget as HTMLElement;
               setReplacingIndex(null);

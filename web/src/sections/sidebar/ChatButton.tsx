@@ -84,7 +84,7 @@ export function PopoverSearchInput({
         value={searchTerm}
         onChange={handleChange}
         onKeyDown={handleKeyDown}
-        placeholder="Search Projects"
+        placeholder="搜索项目"
         onClick={noProp()}
         variant="internal"
         autoFocus
@@ -193,7 +193,7 @@ const ChatButton = memo(
             sizePreset="main-ui"
             rounding="sm"
             icon={SvgShare}
-            title="Share"
+            title="分享"
             onClick={noProp(() => setShowShareModal(true))}
           />,
           <LineItemButton
@@ -201,7 +201,7 @@ const ChatButton = memo(
             sizePreset="main-ui"
             rounding="sm"
             icon={SvgEdit}
-            title="Rename"
+            title="重命名"
             onClick={noProp(() => setRenaming(true))}
           />,
           <LineItemButton
@@ -209,7 +209,7 @@ const ChatButton = memo(
             sizePreset="main-ui"
             rounding="sm"
             icon={SvgFolderIn}
-            title="Move to Project"
+            title="移动到项目"
             onClick={noProp(() => setShowMoveOptions(true))}
           />,
           project && (
@@ -218,7 +218,7 @@ const ChatButton = memo(
               sizePreset="main-ui"
               rounding="sm"
               icon={SvgFolder}
-              title={`Remove from ${project.name}`}
+              title={`从 ${project.name} 移除`}
               onClick={noProp(() => handleRemoveFromProject())}
             />
           ),
@@ -229,7 +229,7 @@ const ChatButton = memo(
             rounding="sm"
             color="danger"
             icon={SvgTrash}
-            title="Delete"
+            title="删除"
             onClick={noProp(() => setDeleteConfirmationModalOpen(true))}
           />,
         ];
@@ -264,7 +264,7 @@ const ChatButton = memo(
                   sizePreset="main-ui"
                   rounding="sm"
                   icon={SvgFolderPlus}
-                  title={`Create ${searchTerm.trim()}`}
+                  title={`创建 ${searchTerm.trim()}`}
                   onClick={noProp(() =>
                     handleCreateProjectAndMove(searchTerm.trim())
                   )}
@@ -321,7 +321,7 @@ const ChatButton = memo(
         await refreshChatSessions();
       } catch (error) {
         console.error("Failed to delete chat:", error);
-        showErrorNotification("Failed to delete chat. Please try again.");
+        showErrorNotification("删除聊天失败，请重试。");
       }
     }
 
@@ -394,7 +394,7 @@ const ChatButton = memo(
         setNavigateAfterMoveProjectId(null);
       } catch (error) {
         console.error("Failed to create project and move chat:", error);
-        showErrorNotification("Failed to create project. Please try again.");
+        showErrorNotification("创建项目失败，请重试。");
         setNavigateAfterMoveProjectId(null);
       }
     }
@@ -457,7 +457,7 @@ const ChatButton = memo(
       <>
         {deleteConfirmationModalOpen && (
           <ConfirmationModalLayout
-            title="Delete Chat"
+            title="删除聊天"
             icon={SvgTrash}
             onClose={() => setDeleteConfirmationModalOpen(false)}
             submit={
@@ -468,12 +468,11 @@ const ChatButton = memo(
                   handleChatDelete();
                 }}
               >
-                Delete
+                删除
               </Button>
             }
           >
-            Are you sure you want to delete this chat? This action cannot be
-            undone.
+            确定要删除这个聊天吗？此操作无法撤销。
           </ConfirmationModalLayout>
         )}
 

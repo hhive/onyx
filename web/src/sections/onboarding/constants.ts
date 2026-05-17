@@ -11,26 +11,26 @@ type StepConfig = {
 export const STEP_CONFIG: Record<OnboardingStep, StepConfig> = {
   [OnboardingStep.Welcome]: {
     index: 0,
-    title: "Let's take a moment to get you set up.",
-    buttonText: "Let's Go",
+    title: "花一点时间完成设置。",
+    buttonText: "开始",
     iconPercentage: 10,
   },
   [OnboardingStep.Name]: {
     index: 1,
-    title: "Let's take a moment to get you set up.",
-    buttonText: "Next",
+    title: "花一点时间完成设置。",
+    buttonText: "下一步",
     iconPercentage: 40,
   },
   [OnboardingStep.LlmSetup]: {
     index: 2,
-    title: "Almost there! Connect your models to start chatting.",
-    buttonText: "Next",
+    title: "快完成了！连接模型后即可开始聊天。",
+    buttonText: "下一步",
     iconPercentage: 70,
   },
   [OnboardingStep.Complete]: {
     index: 3,
-    title: "You're all set, review the optional settings or click Finish Setup",
-    buttonText: "Finish Setup",
+    title: "设置已完成，可检查可选设置或直接完成。",
+    buttonText: "完成设置",
     iconPercentage: 100,
   },
 } as const;
@@ -55,24 +55,24 @@ export const STEP_NAVIGATION: Record<
 
 export const FINAL_SETUP_CONFIG: FinalStepItemProps[] = [
   {
-    title: "Select web search provider",
-    description: "Enable Onyx to search the internet for information.",
+    title: "选择网页搜索服务",
+    description: "允许小逆talk联网搜索信息。",
     icon: SvgGlobe,
-    buttonText: "Web Search",
+    buttonText: "网页搜索",
     buttonHref: "/admin/configuration/web-search",
   },
   {
-    title: "Enable image generation",
-    description: "Set up models to create images in your chats.",
+    title: "启用图片生成",
+    description: "设置可在聊天中创建图片的模型。",
     icon: SvgImage,
-    buttonText: "Image Generation",
+    buttonText: "图片生成",
     buttonHref: "/admin/configuration/image-generation",
   },
   {
-    title: "Invite your team",
-    description: "Manage users and permissions for your team",
+    title: "邀请团队",
+    description: "管理团队用户和权限",
     icon: SvgUsers,
-    buttonText: "Manage Users",
+    buttonText: "管理用户",
     buttonHref: "/admin/users",
   },
 ];

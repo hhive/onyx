@@ -42,7 +42,7 @@ export const handleMoveOperation = async ({
     await Promise.all([refreshChatSessions(), projectRefreshPromise]);
   } catch (error) {
     console.error("Failed to perform move operation:", error);
-    toast.error("Failed to move chat. Please try again.");
+    toast.error("移动聊天失败，请重试。");
     throw error;
   }
 };

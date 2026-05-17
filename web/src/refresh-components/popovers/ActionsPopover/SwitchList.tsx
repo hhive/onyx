@@ -63,7 +63,7 @@ export default function SwitchList({
             icon={SvgChevronLeft}
             prominence="tertiary"
             size="sm"
-            aria-label="Back"
+            aria-label="返回"
             onClick={() => {
               setSearchTerm("");
               onBack();
@@ -83,7 +83,7 @@ export default function SwitchList({
           icon={allDisabled ? SvgPlug : SvgUnplug}
           onClick={allDisabled ? onEnableAll : onDisableAll}
         >
-          {allDisabled ? "Enable All" : "Disable All"}
+          {allDisabled ? "全部启用" : "全部禁用"}
         </LineItem>,
 
         ...filteredItems.map((item) => {
@@ -104,7 +104,7 @@ export default function SwitchList({
                   <Switch
                     checked={item.isEnabled}
                     onCheckedChange={item.onToggle}
-                    aria-label={`Toggle ${item.label}`}
+                    aria-label={`切换 ${item.label}`}
                     disabled={item.disabled}
                   />
                 }

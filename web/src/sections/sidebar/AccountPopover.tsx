@@ -68,7 +68,7 @@ function SettingsPopover({
     logout()
       .then((response) => {
         if (!response?.ok) {
-          alert("Failed to logout");
+          alert("退出登录失败");
           return;
         }
 
@@ -84,7 +84,7 @@ function SettingsPopover({
       })
 
       .catch(() => {
-        toast.error("Failed to logout");
+        toast.error("退出登录失败");
       });
   };
 
@@ -101,7 +101,7 @@ function SettingsPopover({
             variant="section"
             rounding="sm"
             icon={SvgSliders}
-            title="Settings"
+            title="设置"
             href="/app/settings"
             onClick={onUserSettingsClick}
           />
@@ -112,7 +112,7 @@ function SettingsPopover({
           variant="section"
           rounding="sm"
           icon={SvgBell}
-          title="Notifications"
+          title="通知"
           onClick={onOpenNotifications}
           rightChildren={
             !!undismissedCount ? (
@@ -126,7 +126,7 @@ function SettingsPopover({
           variant="section"
           rounding="sm"
           icon={SvgHelpCircle}
-          title="Help & FAQ"
+          title="帮助与常见问题"
           href="https://docs.onyx.app"
           target="_blank"
         />,
@@ -137,7 +137,7 @@ function SettingsPopover({
             variant="section"
             rounding="sm"
             icon={SvgUser}
-            title="Log in"
+            title="登录"
             onClick={handleLogin}
           />
         ),
@@ -149,7 +149,7 @@ function SettingsPopover({
             color="danger"
             rounding="sm"
             icon={SvgLogOut}
-            title="Log Out"
+            title="退出登录"
             onClick={handleLogout}
           />
         ),

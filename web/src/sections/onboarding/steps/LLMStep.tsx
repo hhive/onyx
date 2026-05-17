@@ -152,8 +152,8 @@ const LLMStep = memo(
           >
             <ContentAction
               icon={SvgCpu}
-              title="Connect your LLM models"
-              description="Onyx supports both self-hosted models and popular providers."
+              title="连接你的大语言模型"
+              description="小逆talk 支持自托管模型和常见模型服务商。"
               sizePreset="main-ui"
               variant="section"
               padding="lg"
@@ -215,8 +215,8 @@ const LLMStep = memo(
                   {/* Custom provider card */}
                   <div className="basis-[calc(50%-theme(spacing.1)/2)] grow">
                     <LLMProviderCard
-                      title="Custom LLM Provider"
-                      subtitle="LiteLLM Compatible APIs"
+                      title="自定义大语言模型服务商"
+                      subtitle="兼容 LiteLLM 的 API"
                       disabled={disabled}
                       isConnected={onboardingState.data.llmProviders?.some(
                         (provider) => provider === "custom"
@@ -240,7 +240,7 @@ const LLMStep = memo(
           onboardingActions.setButtonActive(true);
           onboardingActions.goToStep(OnboardingStep.LlmSetup);
         }}
-        aria-label="Edit LLM providers"
+        aria-label="编辑模型服务商"
       >
         <div className="flex items-center gap-1">
           <StackedProviderIcons

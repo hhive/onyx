@@ -5,6 +5,7 @@ import type { Components } from "react-markdown";
 import Text from "@/refresh-components/texts/Text";
 import Truncated from "@/refresh-components/texts/Truncated";
 import { ensureHrefProtocol } from "@/lib/utils";
+import { APP_DISPLAY_NAME } from "@/lib/constants";
 import { cn } from "@opal/utils";
 import { SvgOnyxLogo } from "@opal/logos";
 import MinimalMarkdown from "@/components/chat/MinimalMarkdown";
@@ -134,7 +135,7 @@ function PreviewStart({
             {(logoDisplayStyle === "logo_and_name" ||
               logoDisplayStyle === "name_only") && (
               <Truncated mainUiAction text04 nowrap>
-                {applicationDisplayName || "Onyx"}
+                {applicationDisplayName || APP_DISPLAY_NAME}
               </Truncated>
             )}
           </div>

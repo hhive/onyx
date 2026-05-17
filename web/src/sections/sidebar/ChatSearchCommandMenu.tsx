@@ -37,13 +37,13 @@ function DynamicFooter() {
   const { highlightedItemType } = useCommandMenuContext();
 
   // "Show all" for filters, "Open" for everything else (items, actions, or no highlight)
-  const actionLabel = highlightedItemType === "filter" ? "Show all" : "Open";
+  const actionLabel = highlightedItemType === "filter" ? "显示全部" : "打开";
 
   return (
     <CommandMenu.Footer
       leftActions={
         <>
-          <CommandMenu.FooterAction icon={SvgArrowUpDown} label="Select" />
+          <CommandMenu.FooterAction icon={SvgArrowUpDown} label="选择" />
           <CommandMenu.FooterAction icon={SvgKeystroke} label={actionLabel} />
         </>
       }
@@ -140,10 +140,10 @@ export default function ChatSearchCommandMenu({
   // Header filters for showing active filter as a chip
   const headerFilters = useMemo(() => {
     if (activeFilter === "chats") {
-      return [{ id: "chats", label: "Sessions" }];
+      return [{ id: "chats", label: "会话" }];
     }
     if (activeFilter === "projects") {
-      return [{ id: "projects", label: "Projects" }];
+      return [{ id: "projects", label: "项目" }];
     }
     return [];
   }, [activeFilter]);
@@ -209,14 +209,14 @@ export default function ChatSearchCommandMenu({
 
   return (
     <>
-      <div aria-label="Open chat search" onClick={() => setOpen(true)}>
+      <div aria-label="打开聊天搜索" onClick={() => setOpen(true)}>
         {trigger}
       </div>
 
       <CommandMenu open={open} onOpenChange={handleOpenChange}>
         <CommandMenu.Content>
           <CommandMenu.Header
-            placeholder="Search chat sessions, projects..."
+            placeholder="搜索聊天会话、项目..."
             value={searchValue}
             onValueChange={setSearchValue}
             filters={headerFilters}
@@ -227,7 +227,7 @@ export default function ChatSearchCommandMenu({
 
           <CommandMenu.List
             emptyMessage={
-              hasSearchValue ? "No results found" : "No chats or projects yet"
+              hasSearchValue ? "未找到结果" : "暂无聊天或项目"
             }
           >
             {/* New Session action - always visible in "all" filter, even during search */}
@@ -238,7 +238,7 @@ export default function ChatSearchCommandMenu({
                 onSelect={handleNewSession}
                 defaultHighlight={!hasSearchValue}
               >
-                New Session
+                新会话
               </CommandMenu.Action>
             )}
 
@@ -255,7 +255,7 @@ export default function ChatSearchCommandMenu({
                         filteredChats.length <= PREVIEW_CHATS_LIMIT
                       }
                     >
-                      {activeFilter === "chats" ? "Recent" : "Recent Sessions"}
+                      {activeFilter === "chats" ? "最近" : "最近会话"}
                     </CommandMenu.Filter>
                   )}
                   {displayedChats.map((chat) => (
@@ -303,7 +303,7 @@ export default function ChatSearchCommandMenu({
                     filteredProjects.length <= PREVIEW_PROJECTS_LIMIT
                   }
                 >
-                  Projects
+                  项目
                 </CommandMenu.Filter>
                 {/* New Project action - shown after Projects filter when no search term */}
                 {!hasSearchValue && activeFilter === "all" && (
@@ -312,7 +312,7 @@ export default function ChatSearchCommandMenu({
                     icon={SvgFolderPlus}
                     onSelect={() => handleNewProject()}
                   >
-                    New Project
+                    新建项目
                   </CommandMenu.Action>
                 )}
                 {displayedProjects.map((project) => (
@@ -348,8 +348,8 @@ export default function ChatSearchCommandMenu({
                   onSelect={() => handleNewProject(searchValue.trim())}
                 >
                   <>
-                    Create New Project "
-                    <span className="text-text-05">{searchValue.trim()}</span>"
+                    新建项目“
+                    <span className="text-text-05">{searchValue.trim()}</span>”
                   </>
                 </CommandMenu.Action>
               )}
@@ -360,7 +360,7 @@ export default function ChatSearchCommandMenu({
               (activeFilter === "all" &&
                 displayedChats.length === 0 &&
                 displayedProjects.length === 0)) && (
-              <TextSeparator text="No more results" className="mt-auto mb-2" />
+              <TextSeparator text="没有更多结果" className="mt-auto mb-2" />
             )}
           </CommandMenu.List>
 

@@ -159,10 +159,10 @@ function RecentsSection({
         isOver && "bg-background-tint-03"
       )}
     >
-      <SidebarSection title="Recents">
+      <SidebarSection title="最近">
         {chatSessions.length === 0 ? (
           <Text as="p" text01 className="px-3">
-            Try sending a message! Your chat history will appear here.
+            试着发送一条消息，聊天记录会显示在这里。
           </Text>
         ) : (
           <>
@@ -499,7 +499,7 @@ const MemoizedAppSidebarInner = memo(function AppSidebarInner() {
             reset();
           }}
         >
-          New Session
+          新会话
         </SidebarTab>
       </div>
     );
@@ -532,7 +532,7 @@ const MemoizedAppSidebarInner = memo(function AppSidebarInner() {
       <ChatSearchCommandMenu
         trigger={
           <SidebarTab icon={SvgSearchMenu} folded={folded}>
-            Search Chats
+            搜索聊天
           </SidebarTab>
         }
       />
@@ -553,7 +553,7 @@ const MemoizedAppSidebarInner = memo(function AppSidebarInner() {
           selected={activeSidebarTab.isMoreAgents()}
           variant={folded ? "sidebar-heavy" : "sidebar-light"}
         >
-          {visibleAgents.length === 0 ? "Explore Agents" : "More Agents"}
+          {visibleAgents.length === 0 ? "探索智能体" : "更多智能体"}
         </SidebarTab>
       </div>
     ),
@@ -568,7 +568,7 @@ const MemoizedAppSidebarInner = memo(function AppSidebarInner() {
         folded={folded}
         variant={folded ? "sidebar-heavy" : "sidebar-light"}
       >
-        New Project
+        新建项目
       </SidebarTab>
     ),
     [folded, createProjectModal.toggle, createProjectModal.isOpen]
@@ -590,7 +590,7 @@ const MemoizedAppSidebarInner = memo(function AppSidebarInner() {
             icon={SvgSettings}
             folded={folded}
           >
-            {isAdmin ? "Admin Panel" : "Curator Panel"}
+            {isAdmin ? "管理面板" : "策展面板"}
           </SidebarTab>
         )}
         <AccountPopover
@@ -633,7 +633,7 @@ const MemoizedAppSidebarInner = memo(function AppSidebarInner() {
               try {
                 await performChatMove(target, chat);
               } catch (error) {
-                showErrorNotification("Failed to move chat. Please try again.");
+                showErrorNotification("移动聊天失败，请重试。");
               }
             }
           }}
@@ -685,7 +685,7 @@ const MemoizedAppSidebarInner = memo(function AppSidebarInner() {
               collisionDetection={closestCenter}
               onDragEnd={handleAgentDragEnd}
             >
-              <SidebarSection title="Agents">
+              <SidebarSection title="智能体">
                 <SortableContext
                   items={visibleAgentIds}
                   strategy={verticalListSortingStrategy}
@@ -710,13 +710,13 @@ const MemoizedAppSidebarInner = memo(function AppSidebarInner() {
             >
               {/* Projects */}
               <SidebarSection
-                title="Projects"
+                title="项目"
                 action={
                   <OpalButton
                     icon={SvgFolderPlus}
                     prominence="tertiary"
                     size="sm"
-                    tooltip="New Project"
+                    tooltip="新建项目"
                     onClick={() => createProjectModal.toggle(true)}
                   />
                 }

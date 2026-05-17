@@ -37,8 +37,8 @@ function Removable({ onRemove, children }: RemovableProps) {
                 e.stopPropagation();
                 onRemove();
               }}
-              title="Remove"
-              aria-label="Remove"
+              title="移除"
+              aria-label="移除"
               className={cn(
                 "h-4 w-4",
                 "flex items-center justify-center",
@@ -192,8 +192,8 @@ export function FileCard({
             description={
               isProcessing
                 ? file.status === UserFileStatus.UPLOADING
-                  ? "Uploading..."
-                  : "Processing..."
+                  ? "上传中..."
+                  : "处理中..."
                 : typeLabel
             }
           />

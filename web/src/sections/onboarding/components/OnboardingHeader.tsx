@@ -54,8 +54,8 @@ const OnboardingHeader = React.memo(
               <Section flexDirection="row">
                 {!isWelcomeStep && (
                   <Text as="p" text03 mainUiBody>
-                    Step {onboardingState.stepIndex} of{" "}
-                    {onboardingState.totalSteps}
+                    第 {onboardingState.stepIndex} 步，共{" "}
+                    {onboardingState.totalSteps} 步
                   </Text>
                 )}
                 <Button

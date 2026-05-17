@@ -2,6 +2,7 @@
 
 import { useSettingsContext } from "@/providers/SettingsProvider";
 import {
+  APP_DISPLAY_NAME,
   DEFAULT_LOGO_SIZE_PX,
   NEXT_PUBLIC_DO_NOT_USE_TOGGLE_OFF_DANSWER_POWERED,
 } from "@/lib/constants";
@@ -21,7 +22,8 @@ export default function Logo({ folded, size, className }: LogoProps) {
   const resolvedSize = size ?? DEFAULT_LOGO_SIZE_PX;
   const settings = useSettingsContext();
   const logoDisplayStyle = settings.enterpriseSettings?.logo_display_style;
-  const applicationName = settings.enterpriseSettings?.application_name;
+  const applicationName =
+    settings.enterpriseSettings?.application_name || APP_DISPLAY_NAME;
 
   // Cache-buster: the logo URL never changes (/api/enterprise-settings/logo)
   // so the browser serves the in-memory cached image even after an admin
@@ -76,7 +78,7 @@ export default function Logo({ folded, size, className }: LogoProps) {
                 className={"line-clamp-1 truncate"}
                 nowrap
               >
-                Powered by Onyx
+                Powered by {APP_DISPLAY_NAME}
               </Text>
             )}
           </div>

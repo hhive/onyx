@@ -37,7 +37,7 @@ function UpdateCloudURLOnCloudIdChange({
         // Update multiple fields together ... somehow setting them in sequence
         // doesn't work with the validator
         // it may also be possible to await each setFieldValue call.
-        // https://github.com/jaredpalmer/formik/issues/2266
+        // Formik can leave this value array-shaped after OAuth callbacks.
         setValues((prevValues) => ({
           ...prevValues,
           cloud_name: selectedResource.name,

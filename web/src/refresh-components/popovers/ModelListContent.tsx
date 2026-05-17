@@ -110,8 +110,8 @@ export default function ModelListContent({
     const disabled = isDisabled?.(option) ?? false;
 
     const capabilities: string[] = [];
-    if (option.supportsReasoning) capabilities.push("Reasoning");
-    if (option.supportsImageInput) capabilities.push("Vision");
+    if (option.supportsReasoning) capabilities.push("推理");
+    if (option.supportsImageInput) capabilities.push("视觉");
     const description =
       capabilities.length > 0 ? capabilities.join(", ") : undefined;
 
@@ -144,20 +144,20 @@ export default function ModelListContent({
         variant="internal"
         value={searchQuery}
         onChange={(e) => setSearchQuery(e.target.value)}
-        placeholder="Search models..."
+        placeholder="搜索模型..."
       />
 
       <PopoverMenu scrollContainerRef={scrollContainerRef}>
         {isLoading
           ? [
               <Text key="loading" font="secondary-body" color="text-03">
-                Loading models...
+                正在加载模型...
               </Text>,
             ]
           : groupedOptions.length === 0
             ? [
                 <Text key="empty" font="secondary-body" color="text-03">
-                  No models found
+                  未找到模型
                 </Text>,
               ]
             : groupedOptions.length === 1

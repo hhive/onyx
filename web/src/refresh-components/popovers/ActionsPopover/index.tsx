@@ -48,8 +48,8 @@ function buildTooltipMessage(
   isConfigured: boolean,
   canManageAction: boolean
 ) {
-  const _CONFIGURE_MESSAGE = "Press the settings cog to enable.";
-  const _USER_NOT_ADMIN_MESSAGE = "Ask an admin to configure.";
+  const _CONFIGURE_MESSAGE = "点击设置齿轮启用。";
+  const _USER_NOT_ADMIN_MESSAGE = "请联系管理员配置。";
 
   if (isConfigured) {
     return actionDescription;
@@ -63,13 +63,13 @@ function buildTooltipMessage(
 }
 
 const TOOL_DESCRIPTIONS: Record<string, string> = {
-  [SEARCH_TOOL_ID]: "Search through connected knowledge to inform the answer.",
-  [IMAGE_GENERATION_TOOL_ID]: "Generate images based on a prompt.",
-  [WEB_SEARCH_TOOL_ID]: "Search the web for up-to-date information.",
-  [PYTHON_TOOL_ID]: "Execute code for complex analysis.",
+  [SEARCH_TOOL_ID]: "搜索已连接的知识来辅助回答。",
+  [IMAGE_GENERATION_TOOL_ID]: "根据提示词生成图片。",
+  [WEB_SEARCH_TOOL_ID]: "搜索网页以获取最新信息。",
+  [PYTHON_TOOL_ID]: "执行代码以完成复杂分析。",
 };
 
-const DEFAULT_TOOL_DESCRIPTION = "This action is not configured yet.";
+const DEFAULT_TOOL_DESCRIPTION = "此操作尚未配置。";
 
 function getToolTooltip(
   tool: ToolSnapshot,
@@ -86,21 +86,21 @@ function getToolTooltip(
 const ADMIN_CONFIG_LINKS: Record<string, { href: string; tooltip: string }> = {
   [IMAGE_GENERATION_TOOL_ID]: {
     href: "/admin/configuration/image-generation",
-    tooltip: "Configure Image Generation",
+    tooltip: "配置图片生成",
   },
   [WEB_SEARCH_TOOL_ID]: {
     href: "/admin/configuration/web-search",
-    tooltip: "Configure Web Search",
+    tooltip: "配置网页搜索",
   },
   [PYTHON_TOOL_ID]: {
     href: "/admin/configuration/code-interpreter",
-    tooltip: "Configure Code Interpreter",
+    tooltip: "配置代码解释器",
   },
 };
 
 const OPENAPI_ADMIN_CONFIG = {
   href: "/admin/actions/open-api",
-  tooltip: "Manage OpenAPI Actions",
+  tooltip: "管理 OpenAPI 操作",
 };
 
 const getAdminConfigureInfo = (
@@ -546,7 +546,7 @@ export default function ActionsPopover({
 
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
-        const errorMessage = errorData.detail || "Failed to save API key";
+        const errorMessage = errorData.detail || "保存 API Key 失败";
         throw new Error(errorMessage);
       }
     } catch (error) {
@@ -574,7 +574,7 @@ export default function ActionsPopover({
 
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
-        const errorMessage = errorData.detail || "Failed to save credentials";
+        const errorMessage = errorData.detail || "保存凭据失败";
         throw new Error(errorMessage);
       }
     } catch (error) {
@@ -718,7 +718,7 @@ export default function ActionsPopover({
         <Button icon={SvgChevronRight} prominence="tertiary" size="sm" />
       }
     >
-      Re-Authenticate
+      重新认证
     </LineItem>
   ) : undefined;
 
@@ -825,7 +825,7 @@ export default function ActionsPopover({
       {[
         <InputTypeIn
           key="search"
-          placeholder="Search Actions"
+          placeholder="搜索操作"
           value={searchTerm}
           onChange={(event) => setSearchTerm(event.target.value)}
           autoFocus
@@ -921,7 +921,7 @@ export default function ActionsPopover({
 
         (isAdmin || isCurator) && (
           <LineItem href="/admin/actions" icon={SvgActions} key="more-actions">
-            More Actions
+            更多操作
           </LineItem>
         ),
       ]}
@@ -931,12 +931,12 @@ export default function ActionsPopover({
   const toolsView = (
     <SwitchList
       items={sourceToggleItems}
-      searchPlaceholder="Search Filters"
+      searchPlaceholder="搜索筛选条件"
       allDisabled={allSourcesDisabled}
       onDisableAll={handleDisableAllSources}
       onEnableAll={handleEnableAllSources}
-      disableAllLabel="Disable All Sources"
-      enableAllLabel="Enable All Sources"
+      disableAllLabel="禁用全部来源"
+      enableAllLabel="启用全部来源"
       onBack={() => setSecondaryView(null)}
     />
   );
@@ -944,12 +944,12 @@ export default function ActionsPopover({
   const mcpView = (
     <SwitchList
       items={mcpToggleItems}
-      searchPlaceholder={`Search ${selectedMcpServer?.name ?? "server"} tools`}
+      searchPlaceholder={`搜索 ${selectedMcpServer?.name ?? "服务器"} 工具`}
       allDisabled={mcpAllDisabled}
       onDisableAll={disableAllToolsForSelectedServer}
       onEnableAll={enableAllToolsForSelectedServer}
-      disableAllLabel="Disable All Tools"
-      enableAllLabel="Enable All Tools"
+      disableAllLabel="禁用全部工具"
+      enableAllLabel="启用全部工具"
       onBack={() => setSecondaryView(null)}
       footer={mcpFooter}
     />
@@ -968,7 +968,7 @@ export default function ActionsPopover({
               icon={SvgSliders}
               interaction={open ? "hover" : "rest"}
               prominence="tertiary"
-              tooltip="Manage Actions"
+              tooltip="管理操作"
             />
           </div>
         </Popover.Trigger>

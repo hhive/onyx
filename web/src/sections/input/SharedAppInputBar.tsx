@@ -47,7 +47,7 @@ export default function SharedAppInputBar() {
       {/* CTA button */}
       <div className="absolute inset-0 flex items-center justify-center">
         <Button prominence="secondary" icon={SvgEditBig} href="/app">
-          Start New Session
+          开始新会话
         </Button>
       </div>
     </div>

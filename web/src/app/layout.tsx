@@ -1,6 +1,6 @@
 import "./globals.css";
 
-import { GTM_ENABLED, MODAL_ROOT_ID } from "@/lib/constants";
+import { APP_DISPLAY_NAME, GTM_ENABLED, MODAL_ROOT_ID } from "@/lib/constants";
 import { Metadata } from "next";
 
 import AppProvider from "@/providers/AppProvider";
@@ -50,7 +50,7 @@ const dmMono = DM_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Onyx",
+  title: APP_DISPLAY_NAME,
   description: "Question answering for your documents",
 };
 

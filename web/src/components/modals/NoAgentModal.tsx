@@ -12,25 +12,23 @@ export default function NoAgentModal() {
   return (
     <Modal open>
       <Modal.Content width="sm" height="sm">
-        <Modal.Header icon={SvgUser} title="No Agent Available" />
+        <Modal.Header icon={SvgUser} title="暂无可用智能体" />
         <Modal.Body>
           <Text as="p">
-            You currently have no agent configured. To use this feature, you
-            need to take action.
+            当前没有已配置的智能体。需要先完成配置后才能使用此功能。
           </Text>
           {isAdmin ? (
             <>
               <Text as="p">
-                As an administrator, you can create a new agent by visiting the
-                admin panel.
+                你是管理员，可以前往管理面板创建新的智能体。
               </Text>
               <Button width="full" href="/admin/agents">
-                Go to Admin Panel
+                前往管理面板
               </Button>
             </>
           ) : (
             <Text as="p">
-              Please contact your administrator to configure an agent for you.
+              请联系管理员为你配置智能体。
             </Text>
           )}
         </Modal.Body>

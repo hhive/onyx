@@ -155,7 +155,7 @@ export const AVAILABLE_MODELS: HostedEmbeddingModel[] = [
 
 export const LITELLM_CLOUD_PROVIDER: CloudEmbeddingProvider = {
   provider_type: EmbeddingProvider.LITELLM,
-  website: "https://github.com/BerriAI/litellm",
+  website: "https://www.litellm.ai",
   icon: SvgLitellm,
   description: "Open-source library to call LLM APIs using OpenAI format",
   apiLink: "https://docs.litellm.ai/docs/proxy/quick_start",

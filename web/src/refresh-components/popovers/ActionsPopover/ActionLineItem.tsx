@@ -51,7 +51,7 @@ export default function ActionLineItem({
   tooltip,
   showAdminConfigure = false,
   adminConfigureHref,
-  adminConfigureTooltip = "Configure",
+  adminConfigureTooltip = "配置",
   onToggle,
   onForceToggle,
   onSourceManagementOpen,
@@ -69,7 +69,7 @@ export default function ActionLineItem({
 
   let label = tool ? tool.display_name || tool.name : providedLabel!;
   if (!!currentProjectId && tool?.in_code_tool_id === SEARCH_TOOL_ID) {
-    label = "Project Search";
+    label = "项目搜索";
   }
 
   const isSearchToolWithNoConnectors =
@@ -135,13 +135,13 @@ export default function ActionLineItem({
                 icon={SvgSlash}
                 onClick={noProp(onToggle)}
                 internal
-                aria-label={disabled ? "Enable" : "Disable"}
+                aria-label={disabled ? "启用" : "禁用"}
                 className={cn(
                   !disabled && "invisible group-hover/LineItem:visible",
                   // Hide when showing source count (it has its own hover behavior)
                   shouldShowSourceCount && "!hidden"
                 )}
-                tooltip={disabled ? "Enable" : "Disable"}
+                tooltip={disabled ? "启用" : "禁用"}
               />
             )}
 
@@ -174,7 +174,7 @@ export default function ActionLineItem({
                     onClick={noProp(onToggle)}
                     prominence="tertiary"
                     size="sm"
-                    tooltip={disabled ? "Enable" : "Disable"}
+                    tooltip={disabled ? "启用" : "禁用"}
                   />
                 </span>
               </span>
@@ -184,8 +184,8 @@ export default function ActionLineItem({
               <Button
                 aria-label={
                   isSearchToolWithNoConnectors
-                    ? "Add Connectors"
-                    : "Configure Connectors"
+                    ? "添加连接器"
+                    : "配置连接器"
                 }
                 icon={
                   isSearchToolWithNoConnectors ? SvgSettings : SvgChevronRight
@@ -199,8 +199,8 @@ export default function ActionLineItem({
                 size="sm"
                 tooltip={
                   isSearchToolWithNoConnectors
-                    ? "Add Connectors"
-                    : "Configure Connectors"
+                    ? "添加连接器"
+                    : "配置连接器"
                 }
               />
             )}

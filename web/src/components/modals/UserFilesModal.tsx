@@ -40,9 +40,9 @@ function getIcon(
 function getDescription(file: ProjectFile): string {
   const s = String(file.status || "");
   const typeLabel = getFileExtension(file.name);
-  if (s === UserFileStatus.PROCESSING) return "Processing...";
-  if (s === UserFileStatus.UPLOADING) return "Uploading...";
-  if (s === UserFileStatus.DELETING) return "Deleting...";
+  if (s === UserFileStatus.PROCESSING) return "处理中...";
+  if (s === UserFileStatus.UPLOADING) return "上传中...";
+  if (s === UserFileStatus.DELETING) return "删除中...";
   if (s === UserFileStatus.COMPLETED) return typeLabel;
   return file.status ?? typeLabel;
 }
@@ -181,7 +181,7 @@ export default function UserFilesModal({
             <Section flexDirection="row" gap={0.5}>
               <InputTypeIn
                 ref={searchInputRef}
-                placeholder="Search files..."
+                placeholder="搜索文件..."
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
                 leftSearchIcon
@@ -197,7 +197,7 @@ export default function UserFilesModal({
                   secondary={false}
                   internal
                 >
-                  Add Files
+                  添加文件
                 </CreateButton>
               )}
             </Section>
@@ -210,7 +210,7 @@ export default function UserFilesModal({
           >
             {/* File display section */}
             {filtered.length === 0 ? (
-              <Text text03>No files found</Text>
+              <Text text03>未找到文件</Text>
             ) : (
               <ScrollIndicatorDiv className="p-2 gap-2 max-h-[70vh]">
                 {filtered.map((projectFle) => {
@@ -253,7 +253,7 @@ export default function UserFilesModal({
                 {!query.trim() && !showOnlySelected && (
                   <TextSeparator
                     count={recentFiles.length}
-                    text={recentFiles.length === 1 ? "File" : "Files"}
+                    text="文件"
                   />
                 )}
               </ScrollIndicatorDiv>
@@ -265,8 +265,7 @@ export default function UserFilesModal({
             {onPickRecent && (
               <Section flexDirection="row" justifyContent="start" gap={0.5}>
                 <Text as="p" text03>
-                  {selectedCount} {selectedCount === 1 ? "file" : "files"}{" "}
-                  selected
+                  已选择 {selectedCount} 个文件
                 </Text>
                 <Button
                   icon={SvgEye}
@@ -287,7 +286,7 @@ export default function UserFilesModal({
 
             {/* Right side: Done button */}
             <Button prominence="secondary" onClick={() => toggle(false)}>
-              Done
+              完成
             </Button>
           </Modal.Footer>
         </Modal.Content>

@@ -131,7 +131,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
 
   useToastFromQuery({
     oauth_connected: {
-      message: "Authentication successful",
+      message: "认证成功",
       type: "success",
     },
   });
@@ -283,8 +283,8 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
       const names = lastFailedFiles.map((f) => f.name).join(", ");
       toast.error(
         lastFailedFiles.length === 1
-          ? `File failed and was removed: ${names}`
-          : `Files failed and were removed: ${names}`
+          ? `文件处理失败并已移除：${names}`
+          : `这些文件处理失败并已移除：${names}`
       );
       clearLastFailedFiles();
     }
@@ -514,7 +514,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
       .reverse()
       .find((m) => m.type === "user");
     if (!lastUserMsg) {
-      toast.error("No previously-submitted user message found.");
+      toast.error("未找到之前提交的用户消息。");
       return;
     }
 
@@ -737,7 +737,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
             <Modal.Content>
               <Modal.Header
                 icon={SvgFileText}
-                title="Sources"
+                title="来源"
                 onClose={() => updateCurrentDocumentSidebarVisible(false)}
               />
               <Modal.Body>
@@ -839,21 +839,21 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
                           }
                           title={
                             sessionFetchError.type === "not_found"
-                              ? "Chat not found"
+                              ? "未找到聊天"
                               : sessionFetchError.type === "access_denied"
-                                ? "Access denied"
-                                : "Something went wrong"
+                                ? "无权访问"
+                                : "出现问题"
                           }
                           description={
                             sessionFetchError.type === "not_found"
-                              ? "This chat session doesn't exist or has been deleted."
+                              ? "这个聊天会话不存在或已被删除。"
                               : sessionFetchError.type === "access_denied"
-                                ? "You don't have permission to view this chat session."
+                                ? "你没有权限查看这个聊天会话。"
                                 : sessionFetchError.detail
                           }
                         />
                         <Button href="/app" prominence="secondary">
-                          Start a new chat
+                          开始新聊天
                         </Button>
                       </Section>
                     )}
@@ -923,7 +923,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
                         <Button
                           icon={SvgChevronDown}
                           onClick={handleScrollToBottom}
-                          aria-label="Scroll to bottom"
+                          aria-label="滚动到底部"
                           prominence="secondary"
                         />
                       </div>

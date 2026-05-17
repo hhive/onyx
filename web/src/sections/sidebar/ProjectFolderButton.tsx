@@ -88,7 +88,7 @@ const ProjectFolderButton = memo(({ project }: ProjectFolderButtonProps) => {
       sizePreset="main-ui"
       rounding="sm"
       icon={SvgEdit}
-      title="Rename Project"
+      title="重命名项目"
       onClick={noProp(() => setIsEditing(true))}
     />,
     null,
@@ -98,7 +98,7 @@ const ProjectFolderButton = memo(({ project }: ProjectFolderButtonProps) => {
       rounding="sm"
       color="danger"
       icon={SvgTrash}
-      title="Delete Project"
+      title="删除项目"
       onClick={noProp(() => setDeleteConfirmationModalOpen(true))}
     />,
   ];
@@ -114,7 +114,7 @@ const ProjectFolderButton = memo(({ project }: ProjectFolderButtonProps) => {
       {/* Confirmation Modal (only for deletion) */}
       {deleteConfirmationModalOpen && (
         <ConfirmationModalLayout
-          title="Delete Project"
+          title="删除项目"
           icon={SvgTrash}
           onClose={() => setDeleteConfirmationModalOpen(false)}
           submit={
@@ -125,12 +125,11 @@ const ProjectFolderButton = memo(({ project }: ProjectFolderButtonProps) => {
                 deleteProject(project.id);
               }}
             >
-              Delete
+              删除
             </Button>
           }
         >
-          Are you sure you want to delete this project? This action cannot be
-          undone.
+          确定要删除这个项目吗？此操作无法撤销。
         </ConfirmationModalLayout>
       )}
 

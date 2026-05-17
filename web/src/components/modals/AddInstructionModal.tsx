@@ -34,22 +34,22 @@ export default function AddInstructionModal() {
       <Modal.Content width="sm">
         <Modal.Header
           icon={SvgAddLines}
-          title="Set Project Instructions"
-          description="Specify the behaviors or tone for the chat sessions in this project."
+          title="设置项目指令"
+          description="指定此项目中聊天会话的行为方式或语气。"
           onClose={() => modal.toggle(false)}
         />
         <Modal.Body>
           <InputTextArea
             value={instructionText}
             onChange={(event) => setInstructionText(event.target.value)}
-            placeholder="My goal with is to... be sure to... in your responses."
+            placeholder="我的目标是... 请在回复中注意..."
           />
         </Modal.Body>
         <Modal.Footer>
           <Button prominence="secondary" onClick={() => modal.toggle(false)}>
-            Cancel
+            取消
           </Button>
-          <Button onClick={handleSubmit}>Save Instructions</Button>
+          <Button onClick={handleSubmit}>保存指令</Button>
         </Modal.Footer>
       </Modal.Content>
     </Modal>

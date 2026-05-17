@@ -54,7 +54,7 @@ export default function ConfirmationModalLayout({
         <Modal.Footer>
           {!hideCancel && (
             <Button prominence="secondary" onClick={onClose}>
-              Cancel
+              取消
             </Button>
           )}
           {submit}

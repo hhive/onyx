@@ -127,13 +127,13 @@ export default function ShareChatSessionModal({
 
   const isShared = shareLink && selectedPrivacy === "public";
 
-  let submitButtonText = "Done";
+  let submitButtonText = "完成";
   if (wantsPublic && !isCurrentlyPublic && !shareLink) {
-    submitButtonText = "Create Share Link";
+    submitButtonText = "创建分享链接";
   } else if (!wantsPublic && isCurrentlyPublic) {
-    submitButtonText = "Make Private";
+    submitButtonText = "设为私密";
   } else if (isShared) {
-    submitButtonText = "Copy Link";
+    submitButtonText = "复制链接";
   }
 
   async function handleSubmit() {
@@ -146,9 +146,9 @@ export default function ShareChatSessionModal({
           updateCurrentChatSessionSharedStatus(ChatSessionSharedStatus.Public);
           await refreshChatSessions();
           copyAll(link);
-          toast.success("Share link copied to clipboard!");
+          toast.success("分享链接已复制到剪贴板");
         } else {
-          toast.error("Failed to generate share link");
+          toast.error("生成分享链接失败");
         }
       } else if (!wantsPublic && isCurrentlyPublic) {
         const success = await deleteShareLink(chatSession.id);
@@ -156,20 +156,20 @@ export default function ShareChatSessionModal({
           setShareLink("");
           updateCurrentChatSessionSharedStatus(ChatSessionSharedStatus.Private);
           await refreshChatSessions();
-          toast.success("Chat is now private");
+          toast.success("聊天已设为私密");
           onClose();
         } else {
-          toast.error("Failed to make chat private");
+          toast.error("设为私密失败");
         }
       } else if (wantsPublic && shareLink) {
         copyAll(shareLink);
-        toast.success("Share link copied to clipboard!");
+        toast.success("分享链接已复制到剪贴板");
       } else {
         onClose();
       }
     } catch (e) {
       console.error(e);
-      toast.error("An error occurred");
+      toast.error("发生错误");
     } finally {
       setIsLoading(false);
     }
@@ -180,8 +180,8 @@ export default function ShareChatSessionModal({
       <Modal.Content width="sm">
         <Modal.Header
           icon={SvgShare}
-          title={isShared ? "Chat shared" : "Share this chat"}
-          description="All existing and future messages in this chat will be shared."
+          title={isShared ? "聊天已分享" : "分享此聊天"}
+          description="此聊天中已有和后续的所有消息都会被分享。"
           onClose={onClose}
         />
         <Modal.Body twoTone>
@@ -193,16 +193,16 @@ export default function ShareChatSessionModal({
           >
             <PrivacyOption
               icon={SvgLock}
-              title="Private"
-              description="Only you have access to this chat."
+              title="私密"
+              description="只有你可以访问此聊天。"
               selected={selectedPrivacy === "private"}
               onClick={() => setSelectedPrivacy("private")}
               ariaLabel="share-modal-option-private"
             />
             <PrivacyOption
               icon={SvgUsers}
-              title="Your Organization"
-              description="Anyone in your organization can view this chat."
+              title="你的组织"
+              description="组织内任何人都可以查看此聊天。"
               selected={selectedPrivacy === "public"}
               onClick={() => setSelectedPrivacy("public")}
               ariaLabel="share-modal-option-public"
@@ -217,7 +217,7 @@ export default function ShareChatSessionModal({
               rightSection={
                 <CopyIconButton
                   getCopyText={() => shareLink}
-                  tooltip="Copy link"
+                  tooltip="复制链接"
                   size="sm"
                   aria-label="share-modal-copy-link"
                 />
@@ -232,7 +232,7 @@ export default function ShareChatSessionModal({
               onClick={onClose}
               aria-label="share-modal-cancel"
             >
-              Cancel
+              取消
             </Button>
           )}
           <Button

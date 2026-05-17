@@ -566,7 +566,7 @@ const AppInputBar = React.memo(
               <Button
                 disabled={disabled}
                 icon={SvgPaperclip}
-                tooltip="Attach Files"
+                tooltip="添加文件"
                 interaction={open ? "hover" : "rest"}
                 prominence="tertiary"
               />
@@ -606,8 +606,8 @@ const AppInputBar = React.memo(
                           return currentTabUrl;
                         }
                       })()
-                    : "Reading tab..."
-                  : "Read this tab"}
+                    : "正在读取标签页..."
+                  : "读取此标签页"}
               </SelectButton>
             ) : (
               showDeepResearch && (
@@ -620,11 +620,11 @@ const AppInputBar = React.memo(
                   foldable={!deepResearchEnabled}
                   tooltip={
                     isMultiModelActive
-                      ? "Deep Research is disabled in multi-model mode"
+                      ? "多模型模式下不能使用深度研究"
                       : undefined
                   }
                 >
-                  Deep Research
+                  深度研究
                 </SelectButton>
               )
             )}
@@ -684,9 +684,9 @@ const AppInputBar = React.memo(
               <Button
                 disabled
                 icon={SvgMicrophone}
-                aria-label="Set up voice"
+                aria-label="设置语音"
                 prominence="tertiary"
-                tooltip="Voice not configured. Set up in admin settings."
+                tooltip="语音尚未配置，请在管理设置中配置。"
               />
             ))}
 
@@ -837,14 +837,14 @@ const AppInputBar = React.memo(
                       aria-multiline={true}
                       placeholder={
                         queuedMessages.length > 0 && !message
-                          ? "Press up to edit queued messages"
+                          ? "按上方向键编辑排队消息"
                           : isRecording
-                            ? "Listening..."
+                            ? "正在聆听..."
                             : isVoicePlaybackActive
-                              ? "Onyx is speaking..."
+                              ? "小逆talk 正在朗读..."
                               : isSearchMode
-                                ? "Search connected sources"
-                                : "How can I help you today?"
+                                ? "搜索已连接的来源"
+                                : "今天有什么可以帮你？"
                       }
                       value={message}
                       onKeyDown={(event) => {

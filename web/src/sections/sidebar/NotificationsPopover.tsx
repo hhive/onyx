@@ -76,7 +76,7 @@ function NotificationItem({
                       size="xs"
                       prominence="tertiary"
                       onClick={noProp(dismiss)}
-                      tooltip="Mark as Read"
+                      tooltip="标为已读"
                     />
                   </Hoverable.Item>
                 </div>
@@ -208,13 +208,13 @@ export default function NotificationsPopover({
             prominence="tertiary"
             onClick={onClose}
           />
-          <Text color="text-02">Notifications</Text>
+          <Text color="text-02">通知</Text>
         </Section>
 
         <Section flexDirection="row" gap={0.25} justifyContent="end">
           {undismissedCount !== 0 && (
             <span className="text-action-link-05 font-secondary-body">
-              {`${undismissedCount} unread`}
+              {`${undismissedCount} 条未读`}
             </span>
           )}
           <Button
@@ -222,7 +222,7 @@ export default function NotificationsPopover({
             size="sm"
             prominence="tertiary"
             onClick={handleDismissAll}
-            tooltip="Mark All as Read"
+            tooltip="全部标为已读"
             disabled={undismissedCount === 0}
           />
         </Section>
@@ -238,7 +238,7 @@ export default function NotificationsPopover({
         <div className="h-[var(--notifications-popover)]">
           <Section>
             <IllustrationContent
-              title="No notifications"
+              title="暂无通知"
               illustration={SvgEmpty}
             />
           </Section>
@@ -247,7 +247,7 @@ export default function NotificationsPopover({
         <div className="max-h-[var(--notifications-popover)] overflow-y-auto flex flex-col gap-1">
           {newNotifications.length > 0 && (
             <>
-              <Divider title="New" />
+              <Divider title="新的通知" />
               <div className="flex flex-col gap-1">
                 {newNotifications.map((notification) => (
                   <NotificationItem
@@ -264,7 +264,7 @@ export default function NotificationsPopover({
 
           {olderNotifications.length > 0 && (
             <>
-              <Divider title="Older" />
+              <Divider title="较早通知" />
               <div className="flex flex-col gap-1">
                 {olderNotifications.map((notification) => (
                   <NotificationItem

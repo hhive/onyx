@@ -65,7 +65,7 @@ import useAppFocus from "@/hooks/useAppFocus";
 import { useQueryController } from "@/providers/QueryControllerProvider";
 import { usePaidEnterpriseFeaturesEnabled } from "@/components/settings/usePaidEnterpriseFeaturesEnabled";
 import useBrowserInfo from "@/hooks/useBrowserInfo";
-import { APP_SLOGAN } from "@/lib/constants";
+import { APP_DISPLAY_NAME, APP_SLOGAN } from "@/lib/constants";
 
 /**
  * App Header Component
@@ -194,7 +194,7 @@ function Header() {
       setDeleteModalOpen(false);
     } catch (error) {
       console.error("Failed to delete chat:", error);
-      showErrorNotification("Failed to delete chat. Please try again.");
+      showErrorNotification("删除聊天失败，请重试。");
     }
   }, [
     currentChatSession,
@@ -236,7 +236,7 @@ function Header() {
             sizePreset="main-ui"
             rounding="sm"
             icon={SvgFolderIn}
-            title="Move to Project"
+            title="移动到项目"
             onClick={noProp(() => setShowMoveOptions(true))}
           />,
           <LineItemButton
@@ -245,7 +245,7 @@ function Header() {
             rounding="sm"
             color="danger"
             icon={SvgTrash}
-            title="Delete"
+            title="删除"
             onClick={noProp(() => setDeleteConfirmationModalOpen(true))}
           />,
         ];
@@ -287,17 +287,16 @@ function Header() {
 
       {deleteModalOpen && (
         <ConfirmationModalLayout
-          title="Delete Chat"
+          title="删除聊天"
           icon={SvgTrash}
           onClose={() => setDeleteModalOpen(false)}
           submit={
             <Button variant="danger" onClick={handleDeleteChat}>
-              Delete
+              删除
             </Button>
           }
         >
-          Are you sure you want to delete this chat? This action cannot be
-          undone.
+          确定要删除这个聊天吗？此操作无法撤销。
         </ConfirmationModalLayout>
       )}
 
@@ -331,12 +330,12 @@ function Header() {
               <Popover open={modePopoverOpen} onOpenChange={setModePopoverOpen}>
                 <Popover.Trigger asChild>
                   <OpenButton
-                    aria-label="Change app mode"
+                    aria-label="切换应用模式"
                     icon={
                       effectiveMode === "search" ? SvgSearchMenu : SvgBubbleText
                     }
                   >
-                    {effectiveMode === "search" ? "Search" : "Chat"}
+                    {effectiveMode === "search" ? "搜索" : "聊天"}
                   </OpenButton>
                 </Popover.Trigger>
                 <Popover.Content align="start" width="lg">
@@ -346,8 +345,8 @@ function Header() {
                       rounding="sm"
                       icon={SvgSearchMenu}
                       state={effectiveMode === "search" ? "selected" : "empty"}
-                      title="Search"
-                      description="Quick search for documents"
+                      title="搜索"
+                      description="快速搜索文档"
                       onClick={noProp(() => {
                         setAppMode("search");
                         setModePopoverOpen(false);
@@ -358,8 +357,8 @@ function Header() {
                       rounding="sm"
                       icon={SvgBubbleText}
                       state={effectiveMode === "chat" ? "selected" : "empty"}
-                      title="Chat"
-                      description="Conversation and research"
+                      title="聊天"
+                      description="对话与研究"
                       onClick={noProp(() => {
                         setAppMode("chat");
                         setModePopoverOpen(false);
@@ -405,7 +404,7 @@ function Header() {
                 onClick={() => setShowShareModal(true)}
                 aria-label="share-chat-button"
               >
-                Share
+                分享
               </Button>
               <SimplePopover
                 trigger={
@@ -465,9 +464,7 @@ function Footer() {
 
   const customFooterContent =
     settings?.enterpriseSettings?.custom_lower_disclaimer_content ||
-    `[Onyx ${
-      settings?.webVersion || "dev"
-    }](https://www.onyx.app/) - ${APP_SLOGAN}`;
+    `${APP_DISPLAY_NAME} ${settings?.webVersion || "dev"} - ${APP_SLOGAN}`;
 
   return (
     <footer

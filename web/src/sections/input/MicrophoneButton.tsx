@@ -199,7 +199,7 @@ function MicrophoneButton({
         hasManualRecordStartRef.current = true;
       } catch (err) {
         console.error("Microphone access failed:", err);
-        toast.error("Could not access microphone");
+        toast.error("无法访问麦克风");
       }
     }
   }, [
@@ -255,7 +255,7 @@ function MicrophoneButton({
         messagePrefixRef.current = currentMessageRef.current;
         startRecording().catch((err) => {
           console.error("Auto-start microphone failed:", err);
-          toast.error("Could not auto-start microphone");
+          toast.error("无法自动启动麦克风");
         });
       }, 400);
     }
@@ -332,7 +332,7 @@ function MicrophoneButton({
       disabled={isDisabled}
       icon={icon}
       onClick={handleClick}
-      aria-label={isRecording ? "Stop recording" : "Start recording"}
+      aria-label={isRecording ? "停止录音" : "开始录音"}
       prominence={prominence}
     />
   );

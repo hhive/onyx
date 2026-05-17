@@ -12,6 +12,7 @@ import remarkGfm from "remark-gfm";
 import { transformLinkUri } from "@/lib/utils";
 import { SvgAlertCircle } from "@opal/icons";
 import { SvgOnyxLogo } from "@opal/logos";
+import { APP_DISPLAY_NAME } from "@/lib/constants";
 import type { IconProps } from "@opal/types";
 
 const ALL_USERS_INITIAL_POPUP_FLOW_COMPLETED =
@@ -60,9 +61,9 @@ export function AppPopup() {
   const logoDisplayStyle = enterpriseSettings?.logo_display_style;
 
   // Header icon rules:
-  // - If neither app name nor custom logo exists -> show Onyx icon
+  // - If neither app name nor custom logo exists -> show default icon
   // - If logo display is "name_only" -> show alert icon
-  // - Otherwise -> show uploaded custom logo (fallback to Onyx icon)
+  // - Otherwise -> show uploaded custom logo (fallback to default icon)
   const headerIcon =
     !hasApplicationName && !hasCustomLogo
       ? (props: IconProps) => <SvgOnyxLogo size={24} {...props} />
@@ -77,7 +78,7 @@ export function AppPopup() {
       <Modal.Content width="sm" height="lg">
         <Modal.Header
           icon={headerIcon}
-          title={popupTitle || "Welcome to Onyx!"}
+          title={popupTitle || `欢迎使用 ${APP_DISPLAY_NAME}！`}
         />
         <Modal.Body>
           <div className="overflow-y-auto text-left">
@@ -124,7 +125,7 @@ export function AppPopup() {
                 <div className="flex items-center gap-1">
                   <FormField.Control>
                     <Checkbox
-                      aria-label="Consent checkbox"
+                      aria-label="同意条款复选框"
                       checked={consentChecked}
                       onCheckedChange={(checked) => {
                         setConsentChecked(checked);
@@ -172,7 +173,7 @@ export function AppPopup() {
                 <FormField.Message
                   messages={{
                     error:
-                      "You need to agree to the terms to access the application.",
+                      "你需要同意条款后才能访问应用。",
                   }}
                 />
               </FormField>
@@ -193,7 +194,7 @@ export function AppPopup() {
               setCompletedFlow(true);
             }}
           >
-            Start
+            开始
           </Button>
         </Modal.Footer>
       </Modal.Content>

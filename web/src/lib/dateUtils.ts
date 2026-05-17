@@ -88,8 +88,8 @@ export const buildDateString = (date: Date | null) => {
   return date
     ? `${Math.round(
         (new Date().getTime() - date.getTime()) / (1000 * 60 * 60 * 24)
-      )} days ago`
-    : "Select a time range";
+      )} 天前`
+    : "选择时间范围";
 };
 
 export const getFormattedDateRangeString = (
@@ -125,7 +125,7 @@ export const getDateRangeString = (from: Date | null, to: Date | null) => {
   if (fromString === toString) return fromString;
 
   if (toDiffDays === 0) {
-    return `${fromString} - Today`;
+    return `${fromString} - 今天`;
   }
 
   return `${fromString} - ${toString}`;
@@ -140,11 +140,11 @@ export const getTimeAgoString = (date: Date | null) => {
   const diffWeeks = Math.floor(diffDays / 7);
   const diffMonths = Math.floor(diffDays / 30);
 
-  if (now.toDateString() === date.toDateString()) return "Today";
-  if (diffDays === 1) return "Yesterday";
-  if (diffDays < 7) return `${diffDays}d ago`;
-  if (diffDays < 30) return `${diffWeeks}w ago`;
-  return `${diffMonths}mo ago`;
+  if (now.toDateString() === date.toDateString()) return "今天";
+  if (diffDays === 1) return "昨天";
+  if (diffDays < 7) return `${diffDays} 天前`;
+  if (diffDays < 30) return `${diffWeeks} 周前`;
+  return `${diffMonths} 个月前`;
 };
 
 /**
