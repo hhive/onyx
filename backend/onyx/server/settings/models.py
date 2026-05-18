@@ -30,6 +30,12 @@ class ApplicationStatus(str, Enum):
     SEAT_LIMIT_EXCEEDED = "seat_limit_exceeded"
 
 
+class Tier(str, Enum):
+    COMMUNITY = "community"
+    BUSINESS = "business"
+    ENTERPRISE = "enterprise"
+
+
 class Notification(BaseModel):
     id: int
     notif_type: NotificationType
@@ -76,13 +82,15 @@ class Settings(BaseModel):
     # This controls UI visibility of EE features (user groups, analytics, RBAC, etc.).
     ee_features_enabled: bool = False
 
+    # Resolved per-tenant tier for ENTERPRISE-only feature gating in the FE.
+    tier: Tier = Tier.COMMUNITY
+
     temperature_override_enabled: bool | None = False
     auto_scroll: bool | None = False
     query_history_type: QueryHistoryType | None = None
 
     # Image processing settings
     image_extraction_and_analysis_enabled: bool | None = True
-    search_time_image_analysis_enabled: bool | None = False
     image_analysis_max_size_mb: int | None = 20
 
     # User Knowledge settings

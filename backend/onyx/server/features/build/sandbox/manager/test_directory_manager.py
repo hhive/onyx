@@ -38,16 +38,12 @@ def temp_templates(temp_base_path: Path) -> dict[str, Path]:
     venv_template = templates_dir / "venv"
     venv_template.mkdir()
 
-    skills_path = templates_dir / "skills"
-    skills_path.mkdir()
-
     agent_instructions = templates_dir / "AGENTS.md"
     agent_instructions.write_text("# Agent Instructions\n")
 
     return {
         "outputs": outputs_template,
         "venv": venv_template,
-        "skills": skills_path,
         "agent_instructions": agent_instructions,
     }
 
@@ -61,7 +57,6 @@ def directory_manager(
         base_path=temp_base_path,
         outputs_template_path=temp_templates["outputs"],
         venv_template_path=temp_templates["venv"],
-        skills_path=temp_templates["skills"],
         agent_instructions_template_path=temp_templates["agent_instructions"],
     )
 
@@ -615,11 +610,12 @@ class TestSandboxDirectoryStructure:
         session_id = "test_complete_sandbox"
         sandbox_path = directory_manager.create_sandbox_directory(session_id)
 
-        # Setup all components
+        # Setup all components (these methods use sandbox_path as session path — legacy naming)
         directory_manager.setup_outputs_directory(sandbox_path)
         directory_manager.setup_venv(sandbox_path)
-        directory_manager.setup_agent_instructions(sandbox_path)
-        directory_manager.setup_skills(sandbox_path)
+        directory_manager.setup_agent_instructions(
+            sandbox_path, skills_section="No skills available."
+        )
         directory_manager.setup_attachments_directory(sandbox_path)
         directory_manager.setup_opencode_config(
             sandbox_path=sandbox_path,
@@ -632,7 +628,6 @@ class TestSandboxDirectoryStructure:
         assert (sandbox_path / "outputs").exists()
         assert (sandbox_path / ".venv").exists()
         assert (sandbox_path / "AGENTS.md").exists()
-        assert (sandbox_path / ".opencode" / "skills").exists()
         assert (sandbox_path / "attachments").exists()
         assert (sandbox_path / "opencode.json").exists()
 
@@ -642,39 +637,3 @@ class TestSandboxDirectoryStructure:
             "options"
         ]
         assert model_options["thinking"]["type"] == "enabled"
-
-    def test_setup_skills_copies_and_overwrites(
-        self,
-        directory_manager: DirectoryManager,
-        temp_base_path: Path,  # noqa: ARG002
-        temp_templates: dict[str, Path],
-    ) -> None:
-        """Test that setup_skills copies skills and overwrites existing ones."""
-        session_id = "test_skills_setup"
-        sandbox_path = directory_manager.create_sandbox_directory(session_id)
-        skills_dest = sandbox_path / ".opencode" / "skills"
-
-        # Create a test skill in the source directory
-        test_skill_dir = temp_templates["skills"] / "test-skill"
-        test_skill_dir.mkdir()
-        test_skill_file = test_skill_dir / "SKILL.md"
-        test_skill_file.write_text("# Test Skill\nOriginal content")
-
-        # First call - should copy skills
-        directory_manager.setup_skills(sandbox_path)
-        assert skills_dest.exists()
-        assert (skills_dest / "test-skill" / "SKILL.md").exists()
-        assert (
-            skills_dest / "test-skill" / "SKILL.md"
-        ).read_text() == "# Test Skill\nOriginal content"
-
-        # Update the source skill
-        test_skill_file.write_text("# Test Skill\nUpdated content")
-
-        # Second call - should overwrite existing skills
-        directory_manager.setup_skills(sandbox_path)
-        assert skills_dest.exists()
-        assert (skills_dest / "test-skill" / "SKILL.md").exists()
-        assert (
-            skills_dest / "test-skill" / "SKILL.md"
-        ).read_text() == "# Test Skill\nUpdated content"

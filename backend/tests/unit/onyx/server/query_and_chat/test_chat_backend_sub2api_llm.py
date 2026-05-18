@@ -1,6 +1,12 @@
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 from onyx.server.query_and_chat import chat_backend
+
+
+@contextmanager
+def _session_context(db_session):
+    yield db_session
 
 
 def test_get_available_tokens_for_persona_passes_db_session_to_user_llm(
@@ -54,6 +60,11 @@ def test_rename_chat_session_uses_user_llm_when_name_generated(monkeypatch) -> N
     monkeypatch.setattr(chat_backend, "get_llm_for_persona", get_llm_for_persona)
     monkeypatch.setattr(
         chat_backend,
+        "get_session_with_current_tenant",
+        lambda: _session_context(expected_db_session),
+    )
+    monkeypatch.setattr(
+        chat_backend,
         "check_llm_cost_limit_for_provider",
         lambda **_kwargs: None,
     )
@@ -90,7 +101,6 @@ def test_rename_chat_session_uses_user_llm_when_name_generated(monkeypatch) -> N
         rename_req=rename_req,
         request=request,
         user=user,
-        db_session=expected_db_session,
     )
 
     assert response.new_name == "generated name"
@@ -116,6 +126,11 @@ def test_rename_chat_session_skips_update_when_name_generation_fails(
         chat_backend,
         "get_llm_for_persona",
         lambda **_kwargs: expected_llm,
+    )
+    monkeypatch.setattr(
+        chat_backend,
+        "get_session_with_current_tenant",
+        lambda: _session_context(expected_db_session),
     )
     monkeypatch.setattr(
         chat_backend,
@@ -153,7 +168,6 @@ def test_rename_chat_session_skips_update_when_name_generation_fails(
         rename_req=rename_req,
         request=request,
         user=user,
-        db_session=expected_db_session,
     )
 
     assert response.new_name == ""

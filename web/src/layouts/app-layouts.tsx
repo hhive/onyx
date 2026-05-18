@@ -42,10 +42,9 @@ import { useRouter } from "next/navigation";
 import MoveCustomAgentChatModal from "@/components/modals/MoveCustomAgentChatModal";
 import ConfirmationModalLayout from "@/refresh-components/layouts/ConfirmationModalLayout";
 import FrostedDiv from "@/refresh-components/FrostedDiv";
-import Popover, { PopoverMenu } from "@/refresh-components/Popover";
+import { Popover, PopoverMenu } from "@opal/components";
 import { PopoverSearchInput } from "@/sections/sidebar/ChatButton";
 import SimplePopover from "@/refresh-components/SimplePopover";
-import { Interactive } from "@opal/core";
 import { Button, LineItemButton, OpenButton } from "@opal/components";
 import { useSidebarState } from "@/layouts/sidebar-layouts";
 import useScreenSize from "@/hooks/useScreenSize";
@@ -63,7 +62,8 @@ import { useSettingsContext } from "@/providers/SettingsProvider";
 import type { AppMode } from "@/providers/QueryControllerProvider";
 import useAppFocus from "@/hooks/useAppFocus";
 import { useQueryController } from "@/providers/QueryControllerProvider";
-import { usePaidEnterpriseFeaturesEnabled } from "@/components/settings/usePaidEnterpriseFeaturesEnabled";
+import { useTierAtLeast } from "@/hooks/useTierAtLeast";
+import { Tier } from "@/interfaces/settings";
 import useBrowserInfo from "@/hooks/useBrowserInfo";
 import { APP_DISPLAY_NAME, APP_SLOGAN } from "@/lib/constants";
 
@@ -82,7 +82,7 @@ import { APP_DISPLAY_NAME, APP_SLOGAN } from "@/lib/constants";
  * - App-Mode toggle (EE gated)
  */
 function Header() {
-  const isPaidEnterpriseFeaturesEnabled = usePaidEnterpriseFeaturesEnabled();
+  const businessTier = useTierAtLeast(Tier.BUSINESS);
   const { state, setAppMode } = useQueryController();
   const settings = useSettingsContext();
   const { isMobile } = useScreenSize();
@@ -323,7 +323,7 @@ function Header() {
               onClick={() => setFolded(false)}
             />
           )}
-          {isPaidEnterpriseFeaturesEnabled &&
+          {businessTier &&
             settings.isSearchModeAvailable &&
             appFocus.isNewSession() &&
             state.phase === "idle" && (
@@ -379,7 +379,7 @@ function Header() {
           className={cn(
             "flex flex-col items-center overflow-hidden",
             pageWithHeaderContent && customHeaderContent
-              ? "order-last basis-full py-2 sm:py-0 sm:order-none sm:basis-auto sm:flex-1"
+              ? "order-last basis-full py-2 sm:py-0 sm:order-0 sm:basis-auto sm:flex-1"
               : "flex-1"
           )}
         >
@@ -435,8 +435,8 @@ function Header() {
 
 const footerMarkdownComponents = {
   p: ({ children }) => (
-    //dont remove the !my-0 class, it's important for the markdown to render without any alignment issues
-    <Text as="p" text03 secondaryAction className="!my-0 text-center">
+    //dont remove the my-0! class, it's important for the markdown to render without any alignment issues
+    <Text as="p" text03 secondaryAction className="my-0! text-center">
       {children}
     </Text>
   ),
@@ -545,7 +545,7 @@ function Root({ children, enableBackground }: AppRootProps) {
       const activeEl = document.activeElement;
       const isFocused =
         activeEl instanceof HTMLElement &&
-        activeEl.id === "onyx-chat-input-textarea";
+        activeEl.id === "onyx-chat-input-textbox";
       const target = event.target;
       const isInteractive =
         target instanceof HTMLElement && !!target.closest(INTERACTIVE_SELECTOR);
@@ -559,7 +559,7 @@ function Root({ children, enableBackground }: AppRootProps) {
     inputWasFocused.current = false;
     const sel = window.getSelection();
     if (sel && !sel.isCollapsed) return;
-    const textarea = document.getElementById("onyx-chat-input-textarea");
+    const textarea = document.getElementById("onyx-chat-input-textbox");
     // Only restore focus if no other element has grabbed it since mousedown.
     if (textarea && document.activeElement !== textarea) {
       textarea.focus();

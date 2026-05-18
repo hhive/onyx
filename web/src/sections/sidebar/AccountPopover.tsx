@@ -11,7 +11,7 @@ import {
   logout,
 } from "@/lib/user";
 import { useUser } from "@/providers/UserProvider";
-import Popover, { PopoverMenu } from "@/refresh-components/Popover";
+import { Popover, PopoverMenu } from "@opal/components";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { SidebarTab, LineItemButton } from "@opal/components";
 import NotificationsPopover from "@/sections/sidebar/NotificationsPopover";
@@ -115,7 +115,7 @@ function SettingsPopover({
           title="通知"
           onClick={onOpenNotifications}
           rightChildren={
-            !!undismissedCount ? (
+            undismissedCount ? (
               <SvgNotificationBubble count={undismissedCount} />
             ) : undefined
           }
@@ -217,7 +217,7 @@ export default function AccountPopover({
               </div>
             )}
             rightChildren={
-              !!undismissedCount ? (
+              undismissedCount ? (
                 <Section padding={0.5}>
                   <SvgNotificationBubble count={undismissedCount} />
                 </Section>

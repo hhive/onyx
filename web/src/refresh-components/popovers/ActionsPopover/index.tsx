@@ -1,6 +1,7 @@
 "use client";
 
 import {
+  CODING_AGENT_TOOL_ID,
   FILE_READER_TOOL_ID,
   IMAGE_GENERATION_TOOL_ID,
   PYTHON_TOOL_ID,
@@ -8,18 +9,18 @@ import {
   WEB_SEARCH_TOOL_ID,
 } from "@/app/app/components/tools/constants";
 import { useState, useEffect, useMemo, useCallback, useRef } from "react";
-import Popover, { PopoverMenu } from "@/refresh-components/Popover";
+import { Popover, PopoverMenu } from "@opal/components";
 import SwitchList, {
   SwitchListItem,
 } from "@/refresh-components/popovers/ActionsPopover/SwitchList";
-import { MinimalPersonaSnapshot } from "@/app/admin/agents/interfaces";
+import { MinimalAgent } from "@/lib/agents/types";
 import {
   MCPAuthenticationType,
   MCPAuthenticationPerformer,
   ToolSnapshot,
 } from "@/lib/tools/interfaces";
 import { useForcedTools } from "@/lib/hooks/useForcedTools";
-import useAgentPreferences from "@/hooks/useAgentPreferences";
+import { useAgentPreferences } from "@/lib/agents/hooks";
 import { useUser } from "@/providers/UserProvider";
 import { FilterManager, useSourcePreferences } from "@/lib/hooks";
 import { getSourceMetadata } from "@/lib/sources";
@@ -29,7 +30,7 @@ import { SourceMetadata } from "@/lib/search/interfaces";
 import { SourceIcon } from "@/components/SourceIcon";
 import { useAvailableTools } from "@/hooks/useAvailableTools";
 import useCCPairs from "@/hooks/useCCPairs";
-import { useLLMProviders } from "@/hooks/useLLMProviders";
+import { useLLMProviders } from "@/hooks/useLanguageModels";
 import { useVectorDbEnabled } from "@/providers/SettingsProvider";
 import InputTypeIn from "@/refresh-components/inputs/InputTypeIn";
 import { useToolOAuthStatus } from "@/lib/hooks/useToolOAuthStatus";
@@ -67,6 +68,8 @@ const TOOL_DESCRIPTIONS: Record<string, string> = {
   [IMAGE_GENERATION_TOOL_ID]: "根据提示词生成图片。",
   [WEB_SEARCH_TOOL_ID]: "搜索网页以获取最新信息。",
   [PYTHON_TOOL_ID]: "执行代码以完成复杂分析。",
+  [CODING_AGENT_TOOL_ID]:
+    "分析代码仓库并回答关于代码的问题。",
 };
 
 const DEFAULT_TOOL_DESCRIPTION = "此操作尚未配置。";
@@ -148,7 +151,7 @@ type SecondaryViewState =
   | { type: "mcp"; serverId: number };
 
 export interface ActionsPopoverProps {
-  selectedAgent: MinimalPersonaSnapshot;
+  selectedAgent: MinimalAgent;
   filterManager: FilterManager;
   availableSources?: ValidSources[];
   disabled?: boolean;
