@@ -54,6 +54,9 @@ from onyx.utils.logger import setup_logger
 
 logger = setup_logger()
 
+SUB2API_USER_AGENT = "Mozilla/5.0"
+SUB2API_IMAGE_CONFIG_MARKER = "sub2api_user_credential"
+
 
 class SearchToolConfig(BaseModel):
     user_selected_filters: BaseFilters | None = None
@@ -134,7 +137,7 @@ def _get_user_sub2api_image_generation_config(
         api_version=None,
         deployment_name=credential.image_model_name,
         max_input_tokens=llm.config.max_input_tokens,
-        custom_config=None,
+        custom_config={SUB2API_IMAGE_CONFIG_MARKER: "true"},
     )
 
 
@@ -300,6 +303,19 @@ def _construct_tools_impl(
                                 or img_generation_llm_config.model_name
                             ),
                             custom_config=img_generation_llm_config.custom_config,
+                            additional_headers=(
+                                {"User-Agent": SUB2API_USER_AGENT}
+                                if (
+                                    img_generation_llm_config.model_provider
+                                    == ImageGenerationProviderName.OPENAI.value
+                                    and img_generation_llm_config.custom_config
+                                    and img_generation_llm_config.custom_config.get(
+                                        SUB2API_IMAGE_CONFIG_MARKER
+                                    )
+                                    == "true"
+                                )
+                                else None
+                            ),
                         ),
                         provider=img_generation_llm_config.model_provider,
                         model=img_generation_llm_config.model_name,

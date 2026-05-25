@@ -53,6 +53,9 @@ def test_get_user_sub2api_image_generation_config_uses_user_credential(
     assert result.api_version is None
     assert result.deployment_name == "gpt-image-2"
     assert result.max_input_tokens == 8192
+    assert result.custom_config == {
+        tool_constructor.SUB2API_IMAGE_CONFIG_MARKER: "true",
+    }
 
 
 def test_get_user_sub2api_image_generation_config_prefers_sub2api_llm_base_url(
@@ -216,3 +219,6 @@ def test_construct_tools_prefers_user_sub2api_image_generation_config(
         image_tool.image_generation_credentials.api_base
         == "https://sub2api.example.com/v1"
     )
+    assert image_tool.image_generation_credentials.additional_headers == {
+        "User-Agent": tool_constructor.SUB2API_USER_AGENT,
+    }

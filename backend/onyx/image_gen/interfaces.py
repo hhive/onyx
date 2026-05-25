@@ -18,6 +18,7 @@ class ImageGenerationProviderCredentials(BaseModel):
     api_version: str | None = None
     deployment_name: str | None = None
     custom_config: dict[str, str] | None = None
+    additional_headers: dict[str, str] | None = None
 
 
 class ReferenceImage(BaseModel):

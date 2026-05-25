@@ -359,6 +359,10 @@ def _get_sub2api_llm_for_user(
         return None
 
     api_base = SUB2API_LLM_BASE_URL.strip() or credential.api_base_url
+    sub2api_headers = {
+        **(additional_headers or {}),
+    }
+    sub2api_headers.setdefault("User-Agent", "Mozilla/5.0")
 
     return get_llm(
         provider=LlmProviderNames.OPENAI_COMPATIBLE,
@@ -370,7 +374,7 @@ def _get_sub2api_llm_for_user(
         custom_config=None,
         timeout=timeout,
         temperature=temperature,
-        additional_headers=additional_headers,
+        additional_headers=sub2api_headers,
         max_input_tokens=128000,
         model_kwargs={},
     )

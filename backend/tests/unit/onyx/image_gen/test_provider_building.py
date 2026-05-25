@@ -39,6 +39,7 @@ def test_build_openai_provider_from_api_key_and_base() -> None:
 
     credentials.api_key = "test"
     credentials.api_base = "test"
+    credentials.additional_headers = {"User-Agent": "Mozilla/5.0"}
 
     provider = OPENAI_PROVIDER
 
@@ -47,6 +48,7 @@ def test_build_openai_provider_from_api_key_and_base() -> None:
     assert isinstance(image_gen_provider, OpenAIImageGenerationProvider)
     assert image_gen_provider._api_key == "test"
     assert image_gen_provider._api_base == "test"
+    assert image_gen_provider._additional_headers == {"User-Agent": "Mozilla/5.0"}
     assert image_gen_provider.supports_reference_images is True
     assert image_gen_provider.max_reference_images == 16
 
@@ -145,6 +147,7 @@ def test_openai_provider_uses_image_generation_without_reference_images() -> Non
     provider = OpenAIImageGenerationProvider(
         api_key="test-key",
         api_base="test-base",
+        additional_headers={"User-Agent": "Mozilla/5.0"},
     )
     expected_response = object()
 
@@ -162,6 +165,7 @@ def test_openai_provider_uses_image_generation_without_reference_images() -> Non
 
     assert response is expected_response
     mock_gen.assert_called_once()
+    assert mock_gen.call_args.kwargs["extra_headers"] == {"User-Agent": "Mozilla/5.0"}
     mock_edit.assert_not_called()
 
 
@@ -169,6 +173,7 @@ def test_openai_provider_uses_image_edit_with_reference_images() -> None:
     provider = OpenAIImageGenerationProvider(
         api_key="test-key",
         api_base="test-base",
+        additional_headers={"User-Agent": "Mozilla/5.0"},
     )
     reference_images = [
         ReferenceImage(data=b"image-1-bytes", mime_type="image/png"),
@@ -192,6 +197,7 @@ def test_openai_provider_uses_image_edit_with_reference_images() -> None:
     assert response is expected_response
     mock_gen.assert_not_called()
     mock_edit.assert_called_once()
+    assert mock_edit.call_args.kwargs["extra_headers"] == {"User-Agent": "Mozilla/5.0"}
     assert mock_edit.call_args.kwargs["image"] == [
         b"image-1-bytes",
         b"image-2-bytes",
