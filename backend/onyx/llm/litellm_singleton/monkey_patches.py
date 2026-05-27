@@ -83,6 +83,36 @@ _original_responses_chunk_parser = (
 )
 
 
+def _normalize_responses_api_response_data(response_data: Any) -> Any:
+    if not isinstance(response_data, dict):
+        return response_data
+
+    normalized = dict(response_data)
+    output = normalized.get("output")
+    if output is None:
+        normalized["output"] = []
+    elif isinstance(output, dict):
+        normalized["output"] = [output]
+    elif isinstance(output, list):
+        normalized["output"] = [
+            item for item in output if not isinstance(item, (str, bytes))
+        ]
+    else:
+        normalized["output"] = []
+
+    return normalized
+
+
+def _normalize_responses_streaming_chunk(parsed_chunk: Any) -> Any:
+    if not isinstance(parsed_chunk, dict):
+        return parsed_chunk
+    response = parsed_chunk.get("response")
+    normalized_response = _normalize_responses_api_response_data(response)
+    if normalized_response is response:
+        return parsed_chunk
+    return {**parsed_chunk, "response": normalized_response}
+
+
 def _patch_ollama_chunk_parser() -> None:
     """
     Patches OllamaChatCompletionResponseIterator.chunk_parser to properly handle
@@ -491,6 +521,7 @@ def _patch_responses_api_usage_format() -> None:
         """
         Patched model_construct that ensures usage is a ResponseAPIUsage object.
         """
+        values = _normalize_responses_api_response_data(values)
         # Transform usage if present and not already the correct type
         if "usage" in values and values["usage"] is not None:
             usage = values["usage"]
@@ -542,8 +573,6 @@ def _patch_logging_assembled_streaming_response() -> None:
     original object with its proper ResponseAPIUsage type.
     """
     from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
-    from litellm.responses.utils import ResponseAPILoggingUtils
-    from litellm.types.llms.openai import ResponseAPIUsage
     from litellm.types.llms.openai import ResponseCompletedEvent
     from litellm.types.llms.openai import ResponseFailedEvent
     from litellm.types.llms.openai import ResponseIncompleteEvent
@@ -569,8 +598,8 @@ def _patch_logging_assembled_streaming_response() -> None:
 
         The original LiteLLM code transforms usage to chat completion format and
         sets it directly as a dict, which causes Pydantic serialization warnings.
-        This patch uses model_construct to rebuild the response with the transformed
-        usage, ensuring proper typing.
+        This patch keeps the response as a typed ResponsesAPIResponse and deep-copies
+        it without dumping nested output items into plain dicts.
         """
         if self.stream is not True:
             return None
@@ -582,27 +611,14 @@ def _patch_logging_assembled_streaming_response() -> None:
             result,
             (ResponseCompletedEvent, ResponseIncompleteEvent, ResponseFailedEvent),
         ):
-            # Get the original response data
             original_response = result.response
-            response_data = original_response.model_dump()
-
-            # Transform usage if present
-            if isinstance(original_response.usage, ResponseAPIUsage):
-                transformed_usage = (
-                    ResponseAPILoggingUtils._transform_response_api_usage_to_chat_usage(
-                        original_response.usage
-                    )
+            if isinstance(original_response, dict):
+                original_response = _normalize_responses_api_response_data(
+                    original_response
                 )
-                # Put the transformed usage (in chat completion format) into response_data
-                # Our patched model_construct will convert it back to ResponseAPIUsage
-                response_data["usage"] = (
-                    transformed_usage.model_dump()
-                    if hasattr(transformed_usage, "model_dump")
-                    else dict(transformed_usage)
-                )
+                original_response = ResponsesAPIResponse(**original_response)
 
-            # Rebuild using model_construct - our patch ensures usage is properly typed
-            response_copy = ResponsesAPIResponse.model_construct(**response_data)
+            response_copy = original_response.model_copy(deep=True)
 
             # Copy hidden params
             if hasattr(original_response, "_hidden_params"):
@@ -617,6 +633,33 @@ def _patch_logging_assembled_streaming_response() -> None:
     )
     LiteLLMLoggingObj._get_assembled_streaming_response = (  # ty: ignore[invalid-assignment]
         _patched_get_assembled_streaming_response
+    )
+
+
+def _patch_openai_responses_streaming_transform_response() -> None:
+    from litellm.llms.openai.responses.transformation import OpenAIResponsesAPIConfig
+
+    original_method = OpenAIResponsesAPIConfig.transform_streaming_response
+
+    if getattr(original_method, "_is_patched", False):
+        return
+
+    def _patched_transform_streaming_response(
+        self: Any,
+        model: str,
+        parsed_chunk: dict,
+        logging_obj: Any,
+    ) -> Any:
+        return original_method(
+            self,
+            model,
+            _normalize_responses_streaming_chunk(parsed_chunk),
+            logging_obj,
+        )
+
+    _patched_transform_streaming_response._is_patched = True  # ty: ignore[attr-defined]
+    OpenAIResponsesAPIConfig.transform_streaming_response = (  # ty: ignore[method-assign]
+        _patched_transform_streaming_response
     )
 
 
@@ -636,5 +679,6 @@ def apply_monkey_patches() -> None:
     _patch_responses_reasoning_summary_newlines()
     _patch_openai_responses_transform_response()
     _patch_azure_responses_should_fake_stream()
+    _patch_openai_responses_streaming_transform_response()
     _patch_responses_api_usage_format()
     _patch_logging_assembled_streaming_response()
