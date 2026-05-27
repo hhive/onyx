@@ -123,6 +123,10 @@ class UserSettings(Settings):
     tenant_id: str = POSTGRES_DEFAULT_SCHEMA
     # Feature flag for Onyx Craft (Build Mode) - used for server-side redirects
     onyx_craft_enabled: bool = False
+    # Dev/debug flag: when true, the FE renders a button that streams the
+    # user's sandbox pod's opencode-serve logs. Gated by the
+    # ENABLE_OPENCODE_DEBUGGING env var; never set in prod.
+    opencode_debugging_enabled: bool = False
     # True when a vector database (Vespa/OpenSearch) is available.
     # False when DISABLE_VECTOR_DB is set — connectors, RAG search, and
     # document sets are unavailable.
@@ -143,3 +147,7 @@ class UserSettings(Settings):
             else DEFAULT_FILE_TOKEN_COUNT_THRESHOLD_K_VECTOR_DB
         )
     )
+    # True when the backend is running inside a container (Docker/Podman).
+    # The frontend uses this to default local-service URLs (e.g. Ollama,
+    # LM Studio) to host.docker.internal instead of localhost.
+    is_containerized: bool = False

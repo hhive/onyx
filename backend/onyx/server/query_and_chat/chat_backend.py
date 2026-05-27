@@ -458,6 +458,7 @@ def rename_chat_session(
         metadata={
             "tenant_id": get_current_tenant_id(),
             "chat_session_id": str(chat_session_id),
+            "user_id": str(user_id) if user_id else None,
         },
     ):
         try:
@@ -665,6 +666,15 @@ def handle_send_chat_message(
             external_state_container=state_container,
         )
         result = gather_stream_full(packets, state_container)
+        # CreateChatSessionID is only yielded for newly-created sessions, so for
+        # follow-up messages on an existing session the aggregated response would
+        # otherwise omit chat_session_id. Backfill it from the request so the
+        # field is always present for non-streaming clients.
+        if (
+            result.chat_session_id is None
+            and chat_message_req.chat_session_id is not None
+        ):
+            result.chat_session_id = chat_message_req.chat_session_id
         return result
 
     # Streaming path, normal Onyx UI behavior

@@ -22,7 +22,7 @@ import {
   getBuildLlmSelection,
   getDefaultLlmSelection,
 } from "@/app/craft/onboarding/constants";
-import { LLMProviderDescriptor } from "@/interfaces/llm";
+import { LLMProviderDescriptor } from "@/lib/languageModels/types";
 import { SWR_KEYS } from "@/lib/swr-keys";
 import { testApiKeyHelper } from "@/sections/modals/languageModels/svc";
 import OnboardingInfoPages from "@/app/craft/onboarding/components/OnboardingInfoPages";
@@ -236,7 +236,9 @@ export default function BuildOnboardingModal({
 
     const testResult = await testApiKeyHelper(
       currentProviderConfig.providerName,
-      payload
+      payload,
+      apiKey,
+      selectedModel
     );
 
     if (!testResult.ok) {

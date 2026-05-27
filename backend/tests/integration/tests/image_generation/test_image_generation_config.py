@@ -7,9 +7,9 @@ Uses module-scoped fixtures to reset DB and create users once per module for fas
 """
 
 import pytest
-import requests
 
 from tests.integration.common_utils.constants import API_SERVER_URL
+from tests.integration.common_utils.http_client import client
 from tests.integration.common_utils.managers.image_generation import (
     ImageGenerationConfigManager,
 )
@@ -130,7 +130,7 @@ def test_create_duplicate_config_fails(
     )
 
     # Try to create another with the same image_provider_id
-    response = requests.post(
+    response = client.post(
         f"{API_SERVER_URL}/admin/image-generation/config",
         json={
             "image_provider_id": "duplicate-test-id",
@@ -212,7 +212,7 @@ def test_get_credentials_not_found(
     """Test getting credentials for a non-existent config returns 404."""
     admin_user, _ = setup_image_generation_tests
 
-    response = requests.get(
+    response = client.get(
         f"{API_SERVER_URL}/admin/image-generation/config/non-existent-id/credentials",
         headers=admin_user.headers,
     )
@@ -309,7 +309,7 @@ def test_update_config_source_provider_not_found(
     )
 
     # Try to update with non-existent source provider
-    response = requests.put(
+    response = client.put(
         f"{API_SERVER_URL}/admin/image-generation/config/{config.image_provider_id}",
         json={
             "model_name": "gpt-image-1",
@@ -363,7 +363,7 @@ def test_delete_config_not_found(
     """Test deleting a non-existent config returns 404."""
     admin_user, _ = setup_image_generation_tests
 
-    response = requests.delete(
+    response = client.delete(
         f"{API_SERVER_URL}/admin/image-generation/config/non-existent-id",
         headers=admin_user.headers,
     )
@@ -470,7 +470,7 @@ def test_set_default_not_found(
     """Test setting a non-existent config as default returns 404."""
     admin_user, _ = setup_image_generation_tests
 
-    response = requests.post(
+    response = client.post(
         f"{API_SERVER_URL}/admin/image-generation/config/non-existent-id/default",
         headers=admin_user.headers,
     )
@@ -485,7 +485,7 @@ def test_create_config_missing_credentials(
     admin_user, _ = setup_image_generation_tests
 
     # Try to create without api_key/provider or source_llm_provider_id
-    response = requests.post(
+    response = client.post(
         f"{API_SERVER_URL}/admin/image-generation/config",
         json={
             "image_provider_id": "no-creds-test",
@@ -504,7 +504,7 @@ def test_create_config_source_provider_not_found(
     """Test creating a config with non-existent source_llm_provider_id fails."""
     admin_user, _ = setup_image_generation_tests
 
-    response = requests.post(
+    response = client.post(
         f"{API_SERVER_URL}/admin/image-generation/config",
         json={
             "image_provider_id": "bad-source-test",

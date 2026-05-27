@@ -6,18 +6,46 @@ from pathlib import Path
 class SandboxBackend(str, Enum):
     """Backend mode for sandbox operations.
 
-    LOCAL: Development mode - no snapshots, no automatic cleanup
-    KUBERNETES: Production mode - full snapshots and cleanup
+    KUBERNETES: Production + dev (kind) - full snapshots and cleanup.
+    DOCKER: Self-hosted docker-compose - api_server drives the Docker Engine.
     """
 
-    LOCAL = "local"
     KUBERNETES = "kubernetes"
+    DOCKER = "docker"
+
+
+def _parse_sandbox_backend(raw: str) -> SandboxBackend:
+    """Parse SANDBOX_BACKEND with a friendly error on the retired ``local`` value.
+
+    The local backend was removed in favour of the kubernetes (kind) dev flow
+    documented in ``docs/dev/local-kubernetes.md``. We raise a deliberate
+    startup error rather than the bare ``ValueError`` from the enum
+    constructor so the operator gets pointed at the migration path.
+    """
+    if raw.lower() == "local":
+        raise RuntimeError(
+            "SANDBOX_BACKEND=local is no longer supported. The local sandbox "
+            "backend has been removed; use the kind-based Kubernetes dev flow. "
+            "See docs/dev/local-kubernetes.md (run `make craft-up`) and unset "
+            "SANDBOX_BACKEND in your environment (it now defaults to "
+            "'kubernetes')."
+        )
+    try:
+        return SandboxBackend(raw)
+    except ValueError as e:
+        raise RuntimeError(
+            f"SANDBOX_BACKEND={raw!r} is not a valid value. Allowed values: "
+            f"{[b.value for b in SandboxBackend]!r}. See "
+            "docs/dev/local-kubernetes.md for the recommended dev setup."
+        ) from e
 
 
 # Sandbox backend mode (controls snapshot and cleanup behavior)
-# "local" = no snapshots, no cleanup (for development)
-# "kubernetes" = full snapshots and cleanup (for production)
-SANDBOX_BACKEND = SandboxBackend(os.environ.get("SANDBOX_BACKEND", "local"))
+# "kubernetes" = full snapshots and cleanup (production Helm/cloud + dev kind)
+# "docker" = full snapshots and cleanup (self-hosted docker-compose)
+SANDBOX_BACKEND = _parse_sandbox_backend(
+    os.environ.get("SANDBOX_BACKEND", "kubernetes")
+)
 
 # Base directory path for persistent document storage (local filesystem)
 # Example: /var/onyx/file-system or /app/file-system
@@ -27,10 +55,6 @@ PERSISTENT_DOCUMENT_STORAGE_PATH = os.environ.get(
 
 _THIS_FILE = Path(__file__)
 
-# Sandbox filesystem paths
-SANDBOX_BASE_PATH = os.environ.get("SANDBOX_BASE_PATH", "/tmp/onyx-sandboxes")
-OUTPUTS_TEMPLATE_PATH = os.environ.get("OUTPUTS_TEMPLATE_PATH", "/templates/outputs")
-VENV_TEMPLATE_PATH = os.environ.get("VENV_TEMPLATE_PATH", "/templates/venv")
 SKILLS_TEMPLATE_PATH = str(
     _THIS_FILE.parent / "sandbox" / "kubernetes" / "docker" / "skills"
 )
@@ -85,7 +109,7 @@ SANDBOX_NAMESPACE = os.environ.get("SANDBOX_NAMESPACE", "onyx-sandboxes")
 # Container image for sandbox pods
 # Should include Next.js template, opencode CLI, and agent skills
 SANDBOX_CONTAINER_IMAGE = os.environ.get(
-    "SANDBOX_CONTAINER_IMAGE", "onyxdotapp/sandbox:v0.1.41"
+    "SANDBOX_CONTAINER_IMAGE", "onyxdotapp/sandbox:v0.1.44"
 )
 
 # S3 bucket for sandbox file storage (snapshots, knowledge files, uploads)
@@ -101,9 +125,78 @@ SANDBOX_SERVICE_ACCOUNT_NAME = os.environ.get(
 
 ENABLE_CRAFT = os.environ.get("ENABLE_CRAFT", "false").lower() == "true"
 
+# Dev/debug-only: when true, exposes a frontend button + SSE endpoint that
+# tails the user's sandbox pod's opencode-serve container logs. Never
+# enable in prod — the logs include LLM I/O and tool invocations that may
+# contain sensitive data. Disabled by default; the SSE endpoint 404s when
+# this is false so the surface is gone (not just hidden).
+ENABLE_OPENCODE_DEBUGGING = (
+    os.environ.get("ENABLE_OPENCODE_DEBUGGING", "false").lower() == "true"
+)
+
 # Internal URL the sandbox uses to reach the Onyx API server.
 # Must be set when SANDBOX_BACKEND=kubernetes (no default — varies per deployment).
 SANDBOX_API_SERVER_URL = os.environ.get("SANDBOX_API_SERVER_URL", "")
+
+# Per-pod resource requests/limits. Defaults match production sizing for
+# real bun/npm/python workloads. CI overrides these in kind clusters where
+# the runner only has 4 vCPU and we provision 4+ sandbox pods concurrently;
+# k8s scheduler honors requests, so the production defaults would prevent
+# all-but-one pod from being scheduled at the same time.
+SANDBOX_POD_CPU_REQUEST = os.environ.get("SANDBOX_POD_CPU_REQUEST", "1000m")
+SANDBOX_POD_MEMORY_REQUEST = os.environ.get("SANDBOX_POD_MEMORY_REQUEST", "2Gi")
+SANDBOX_POD_CPU_LIMIT = os.environ.get("SANDBOX_POD_CPU_LIMIT", "2000m")
+SANDBOX_POD_MEMORY_LIMIT = os.environ.get("SANDBOX_POD_MEMORY_LIMIT", "10Gi")
+
+# ============================================================================
+# Sandbox Egress Proxy Configuration
+# Consumed by both the api-server (building sandbox pod specs) and the
+# proxy itself (on boot).
+# ============================================================================
+
+# Empty SANDBOX_PROXY_HOST disables proxy wiring for tests/dev (the
+# initContainer is skipped and HTTPS_PROXY isn't set on the sandbox).
+SANDBOX_PROXY_HOST = os.environ.get("SANDBOX_PROXY_HOST", "")
+SANDBOX_PROXY_PORT = int(os.environ.get("SANDBOX_PROXY_PORT", "8080"))
+
+SANDBOX_PROXY_LISTEN_PORT = int(os.environ.get("SANDBOX_PROXY_LISTEN_PORT", "8080"))
+SANDBOX_PROXY_HEALTHZ_PORT = int(os.environ.get("SANDBOX_PROXY_HEALTHZ_PORT", "8081"))
+
+# Namespace the proxy runs in. The CA Secret lives here; the CA
+# ConfigMap is projected into SANDBOX_NAMESPACE so sandboxes can mount
+# it (K8s does not allow cross-namespace ConfigMap mounts).
+SANDBOX_PROXY_NAMESPACE = os.environ.get("SANDBOX_PROXY_NAMESPACE", "onyx")
+
+SANDBOX_PROXY_CA_SECRET = os.environ.get("SANDBOX_PROXY_CA_SECRET", "sandbox-proxy-ca")
+SANDBOX_PROXY_CA_CONFIGMAP = os.environ.get(
+    "SANDBOX_PROXY_CA_CONFIGMAP", "sandbox-proxy-ca-bundle"
+)
+
+# ============================================================================
+# Docker Sandbox Configuration
+# Only used when SANDBOX_BACKEND = "docker" (self-hosted docker-compose)
+# ============================================================================
+
+# Docker socket path on the api_server host. Mounted into the api_server
+# container; api_server uses this to drive sandbox container lifecycle.
+SANDBOX_DOCKER_SOCKET = os.environ.get("SANDBOX_DOCKER_SOCKET", "/var/run/docker.sock")
+
+# Bridge network for sandbox containers. Sandbox containers join only this
+# network and never compose's default network, isolating them from
+# api_server, postgres, redis, etc.
+SANDBOX_DOCKER_NETWORK = os.environ.get("SANDBOX_DOCKER_NETWORK", "onyx_craft_sandbox")
+
+# Prefix for the per-sandbox named volumes that hold ``/workspace/sessions``.
+SANDBOX_DOCKER_VOLUME_PREFIX = os.environ.get(
+    "SANDBOX_DOCKER_VOLUME_PREFIX", "onyx-craft-sandbox-"
+)
+
+# Container resource limits. Memory accepts docker-style suffixes (``2g``).
+# Defaults match the Kubernetes sandbox pod's *requests* (1 CPU / 2Gi),
+# not its limits (2 CPU / 10Gi). Single-VM docker-compose deployments rarely
+# have the headroom to over-commit each sandbox to 10Gi.
+SANDBOX_DOCKER_MEMORY_LIMIT = os.environ.get("SANDBOX_DOCKER_MEMORY_LIMIT", "2g")
+SANDBOX_DOCKER_CPU_LIMIT = float(os.environ.get("SANDBOX_DOCKER_CPU_LIMIT", "1.0"))
 
 # ============================================================================
 # SSE Streaming Configuration
@@ -119,6 +212,62 @@ SSE_KEEPALIVE_INTERVAL = float(os.environ.get("SSE_KEEPALIVE_INTERVAL", "15.0"))
 # Timeout for ACP message processing in seconds
 # This is the maximum time to wait for a complete response from the agent
 ACP_MESSAGE_TIMEOUT = float(os.environ.get("ACP_MESSAGE_TIMEOUT", "900.0"))
+
+
+class AgentTransport(str, Enum):
+    """Wire protocol used to drive the in-sandbox agent.
+
+    ACP: subprocess-per-message `opencode acp` over JSON-RPC (stdin/stdout).
+         The historical default. Deprecated — opencode 1.15.7 non-deterministically
+         drops the per-turn terminator; see docs/craft/opencode-serve-migration.md.
+    SERVE: long-lived `opencode serve` HTTP server inside the sandbox pod.
+         Streaming via /event SSE, prompts via POST /session/.../prompt_async.
+         Target post-Phase 5.
+    """
+
+    ACP = "acp"
+    SERVE = "serve"
+
+
+# Transport for driving the in-sandbox agent. Default ACP until serve has soaked.
+# The OpencodeServeClient path is gated on this; setting "serve" routes
+# SandboxManager.send_message through HTTP instead of the per-message exec'd
+# `opencode acp` subprocess. See docs/craft/opencode-serve-migration.md.
+AGENT_TRANSPORT = AgentTransport(
+    os.environ.get("AGENT_TRANSPORT", AgentTransport.ACP.value)
+)
+
+# Port `opencode serve` listens on inside the sandbox container.
+# Match against the EXPOSE directive in the sandbox Dockerfile.
+OPENCODE_SERVE_PORT = int(os.environ.get("OPENCODE_SERVE_PORT", "4096"))
+
+# Name of the env var inside the sandbox container that holds the
+# per-pod HTTP Basic Auth password for opencode serve. The sandbox manager
+# is responsible for generating + provisioning the per-pod K8s Secret
+# (see docs/craft/opencode-serve-migration.md §Pod / image changes) and
+# mounting it under this name in the sandbox container's env.
+OPENCODE_SERVER_PASSWORD_ENV = os.environ.get(
+    "OPENCODE_SERVER_PASSWORD_ENV", "OPENCODE_SERVER_PASSWORD"
+)
+
+# Username for HTTP Basic Auth against opencode serve. Opencode's serve
+# implementation hard-codes the username to "opencode" when only
+# OPENCODE_SERVER_PASSWORD is set; using any other value yields a 401
+# (verified empirically against opencode 1.15.7, see test report).
+OPENCODE_SERVER_USERNAME = "opencode"
+
+# Per-request HTTP timeouts when talking to opencode serve, in seconds.
+OPENCODE_SERVE_CONNECT_TIMEOUT = float(
+    os.environ.get("OPENCODE_SERVE_CONNECT_TIMEOUT", "5.0")
+)
+OPENCODE_SERVE_REQUEST_TIMEOUT = float(
+    os.environ.get("OPENCODE_SERVE_REQUEST_TIMEOUT", "30.0")
+)
+# Idle timeout for /event SSE. The reader reconnects (with backoff) if the
+# stream is silent for this long.
+OPENCODE_SERVE_EVENT_READ_TIMEOUT = float(
+    os.environ.get("OPENCODE_SERVE_EVENT_READ_TIMEOUT", "60.0")
+)
 
 # ============================================================================
 # Rate Limiting Configuration
