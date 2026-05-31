@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from onyx.auth.oauth_token_manager import OAuthTokenManager
 from onyx.chat.emitter import Emitter
 from onyx.configs.app_configs import DISABLE_VECTOR_DB
+from onyx.configs.app_configs import SUB2API_DEFAULT_IMAGE_MODEL
 from onyx.configs.model_configs import GEN_AI_TEMPERATURE
 from onyx.context.search.models import BaseFilters
 from onyx.context.search.models import PersonaSearchInfo
@@ -20,12 +21,17 @@ from onyx.db.models import Persona
 from onyx.db.models import User
 from onyx.db.oauth_config import get_oauth_config
 from onyx.db.search_settings import get_current_search_settings
+from onyx.db.sub2api_user_credentials import get_sub2api_user_credentials
 from onyx.db.tools import get_builtin_tool
 from onyx.document_index.factory import get_default_document_index
 from onyx.image_gen.interfaces import ImageGenerationProviderCredentials
 from onyx.llm.interfaces import LLM
 from onyx.llm.interfaces import LLMConfig
 from onyx.onyxbot.slack.models import SlackContext
+from onyx.server.sub2api.image_generation import build_sub2api_image_credentials
+from onyx.server.sub2api.image_generation import (
+    is_sub2api_image_generation_configured,
+)
 from onyx.tools.built_in_tools import get_built_in_tool_by_id
 from onyx.tools.interface import Tool
 from onyx.tools.models import DynamicSchemaInfo
@@ -108,6 +114,24 @@ def _get_image_generation_config(llm: LLM, db_session: Session) -> LLMConfig:
         deployment_name=llm_provider.deployment_name,
         max_input_tokens=llm.config.max_input_tokens,
         custom_config=llm_provider.custom_config,
+    )
+
+
+def _get_sub2api_image_generation_config(
+    user: User,
+    db_session: Session,
+) -> tuple[ImageGenerationProviderCredentials, str, str] | None:
+    if not is_sub2api_image_generation_configured():
+        return None
+
+    credential = get_sub2api_user_credentials(db_session, user.id)
+    if credential is None:
+        return None
+
+    return (
+        build_sub2api_image_credentials(credential),
+        "openai",
+        SUB2API_DEFAULT_IMAGE_MODEL,
     )
 
 
@@ -240,6 +264,24 @@ def _construct_tools_impl(
 
             # Handle Image Generation Tool
             elif tool_cls.__name__ == ImageGenerationTool.__name__:
+                sub2api_image_config = _get_sub2api_image_generation_config(
+                    user=user,
+                    db_session=db_session,
+                )
+
+                if sub2api_image_config is not None:
+                    credentials, provider, model = sub2api_image_config
+                    tool_dict[db_tool_model.id] = [
+                        ImageGenerationTool(
+                            image_generation_credentials=credentials,
+                            provider=provider,
+                            model=model,
+                            tool_id=db_tool_model.id,
+                            emitter=emitter,
+                        )
+                    ]
+                    continue
+
                 img_generation_llm_config = _get_image_generation_config(
                     llm, db_session
                 )

@@ -25,6 +25,9 @@ from onyx.server.query_and_chat.streaming_models import ImageGenerationFinal
 from onyx.server.query_and_chat.streaming_models import ImageGenerationToolHeartbeat
 from onyx.server.query_and_chat.streaming_models import ImageGenerationToolStart
 from onyx.server.query_and_chat.streaming_models import Packet
+from onyx.server.sub2api.image_generation import (
+    is_sub2api_image_generation_configured,
+)
 from onyx.tools.interface import Tool
 from onyx.tools.models import ToolCallException
 from onyx.tools.models import ToolExecutionException
@@ -91,6 +94,9 @@ class ImageGenerationTool(Tool[None]):
     def is_available(cls, db_session: Session) -> bool:
         """Available if a default image generation config exists with valid credentials."""
         try:
+            if is_sub2api_image_generation_configured():
+                return True
+
             config = get_default_image_generation_config(db_session)
             if not config or not config.model_configuration:
                 return False
