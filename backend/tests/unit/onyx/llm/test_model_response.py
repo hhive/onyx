@@ -237,6 +237,17 @@ def test_from_litellm_model_response_stream_parses_tool_calls() -> None:
     )
 
 
+def test_from_litellm_model_response_stream_defaults_null_tool_call_type() -> None:
+    payload = _build_tool_call_payload()
+    payload["choices"][0]["delta"]["tool_calls"][0]["type"] = None
+
+    response = from_litellm_model_response_stream(_make_stream_double(payload))
+
+    tool_calls = response.choice.delta.tool_calls
+    assert len(tool_calls) == 1
+    assert tool_calls[0].type == "function"
+
+
 def test_from_litellm_model_response_stream_preserves_reasoning_content() -> None:
     response = from_litellm_model_response_stream(
         _make_stream_double(_build_reasoning_payload())
@@ -328,3 +339,13 @@ def test_from_litellm_model_response_parses_tool_calls() -> None:
     assert tool_call.type == "function"
     assert tool_call.function.name == "search_documents"
     assert tool_call.function.arguments == '{"query": "test"}'
+
+
+def test_from_litellm_model_response_defaults_null_tool_call_type() -> None:
+    payload = _build_non_streaming_tool_call_payload()
+    payload["choices"][0]["message"]["tool_calls"][0]["type"] = None
+
+    response = from_litellm_model_response(_make_response_double(payload))
+
+    assert response.choice.message.tool_calls is not None
+    assert response.choice.message.tool_calls[0].type == "function"

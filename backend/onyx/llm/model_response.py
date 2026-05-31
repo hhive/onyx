@@ -107,7 +107,7 @@ def _parse_delta_tool_calls(
             ChatCompletionDeltaToolCall(
                 id=tool_call.get("id"),
                 index=tool_call.get("index", 0),
-                type=tool_call.get("type", "function"),
+                type=tool_call.get("type") or "function",
                 function=_parse_function_call(tool_call.get("function")),
             )
         )
@@ -130,7 +130,7 @@ def _parse_message_tool_calls(
         parsed_tool_calls.append(
             ChatCompletionMessageToolCall(
                 id=tool_call.get("id", ""),
-                type=tool_call.get("type", "function"),
+                type=tool_call.get("type") or "function",
                 function=function_call,
             )
         )
