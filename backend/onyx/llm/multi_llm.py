@@ -561,7 +561,15 @@ class LitellmLLM(LLM):
         # although this assumes users have upgraded their litellm if relevant.
         omits_sampling_params = _anthropic_omits_sampling_params(self.config.model_name)
         if not omits_sampling_params:
-            optional_kwargs["temperature"] = 1 if is_reasoning else self._temperature
+            temperature = 1 if is_reasoning else self._temperature
+            model_name_lower = (
+                self.config.deployment_name or self.config.model_name
+            ).lower()
+            if model_name_lower.startswith("gpt-5") and not model_name_lower.startswith(
+                "gpt-5.1"
+            ):
+                temperature = 1
+            optional_kwargs["temperature"] = temperature
 
         if stream and not is_vertex_model_rejecting_output_config:
             optional_kwargs["stream_options"] = {"include_usage": True}

@@ -505,6 +505,38 @@ def test_keeps_temperature_for_other_models(default_multi_llm: LitellmLLM) -> No
         assert kwargs["temperature"] == 0.0
 
 
+@pytest.mark.parametrize(
+    ("model_name", "expected_temperature"),
+    [
+        ("gpt-5.5", 1),
+        ("gpt-5-chat", 1),
+        ("gpt-5.1", 0.0),
+    ],
+)
+def test_gpt_5_models_use_supported_temperature(
+    model_name: str, expected_temperature: float
+) -> None:
+    llm = LitellmLLM(
+        api_key="test_key",
+        timeout=30,
+        model_provider=LlmProviderNames.OPENAI_COMPATIBLE,
+        model_name=model_name,
+        max_input_tokens=get_max_input_tokens(
+            model_provider=LlmProviderNames.OPENAI,
+            model_name=model_name,
+        ),
+    )
+
+    with patch("litellm.completion") as mock_completion:
+        mock_completion.return_value = []
+
+        messages: LanguageModelInput = [UserMessage(content="Hi")]
+        list(llm.stream(messages))
+
+        kwargs = mock_completion.call_args.kwargs
+        assert kwargs["temperature"] == expected_temperature
+
+
 @pytest.mark.parametrize("model_name", VERTEX_OPUS_MODELS_REJECTING_OUTPUT_CONFIG)
 def test_vertex_stream_omits_stream_options(model_name: str) -> None:
     llm = LitellmLLM(
