@@ -540,15 +540,15 @@ const AppInputBar = React.memo(
       <div
         {...(isSearchMode ? { inert: true } : {})}
         className={cn(
-          "flex justify-between items-center w-full",
+          "flex flex-wrap justify-between items-center w-full gap-y-1",
           isSearchMode
             ? "opacity-0 p-0 h-0 overflow-hidden pointer-events-none"
-            : "opacity-100 p-1 h-11 pointer-events-auto",
+            : "opacity-100 p-1 min-h-11 pointer-events-auto",
           "transition-all duration-150"
         )}
       >
         {/* Bottom left controls */}
-        <div className="flex flex-row items-center">
+        <div className="flex min-w-0 flex-1 flex-row items-center overflow-x-auto">
           {/* (+) button - always visible */}
           <FilePickerPopover
             onFileClick={handleFileClick}
@@ -574,7 +574,7 @@ const AppInputBar = React.memo(
               <Button
                 disabled={disabled}
                 icon={SvgPaperclip}
-                tooltip="Attach Files"
+                tooltip="添加文件"
                 interaction={open ? "hover" : "rest"}
                 prominence="tertiary"
               />
@@ -614,8 +614,8 @@ const AppInputBar = React.memo(
                           return currentTabUrl;
                         }
                       })()
-                    : "Reading tab..."
-                  : "Read this tab"}
+                    : "正在读取标签页..."
+                  : "读取当前标签页"}
               </SelectButton>
             ) : (
               showDeepResearch && (
@@ -628,11 +628,11 @@ const AppInputBar = React.memo(
                   foldable={!deepResearchEnabled}
                   tooltip={
                     isMultiModelActive
-                      ? "Deep Research is disabled in multi-model mode"
+                      ? "多模型模式下暂不可使用深度研究"
                       : undefined
                   }
                 >
-                  Deep Research
+                  深度研究
                 </SelectButton>
               )
             )}
@@ -667,7 +667,7 @@ const AppInputBar = React.memo(
         </div>
 
         {/* Bottom right controls */}
-        <div className="flex flex-row items-center gap-1">
+        <div className="ml-auto flex shrink-0 flex-row items-center gap-1">
           {showMicButton &&
             (sttEnabled ? (
               <MicrophoneButton
@@ -692,9 +692,9 @@ const AppInputBar = React.memo(
               <Button
                 disabled
                 icon={SvgMicrophone}
-                aria-label="Set up voice"
+                aria-label="设置语音"
                 prominence="tertiary"
-                tooltip="Voice not configured. Set up in admin settings."
+                tooltip="语音尚未配置，请在管理员设置中启用。"
               />
             ))}
 
@@ -825,7 +825,7 @@ const AppInputBar = React.memo(
                 <Popover.Anchor asChild>
                   <div
                     ref={inputWrapperRef}
-                    className="px-3 py-2 flex-1 flex h-11 overflow-hidden"
+                    className="px-3 py-2 flex-1 flex min-h-12 max-h-32 overflow-hidden sm:min-h-11"
                   >
                     <div
                       ref={inputRef}
@@ -852,17 +852,17 @@ const AppInputBar = React.memo(
                       }}
                       aria-multiline={true}
                       aria-disabled={disabled}
-                      aria-placeholder="How can I help you today?"
+                      aria-placeholder="今天想聊点什么？"
                       data-placeholder={
                         queuedMessages.length > 0 && !message
-                          ? "Press up to edit queued messages"
+                          ? "按上方向键编辑排队消息"
                           : isRecording
-                            ? "Listening..."
+                            ? "正在聆听..."
                             : isVoicePlaybackActive
-                              ? "Onyx is speaking..."
+                              ? "小逆talk 正在说话..."
                               : isSearchMode
-                                ? "Search connected sources"
-                                : "How can I help you today?"
+                                ? "搜索已连接来源"
+                                : "今天想聊点什么？"
                       }
                       data-empty={!message ? "" : undefined}
                       onKeyDown={(event) => {
@@ -936,7 +936,7 @@ const AppInputBar = React.memo(
                           tabbingIconIndex === sortedFilteredPrompts.length
                         }
                       >
-                        Create New Prompt
+                        新建提示词
                       </LineItem>,
                     ]}
                   </Popover.Menu>

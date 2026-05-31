@@ -93,12 +93,13 @@ describe("useShowOnboarding", () => {
     expect(result.current.showOnboarding).toBe(false);
   });
 
-  it("returns showOnboarding=true when no providers and no chat sessions", () => {
+  it("defaults to showOnboarding=false when no providers and no chat sessions", () => {
     const { result } = renderUseShowOnboarding({
       hasAnyProvider: false,
       chatSessionsCount: 0,
     });
-    expect(result.current.showOnboarding).toBe(true);
+    expect(result.current.showOnboarding).toBe(false);
+    expect(result.current.onboardingDismissed).toBe(true);
   });
 
   it("returns showOnboarding=false when providers exist", () => {
@@ -123,7 +124,7 @@ describe("useShowOnboarding", () => {
       chatSessionsCount: 0,
       userId: "user-1",
     });
-    expect(result.current.showOnboarding).toBe(true);
+    expect(result.current.showOnboarding).toBe(false);
 
     // Simulate providers arriving — update the mock
     mockProviderStatus.hasProviders = true;
@@ -146,7 +147,7 @@ describe("useShowOnboarding", () => {
       chatSessionsCount: 0,
       userId: "user-1",
     });
-    expect(result.current.showOnboarding).toBe(true);
+    expect(result.current.showOnboarding).toBe(false);
 
     // Change to a new userId with providers available — update the mock
     mockProviderStatus.hasProviders = true;
@@ -167,7 +168,7 @@ describe("useShowOnboarding", () => {
       hasAnyProvider: false,
       chatSessionsCount: 0,
     });
-    expect(result.current.showOnboarding).toBe(true);
+    expect(result.current.showOnboarding).toBe(false);
 
     act(() => {
       result.current.hideOnboarding();
@@ -181,7 +182,7 @@ describe("useShowOnboarding", () => {
       hasAnyProvider: false,
       chatSessionsCount: 0,
     });
-    expect(result.current.showOnboarding).toBe(true);
+    expect(result.current.showOnboarding).toBe(false);
 
     act(() => {
       result.current.finishOnboarding();
@@ -204,8 +205,8 @@ describe("useShowOnboarding", () => {
         hasAnyProvider: false,
         chatSessionsCount: 0,
       });
-      expect(result.current.showOnboarding).toBe(true);
-      expect(result.current.onboardingDismissed).toBe(false);
+      expect(result.current.showOnboarding).toBe(false);
+      expect(result.current.onboardingDismissed).toBe(true);
 
       act(() => {
         result.current.finishOnboarding();
@@ -246,18 +247,19 @@ describe("useShowOnboarding", () => {
       expect(result.current.onboardingDismissed).toBe(true);
     });
 
-    it("onboardingDismissed is false when localStorage flag is not set", () => {
+    it("onboardingDismissed defaults to true when localStorage flag is not set", () => {
       const { result } = renderUseShowOnboarding();
-      expect(result.current.onboardingDismissed).toBe(false);
+      expect(result.current.onboardingDismissed).toBe(true);
     });
 
-    it("dismissal for user-1 does not suppress onboarding for user-2", () => {
+    it("new users also default to dismissed onboarding", () => {
       const { result: result1 } = renderUseShowOnboarding({
         hasAnyProvider: false,
         chatSessionsCount: 0,
         userId: "1",
       });
-      expect(result1.current.showOnboarding).toBe(true);
+      expect(result1.current.showOnboarding).toBe(false);
+      expect(result1.current.onboardingDismissed).toBe(true);
 
       act(() => {
         result1.current.finishOnboarding();
@@ -265,14 +267,13 @@ describe("useShowOnboarding", () => {
       expect(result1.current.onboardingDismissed).toBe(true);
       expect(localStorage.getItem("onyx:onboardingCompleted:1")).toBe("true");
 
-      // user-2 should still see onboarding
       const { result: result2 } = renderUseShowOnboarding({
         hasAnyProvider: false,
         chatSessionsCount: 0,
         userId: "2",
       });
-      expect(result2.current.showOnboarding).toBe(true);
-      expect(result2.current.onboardingDismissed).toBe(false);
+      expect(result2.current.showOnboarding).toBe(false);
+      expect(result2.current.onboardingDismissed).toBe(true);
       expect(localStorage.getItem("onyx:onboardingCompleted:2")).toBeNull();
     });
   });

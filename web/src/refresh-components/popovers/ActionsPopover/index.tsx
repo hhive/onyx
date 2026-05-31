@@ -49,8 +49,8 @@ function buildTooltipMessage(
   isConfigured: boolean,
   canManageAction: boolean
 ) {
-  const _CONFIGURE_MESSAGE = "Press the settings cog to enable.";
-  const _USER_NOT_ADMIN_MESSAGE = "Ask an admin to configure.";
+  const _CONFIGURE_MESSAGE = "点击设置入口启用。";
+  const _USER_NOT_ADMIN_MESSAGE = "请联系管理员配置。";
 
   if (isConfigured) {
     return actionDescription;
@@ -64,15 +64,15 @@ function buildTooltipMessage(
 }
 
 const TOOL_DESCRIPTIONS: Record<string, string> = {
-  [SEARCH_TOOL_ID]: "Search through connected knowledge to inform the answer.",
-  [IMAGE_GENERATION_TOOL_ID]: "Generate images based on a prompt.",
-  [WEB_SEARCH_TOOL_ID]: "Search the web for up-to-date information.",
-  [PYTHON_TOOL_ID]: "Execute code for complex analysis.",
+  [SEARCH_TOOL_ID]: "在已连接知识中检索并辅助回答。",
+  [IMAGE_GENERATION_TOOL_ID]: "根据提示词生成图片。",
+  [WEB_SEARCH_TOOL_ID]: "联网搜索最新信息。",
+  [PYTHON_TOOL_ID]: "执行代码完成复杂分析。",
   [CODING_AGENT_TOOL_ID]:
-    "Investigate a GitHub repository and answer questions about its code.",
+    "分析代码仓库并回答相关问题。",
 };
 
-const DEFAULT_TOOL_DESCRIPTION = "This action is not configured yet.";
+const DEFAULT_TOOL_DESCRIPTION = "此工具尚未配置。";
 
 function getToolTooltip(
   tool: ToolSnapshot,
@@ -89,21 +89,21 @@ function getToolTooltip(
 const ADMIN_CONFIG_LINKS: Record<string, { href: string; tooltip: string }> = {
   [IMAGE_GENERATION_TOOL_ID]: {
     href: "/admin/configuration/image-generation",
-    tooltip: "Configure Image Generation",
+    tooltip: "配置图片生成",
   },
   [WEB_SEARCH_TOOL_ID]: {
     href: "/admin/configuration/web-search",
-    tooltip: "Configure Web Search",
+    tooltip: "配置联网搜索",
   },
   [PYTHON_TOOL_ID]: {
     href: "/admin/configuration/code-interpreter",
-    tooltip: "Configure Code Interpreter",
+    tooltip: "配置代码解释器",
   },
 };
 
 const OPENAPI_ADMIN_CONFIG = {
   href: "/admin/actions/open-api",
-  tooltip: "Manage OpenAPI Actions",
+  tooltip: "管理 OpenAPI 工具",
 };
 
 const getAdminConfigureInfo = (
@@ -828,7 +828,7 @@ export default function ActionsPopover({
       {[
         <InputTypeIn
           key="search"
-          placeholder="Search actions..."
+          placeholder="搜索工具..."
           searchIcon
           value={searchTerm}
           onChange={(event) => setSearchTerm(event.target.value)}
@@ -925,7 +925,7 @@ export default function ActionsPopover({
 
         (isAdmin || isCurator) && (
           <LineItem href="/admin/actions" icon={SvgActions} key="more-actions">
-            More Actions
+            更多工具
           </LineItem>
         ),
       ]}
@@ -935,12 +935,12 @@ export default function ActionsPopover({
   const toolsView = (
     <SwitchList
       items={sourceToggleItems}
-      searchPlaceholder="Search Filters"
+      searchPlaceholder="搜索筛选"
       allDisabled={allSourcesDisabled}
       onDisableAll={handleDisableAllSources}
       onEnableAll={handleEnableAllSources}
-      disableAllLabel="Disable All Sources"
-      enableAllLabel="Enable All Sources"
+      disableAllLabel="停用全部来源"
+      enableAllLabel="启用全部来源"
       onBack={() => setSecondaryView(null)}
     />
   );
@@ -948,12 +948,12 @@ export default function ActionsPopover({
   const mcpView = (
     <SwitchList
       items={mcpToggleItems}
-      searchPlaceholder={`Search ${selectedMcpServer?.name ?? "server"} tools`}
+      searchPlaceholder={`搜索 ${selectedMcpServer?.name ?? "服务"} 工具`}
       allDisabled={mcpAllDisabled}
       onDisableAll={disableAllToolsForSelectedServer}
       onEnableAll={enableAllToolsForSelectedServer}
-      disableAllLabel="Disable All Tools"
-      enableAllLabel="Enable All Tools"
+      disableAllLabel="停用全部工具"
+      enableAllLabel="启用全部工具"
       onBack={() => setSecondaryView(null)}
       footer={mcpFooter}
     />
@@ -972,7 +972,7 @@ export default function ActionsPopover({
               icon={SvgSliders}
               interaction={open ? "hover" : "rest"}
               prominence="tertiary"
-              tooltip="Manage Actions"
+              tooltip="管理工具"
             />
           </div>
         </Popover.Trigger>

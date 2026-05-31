@@ -149,6 +149,8 @@ from onyx.server.query_and_chat.query_backend import basic_router as query_route
 from onyx.server.saml import router as saml_router
 from onyx.server.settings.api import admin_router as settings_admin_router
 from onyx.server.settings.api import basic_router as settings_router
+from onyx.server.sub2api.api import legacy_router as sub2api_legacy_router
+from onyx.server.sub2api.api import router as sub2api_router
 from onyx.server.token_rate_limits.api import router as token_rate_limit_settings_router
 from onyx.server.utils import BasicAuthenticationError
 from onyx.setup import setup_multitenant_onyx
@@ -554,6 +556,8 @@ def get_application(lifespan_override: Lifespan | None = None) -> FastAPI:
 
     include_router_with_global_prefix_prepended(application, pat_router)
     include_router_with_global_prefix_prepended(application, captcha_router)
+    include_router_with_global_prefix_prepended(application, sub2api_router)
+    include_router_with_global_prefix_prepended(application, sub2api_legacy_router)
 
     if AUTH_TYPE == AuthType.BASIC or AUTH_TYPE == AuthType.CLOUD:
         include_auth_router_with_prefix(

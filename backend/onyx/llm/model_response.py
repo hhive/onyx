@@ -181,6 +181,16 @@ def from_litellm_model_response_stream(
     Convert a LiteLLM ModelResponseStream into the simplified Onyx representation.
     """
     response_data = response.model_dump()
+    choices: list[dict[str, Any]] = response_data.get("choices") or []
+    usage_data = response_data.get("usage")
+    if not choices and usage_data:
+        return ModelResponseStream(
+            id=str(response_data.get("id") or ""),
+            created=str(response_data.get("created") or ""),
+            choice=StreamingChoice(),
+            usage=_usage_from_usage_data(usage_data),
+        )
+
     response_id, created, choice_data = _validate_and_extract_base_fields(
         response_data, "LiteLLM response stream"
     )
@@ -198,7 +208,6 @@ def from_litellm_model_response_stream(
         delta=parsed_delta,
     )
 
-    usage_data = response_data.get("usage")
     return ModelResponseStream(
         id=response_id,
         created=created,

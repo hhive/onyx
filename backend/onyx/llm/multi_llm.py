@@ -63,6 +63,7 @@ _env_lock = threading.Lock()
 if TYPE_CHECKING:
     from litellm import CustomStreamWrapper
     from litellm import HTTPHandler
+    from openai import OpenAI
 
 
 _LLM_PROMPT_LONG_TERM_LOG_CATEGORY = "llm_prompt"
@@ -296,6 +297,7 @@ class LitellmLLM(LLM):
         extra_headers: dict[str, str] | None = None,
         extra_body: dict | None = LITELLM_EXTRA_BODY,
         model_kwargs: dict[str, Any] | None = None,
+        litellm_client: "OpenAI | None" = None,
     ):
         # Timeout in seconds for each socket read operation (i.e., max time between
         # receiving data chunks/tokens). This is NOT a total request timeout - a
@@ -317,6 +319,7 @@ class LitellmLLM(LLM):
         self._custom_llm_provider = custom_llm_provider
         self._max_input_tokens = max_input_tokens
         self._custom_config = custom_config
+        self._litellm_client = litellm_client
 
         # Create a dictionary for model-specific arguments if it's None
         model_kwargs = model_kwargs or {}
@@ -708,6 +711,38 @@ class LitellmLLM(LLM):
                 if tools and tool_choice is not None:
                     optional_kwargs["tool_choice"] = tool_choice
 
+                if self._litellm_client is not None:
+                    direct_kwargs: dict[str, Any] = {
+                        "model": self.config.deployment_name
+                        or self.config.model_name,
+                        "messages": messages,
+                        "stream": stream,
+                    }
+                    if tools:
+                        direct_kwargs["tools"] = tools
+                        direct_kwargs["parallel_tool_calls"] = parallel_tool_calls
+                    if tools and tool_choice is not None:
+                        direct_kwargs["tool_choice"] = tool_choice.value
+                    if max_tokens is not None:
+                        direct_kwargs["max_tokens"] = max_tokens
+                    if "temperature" in optional_kwargs:
+                        direct_kwargs["temperature"] = optional_kwargs["temperature"]
+                    if stream:
+                        direct_kwargs["stream_options"] = {
+                            "include_usage": True,
+                        }
+                    if "reasoning_effort" in optional_kwargs:
+                        direct_kwargs["reasoning_effort"] = optional_kwargs[
+                            "reasoning_effort"
+                        ]
+                    extra_headers = passthrough_kwargs.get("extra_headers")
+                    if extra_headers:
+                        direct_kwargs["extra_headers"] = extra_headers
+
+                    return self._litellm_client.chat.completions.create(
+                        **direct_kwargs
+                    )
+
                 response = litellm.completion(
                     mock_response=get_llm_mock_response() or MOCK_LLM_RESPONSE,
                     model=model,
@@ -799,7 +834,9 @@ class LitellmLLM(LLM):
         # and not every model path was traced thoroughly. It is also possible that in future versions of LiteLLM
         # they will realize that their OpenAI handling is not threadsafe. Hope they will just fix it.
         client = None
-        if is_true_openai_model(self.config.model_provider, self.config.model_name):
+        if self._litellm_client is not None:
+            client = self._litellm_client
+        elif is_true_openai_model(self.config.model_provider, self.config.model_name):
             client = HTTPHandler(timeout=timeout_override or self._timeout)
 
         try:
@@ -841,7 +878,7 @@ class LitellmLLM(LLM):
 
             return model_response
         finally:
-            if client is not None:
+            if client is not None and client is not self._litellm_client:
                 client.close()
 
     def stream(
@@ -890,7 +927,9 @@ class LitellmLLM(LLM):
         #    - Shared pools can have connections corrupted by other threads
         #    - Per-request HTTPHandler eliminates cross-thread interference
         client = None
-        if is_true_openai_model(self.config.model_provider, self.config.model_name):
+        if self._litellm_client is not None:
+            client = self._litellm_client
+        elif is_true_openai_model(self.config.model_provider, self.config.model_name):
             client = HTTPHandler(timeout=timeout_override or self._timeout)
 
         try:
@@ -920,7 +959,7 @@ class LitellmLLM(LLM):
 
                 yield model_response
         finally:
-            if client is not None:
+            if client is not None and client is not self._litellm_client:
                 client.close()
 
 

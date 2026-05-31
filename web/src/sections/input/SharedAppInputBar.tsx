@@ -18,7 +18,7 @@ export default function SharedAppInputBar() {
         {/* Textarea area */}
         <div className="flex flex-row items-center w-full">
           <Text text03 className="w-full px-3 pt-3 pb-2 select-none">
-            How can Onyx help you today
+            今天想聊点什么？
           </Text>
         </div>
 
@@ -47,7 +47,7 @@ export default function SharedAppInputBar() {
       {/* CTA button */}
       <div className="absolute inset-0 flex items-center justify-center">
         <Button prominence="secondary" icon={SvgEditBig} href="/app">
-          Start New Session
+          开始新对话
         </Button>
       </div>
     </div>

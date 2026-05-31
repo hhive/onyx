@@ -9,12 +9,21 @@ import { cn } from "@opal/utils";
 import Text from "@/refresh-components/texts/Text";
 import Truncated from "@/refresh-components/texts/Truncated";
 import { useMemo } from "react";
-import { SvgOnyxLogo, SvgOnyxLogoTyped } from "@opal/logos";
+import { SvgOnyxLogo } from "@opal/logos";
 
 export interface LogoProps {
   folded?: boolean;
   size?: number;
   className?: string;
+}
+
+function XiaoniTalkWordmark() {
+  return (
+    <div className="flex items-center gap-2 min-w-0">
+      <SvgOnyxLogo size={DEFAULT_LOGO_SIZE_PX} className="shrink-0" />
+      <Truncated headingH3>小逆talk</Truncated>
+    </div>
+  );
 }
 
 export default function Logo({ folded, size, className }: LogoProps) {
@@ -68,13 +77,8 @@ export default function Logo({ folded, size, className }: LogoProps) {
             )}
             {!NEXT_PUBLIC_DO_NOT_USE_TOGGLE_OFF_DANSWER_POWERED &&
               !settings.enterpriseSettings?.hide_onyx_branding && (
-                <Text
-                  secondaryBody
-                  text03
-                  className={"line-clamp-1 truncate"}
-                  nowrap
-                >
-                  Powered by Onyx
+                <Text secondaryBody text03 className="line-clamp-1 truncate" nowrap>
+                  本地部署版
                 </Text>
               )}
           </div>
@@ -99,6 +103,6 @@ export default function Logo({ folded, size, className }: LogoProps) {
   ) : folded ? (
     <SvgOnyxLogo size={resolvedSize} className={cn("shrink-0", className)} />
   ) : (
-    <SvgOnyxLogoTyped size={resolvedSize} className={className} />
+    <XiaoniTalkWordmark />
   );
 }

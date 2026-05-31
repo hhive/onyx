@@ -18,6 +18,8 @@ from sqlalchemy.orm import Session
 from onyx.auth.permissions import require_permission
 from onyx.auth.schemas import UserRole
 from onyx.auth.users import current_chat_accessible_user
+from onyx.configs.app_configs import SUB2API_DEFAULT_IMAGE_MODEL
+from onyx.configs.app_configs import SUB2API_DEFAULT_TEXT_MODEL
 from onyx.db.engine.sql_engine import get_session
 from onyx.db.enums import LLMModelFlowType
 from onyx.db.enums import Permission
@@ -40,6 +42,7 @@ from onyx.db.llm import validate_persona_ids_exist
 from onyx.db.models import Persona
 from onyx.db.models import User
 from onyx.db.persona import user_can_access_persona
+from onyx.db.sub2api_user_credentials import get_sub2api_user_credentials
 from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
 from onyx.llm.constants import LlmProviderNames
@@ -103,6 +106,11 @@ from onyx.server.manage.llm.utils import is_reasoning_model
 from onyx.server.manage.llm.utils import is_valid_bedrock_model
 from onyx.server.manage.llm.utils import ModelMetadata
 from onyx.server.manage.llm.utils import strip_openrouter_vendor_prefix
+from onyx.server.sub2api.client import Sub2APIClient
+from onyx.server.sub2api.service import build_sub2api_runtime_provider
+from onyx.server.sub2api.service import filter_providers_by_sub2api_model_ids
+from onyx.server.sub2api.service import find_provider_model_for_default
+from onyx.server.sub2api.service import sub2api_model_ids
 from onyx.utils.encryption import mask_string as mask_with_ellipsis
 from onyx.utils.logger import setup_logger
 from shared_configs.configs import MULTI_TENANT
@@ -118,6 +126,48 @@ def _mask_string(value: str) -> str:
     if len(value) <= 8:
         return "****"
     return value[:4] + "****" + value[-4:]
+
+
+def _filter_with_sub2api_model_whitelist(
+    providers: list[LLMProviderDescriptor],
+    user: User,
+    db_session: Session,
+) -> list[LLMProviderDescriptor]:
+    credential = get_sub2api_user_credentials(db_session, user.id)
+    if credential is None:
+        return providers
+
+    try:
+        api_key = credential.api_key.get_value(apply_mask=False)
+        models = Sub2APIClient().get_models(api_key)
+    except Exception:
+        logger.exception("Failed to fetch Sub2API model whitelist")
+        return providers
+
+    if not providers:
+        runtime_provider = build_sub2api_runtime_provider(models)
+        return [runtime_provider] if runtime_provider else []
+
+    return filter_providers_by_sub2api_model_ids(providers, sub2api_model_ids(models))
+
+
+def _apply_sub2api_default_model_config(
+    providers: list[LLMProviderDescriptor],
+    default_text: DefaultModel | None,
+    default_vision: DefaultModel | None,
+) -> tuple[DefaultModel | None, DefaultModel | None]:
+    text_match = find_provider_model_for_default(providers, SUB2API_DEFAULT_TEXT_MODEL)
+    if text_match:
+        default_text = DefaultModel(provider_id=text_match[0], model_name=text_match[1])
+
+    image_match = find_provider_model_for_default(providers, SUB2API_DEFAULT_IMAGE_MODEL)
+    if image_match:
+        default_vision = DefaultModel(
+            provider_id=image_match[0],
+            model_name=image_match[1],
+        )
+
+    return default_text, default_vision
 
 
 def _resolve_api_key(
@@ -767,6 +817,12 @@ def list_llm_provider_basics(
         ):
             accessible_providers.append(LLMProviderDescriptor.from_model(provider))
 
+    accessible_providers = _filter_with_sub2api_model_whitelist(
+        accessible_providers,
+        user,
+        db_session,
+    )
+
     end_time = datetime.now(timezone.utc)
     duration = (end_time - start_time).total_seconds()
     logger.debug(
@@ -775,14 +831,16 @@ def list_llm_provider_basics(
         format(duration, ".2f"),
     )
 
+    default_text, default_vision = _apply_sub2api_default_model_config(
+        accessible_providers,
+        DefaultModel.from_model_config(fetch_default_llm_model(db_session)),
+        DefaultModel.from_model_config(fetch_default_vision_model(db_session)),
+    )
+
     return LLMProviderResponse[LLMProviderDescriptor].from_models(
         providers=accessible_providers,
-        default_text=DefaultModel.from_model_config(
-            fetch_default_llm_model(db_session)
-        ),
-        default_vision=DefaultModel.from_model_config(
-            fetch_default_vision_model(db_session)
-        ),
+        default_text=default_text,
+        default_vision=default_vision,
     )
 
 
@@ -894,6 +952,12 @@ def list_llm_providers_for_persona(
                 LLMProviderDescriptor.from_model(llm_provider_model)
             )
 
+    llm_provider_list = _filter_with_sub2api_model_whitelist(
+        llm_provider_list,
+        user,
+        db_session,
+    )
+
     end_time = datetime.now(timezone.utc)
     duration = (end_time - start_time).total_seconds()
     logger.debug(
@@ -922,6 +986,12 @@ def list_llm_providers_for_persona(
                 provider_id=model_config.llm_provider_id,
                 model_name=model_config.name,
             )
+
+    default_text, default_vision = _apply_sub2api_default_model_config(
+        llm_provider_list,
+        default_text,
+        default_vision,
+    )
 
     return LLMProviderResponse[LLMProviderDescriptor].from_models(
         providers=llm_provider_list,

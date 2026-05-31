@@ -261,14 +261,14 @@ export function useShowOnboarding({
   userId,
 }: UseShowOnboardingParams) {
   const [showOnboarding, setShowOnboarding] = useState(false);
-  const [onboardingDismissed, setOnboardingDismissed] = useState(false);
+  const [onboardingDismissed, setOnboardingDismissed] = useState(true);
 
-  // Read localStorage once userId is available to check if onboarding was dismissed
+  // Xiaoni Talk defaults to the main app instead of forcing first-run onboarding.
+  // The storage flag is still honored for existing users and explicit dismissals.
   useEffect(() => {
     if (userId === undefined) return;
-    const dismissed =
-      localStorage.getItem(getOnboardingCompletedKey(userId)) === "true";
-    setOnboardingDismissed(dismissed);
+    const storedValue = localStorage.getItem(getOnboardingCompletedKey(userId));
+    setOnboardingDismissed(storedValue !== "false");
   }, [userId]);
 
   // Initialize onboarding state — single source of truth for provider data

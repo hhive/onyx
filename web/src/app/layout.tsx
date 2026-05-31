@@ -51,8 +51,8 @@ const dmMono = DM_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Onyx",
-  description: "Question answering for your documents",
+  title: "小逆talk",
+  description: "小逆talk 本地知识与模型入口",
 };
 
 // force-dynamic prevents Next.js from statically prerendering pages at build

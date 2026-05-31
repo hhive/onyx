@@ -1,9 +1,12 @@
 from collections.abc import Callable
 from typing import Any
 
+import httpx
+import openai
 from sqlalchemy.orm import Session
 
 from onyx.auth.schemas import UserRole
+from onyx.configs.app_configs import SUB2API_DEFAULT_TEXT_MODEL
 from onyx.configs.model_configs import GEN_AI_TEMPERATURE
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.enums import LLMModelFlowType
@@ -17,10 +20,12 @@ from onyx.db.llm import fetch_user_group_ids
 from onyx.db.models import LLMProvider as LLMProviderModel
 from onyx.db.models import Persona
 from onyx.db.models import User
+from onyx.db.sub2api_user_credentials import get_sub2api_user_credentials
 from onyx.llm.constants import LlmProviderNames
 from onyx.llm.interfaces import LLM
 from onyx.llm.multi_llm import LitellmLLM
 from onyx.llm.override_models import LLMOverride
+from onyx.llm.utils import get_max_input_tokens
 from onyx.llm.utils import get_max_input_tokens_from_llm_provider
 from onyx.llm.utils import model_supports_image_input
 from onyx.llm.well_known_providers.constants import (
@@ -28,10 +33,14 @@ from onyx.llm.well_known_providers.constants import (
 )
 from onyx.natural_language_processing.utils import get_tokenizer
 from onyx.server.manage.llm.models import LLMProviderView
+from onyx.server.sub2api.client import resolve_sub2api_api_base_url
+from onyx.server.sub2api.service import is_sub2api_runtime_provider_name
 from onyx.utils.headers import build_llm_extra_headers
 from onyx.utils.logger import setup_logger
 
 logger = setup_logger()
+
+SUB2API_LLM_USER_AGENT = "Mozilla/5.0"
 
 
 def _build_provider_extra_headers(
@@ -128,6 +137,62 @@ def _resolve_provider_and_model(
     return provider_model, model_name
 
 
+def _build_sub2api_runtime_llm(
+    *,
+    user: User,
+    model_name: str | None,
+    temperature: float | None,
+    additional_headers: dict[str, str] | None,
+) -> LLM | None:
+    if not model_name:
+        return None
+
+    with get_session_with_current_tenant() as db_session:
+        credential = get_sub2api_user_credentials(db_session, user.id)
+        if credential is None:
+            return None
+        api_key = credential.api_key.get_value(apply_mask=False)
+
+    sub2api_headers = dict(additional_headers or {})
+    sub2api_headers.setdefault("User-Agent", SUB2API_LLM_USER_AGENT)
+    sub2api_api_base = resolve_sub2api_api_base_url()
+    sub2api_client = openai.OpenAI(
+        api_key=api_key,
+        base_url=sub2api_api_base,
+        default_headers=sub2api_headers,
+        http_client=httpx.Client(timeout=60, trust_env=False),
+    )
+
+    return get_llm(
+        provider=LlmProviderNames.OPENAI_COMPATIBLE,
+        model=model_name,
+        deployment_name=None,
+        api_key=api_key,
+        api_base=sub2api_api_base,
+        temperature=temperature,
+        additional_headers=sub2api_headers,
+        litellm_client=sub2api_client,
+        max_input_tokens=get_max_input_tokens(
+            model_provider="openai",
+            model_name=model_name,
+        ),
+    )
+
+
+def _build_sub2api_default_runtime_llm(
+    *,
+    user: User,
+    temperature: float | None,
+    additional_headers: dict[str, str] | None,
+) -> LLM | None:
+    return _build_sub2api_runtime_llm(
+        user=user,
+        model_name=SUB2API_DEFAULT_TEXT_MODEL,
+        temperature=temperature,
+        additional_headers=additional_headers,
+    )
+
+
 def get_llm_for_persona(
     persona: Persona | None,
     user: User,
@@ -139,17 +204,51 @@ def get_llm_for_persona(
     2. Persona's model configuration override
     3. Default LLM
     """
+    temperature = (
+        llm_override.temperature
+        if llm_override and llm_override.temperature is not None
+        else GEN_AI_TEMPERATURE
+    )
+
     if persona is None:
         logger.warning("No persona provided, using default LLM")
+        runtime_llm = _build_sub2api_default_runtime_llm(
+            user=user,
+            temperature=temperature,
+            additional_headers=additional_headers,
+        )
+        if runtime_llm is not None:
+            return runtime_llm
         return get_default_llm()
 
     provider_name_override = llm_override.model_provider if llm_override else None
     model_version_override = llm_override.model_version if llm_override else None
     temperature_override = llm_override.temperature if llm_override else None
 
+    if is_sub2api_runtime_provider_name(provider_name_override):
+        runtime_llm = _build_sub2api_runtime_llm(
+            user=user,
+            model_name=model_version_override,
+            temperature=(
+                temperature_override
+                if temperature_override is not None
+                else GEN_AI_TEMPERATURE
+            ),
+            additional_headers=additional_headers,
+        )
+        if runtime_llm is not None:
+            return runtime_llm
+
     if not provider_name_override and not persona.default_model_configuration_id:
+        runtime_llm = _build_sub2api_default_runtime_llm(
+            user=user,
+            temperature=temperature,
+            additional_headers=additional_headers,
+        )
+        if runtime_llm is not None:
+            return runtime_llm
         return get_default_llm(
-            temperature=temperature_override or GEN_AI_TEMPERATURE,
+            temperature=temperature,
             additional_headers=additional_headers,
         )
 
@@ -158,12 +257,15 @@ def get_llm_for_persona(
             persona, provider_name_override, model_version_override, db_session
         )
         if resolved is None:
+            runtime_llm = _build_sub2api_default_runtime_llm(
+                user=user,
+                temperature=temperature,
+                additional_headers=additional_headers,
+            )
+            if runtime_llm is not None:
+                return runtime_llm
             return get_default_llm(
-                temperature=(
-                    temperature_override
-                    if temperature_override is not None
-                    else GEN_AI_TEMPERATURE
-                ),
+                temperature=temperature,
                 additional_headers=additional_headers,
             )
         provider_model, model = resolved
@@ -180,7 +282,7 @@ def get_llm_for_persona(
                 provider_model.name,
             )
             return get_default_llm(
-                temperature=temperature_override or GEN_AI_TEMPERATURE,
+                temperature=temperature,
                 additional_headers=additional_headers,
             )
 
@@ -380,6 +482,7 @@ def get_llm(
     timeout: int | None = None,
     additional_headers: dict[str, str] | None = None,
     model_kwargs: dict[str, Any] | None = None,
+    litellm_client: openai.OpenAI | None = None,
 ) -> LLM:
     if temperature is None:
         temperature = GEN_AI_TEMPERATURE
@@ -405,6 +508,7 @@ def get_llm(
         custom_config=custom_config,
         extra_headers=extra_headers,
         model_kwargs=model_kwargs or {},
+        litellm_client=litellm_client,
         max_input_tokens=max_input_tokens,
     )
 

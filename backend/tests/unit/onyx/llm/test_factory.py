@@ -1,8 +1,12 @@
+from unittest.mock import Mock
 from unittest.mock import patch
 
+from onyx.configs.model_configs import GEN_AI_TEMPERATURE
 from onyx.llm.constants import LlmProviderNames
 from onyx.llm.factory import _build_provider_extra_headers
+from onyx.llm.factory import _build_sub2api_runtime_llm
 from onyx.llm.factory import get_llm
+from onyx.llm.factory import get_llm_for_persona
 from onyx.llm.factory import llm_from_provider
 from onyx.llm.well_known_providers.constants import OLLAMA_API_KEY_CONFIG_KEY
 from onyx.server.manage.llm.models import LLMProviderView
@@ -146,3 +150,107 @@ def test_llm_from_provider_never_sets_ollama_num_ctx_for_non_ollama_provider() -
         kwargs = mock_get_llm.call_args.kwargs
         assert kwargs["max_input_tokens"] == 16384
         assert kwargs["model_kwargs"] == {}
+
+
+def _mock_persona(default_model_configuration_id: int | None = None) -> Mock:
+    persona = Mock()
+    persona.id = 7
+    persona.default_model_configuration_id = default_model_configuration_id
+    return persona
+
+
+def _mock_user() -> Mock:
+    user = Mock()
+    user.id = 1
+    user.role = None
+    return user
+
+
+def test_get_llm_for_persona_uses_sub2api_default_runtime_llm_without_db_default() -> None:
+    runtime_llm = Mock()
+    user = _mock_user()
+
+    with (
+        patch(
+            "onyx.llm.factory._build_sub2api_default_runtime_llm",
+            return_value=runtime_llm,
+        ) as mock_build_runtime,
+        patch("onyx.llm.factory.get_default_llm") as mock_get_default,
+    ):
+        llm = get_llm_for_persona(
+            _mock_persona(),
+            user,
+            additional_headers={"x-test": "1"},
+        )
+
+    assert llm is runtime_llm
+    mock_build_runtime.assert_called_once_with(
+        user=user,
+        temperature=GEN_AI_TEMPERATURE,
+        additional_headers={"x-test": "1"},
+    )
+    mock_get_default.assert_not_called()
+
+
+def test_get_llm_for_persona_falls_back_to_db_default_without_sub2api_credential() -> None:
+    default_llm = Mock()
+
+    with (
+        patch("onyx.llm.factory._build_sub2api_default_runtime_llm", return_value=None),
+        patch("onyx.llm.factory.get_default_llm", return_value=default_llm),
+    ):
+        llm = get_llm_for_persona(_mock_persona(), _mock_user())
+
+    assert llm is default_llm
+
+
+def test_get_llm_for_persona_without_persona_uses_sub2api_runtime_default_first() -> None:
+    runtime_llm = Mock()
+
+    with (
+        patch(
+            "onyx.llm.factory._build_sub2api_default_runtime_llm",
+            return_value=runtime_llm,
+        ) as mock_build_runtime,
+        patch("onyx.llm.factory.get_default_llm") as mock_get_default,
+    ):
+        llm = get_llm_for_persona(None, _mock_user())
+
+    assert llm is runtime_llm
+    mock_build_runtime.assert_called_once()
+    mock_get_default.assert_not_called()
+
+
+def test_build_sub2api_runtime_llm_sets_browser_user_agent() -> None:
+    credential = Mock()
+    credential.api_key.get_value.return_value = "test-api-key"
+
+    with (
+        patch("onyx.llm.factory.get_session_with_current_tenant") as mock_session,
+        patch(
+            "onyx.llm.factory.get_sub2api_user_credentials",
+            return_value=credential,
+        ),
+        patch(
+            "onyx.llm.factory.resolve_sub2api_api_base_url",
+            return_value="http://127.0.0.1:8080/v1",
+        ),
+        patch("onyx.llm.factory.get_llm") as mock_get_llm,
+    ):
+        mock_session.return_value.__enter__.return_value = Mock()
+
+        _build_sub2api_runtime_llm(
+            user=_mock_user(),
+            model_name="gpt-5.5",
+            temperature=0,
+            additional_headers={"X-Test": "1"},
+        )
+
+    kwargs = mock_get_llm.call_args.kwargs
+    assert kwargs["provider"] == LlmProviderNames.OPENAI_COMPATIBLE
+    assert kwargs["additional_headers"] == {
+        "X-Test": "1",
+        "User-Agent": "Mozilla/5.0",
+    }
+    assert kwargs["litellm_client"].api_key == "test-api-key"
+    assert str(kwargs["litellm_client"].base_url) == "http://127.0.0.1:8080/v1/"

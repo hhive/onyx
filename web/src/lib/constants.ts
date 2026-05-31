@@ -114,7 +114,7 @@ export const CREDENTIAL_JSON = "credential_json";
 
 export const MODAL_ROOT_ID = "modal-root";
 
-export const UNNAMED_CHAT = "New Chat";
+export const UNNAMED_CHAT = "新对话";
 
 export const DEFAULT_AGENT_ID = 0;
 export const GENERAL_ASSISTANT_ID = -1;
@@ -136,6 +136,6 @@ export const DEFAULT_LOGO_SIZE_PX = 24;
 export const DEFAULT_CONTEXT_TOKENS = 120_000;
 export const MAX_CHUNKS_FED_TO_CHAT = 25;
 
-export const APP_SLOGAN = "Open Source AI Platform";
+export const APP_SLOGAN = "小逆talk 本地知识与模型入口";
 
 export const DEFAULT_PAGE_SIZE = 10;

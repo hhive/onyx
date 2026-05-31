@@ -258,6 +258,18 @@ OIDC_PKCE_ENABLED = os.environ.get("OIDC_PKCE_ENABLED", "").lower() == "true"
 # Applicable for SAML Auth
 SAML_CONF_DIR = os.environ.get("SAML_CONF_DIR") or "/app/onyx/configs/saml_config"
 
+SUB2API_INTEGRATION_ENABLED = (
+    os.environ.get("SUB2API_INTEGRATION_ENABLED", "").lower() == "true"
+)
+SUB2API_BASE_URL = os.environ.get("SUB2API_BASE_URL") or "http://127.0.0.1:8080"
+SUB2API_EXCHANGE_SECRET = os.environ.get("SUB2API_EXCHANGE_SECRET") or ""
+SUB2API_API_BASE_URL = os.environ.get("SUB2API_API_BASE_URL") or (
+    SUB2API_BASE_URL.rstrip("/") + "/v1"
+)
+SUB2API_DEFAULT_TEXT_MODEL = os.environ.get("SUB2API_DEFAULT_TEXT_MODEL") or ""
+SUB2API_DEFAULT_IMAGE_MODEL = os.environ.get("SUB2API_DEFAULT_IMAGE_MODEL") or ""
+SUB2API_ONYX_REDIRECT_PATH = os.environ.get("SUB2API_ONYX_REDIRECT_PATH") or "/"
+
 # JWT Public Key URL for JWT token verification
 JWT_PUBLIC_KEY_URL: str | None = os.getenv("JWT_PUBLIC_KEY_URL", None)
 

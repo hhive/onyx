@@ -457,6 +457,42 @@ class User(SQLAlchemyBaseUserTableUUID, Base):
         return str(self.id) == ANONYMOUS_USER_UUID
 
 
+class Sub2APIUserCredential(Base):
+    __tablename__ = "sub2api_user_credential"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("user.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    sub2api_user_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    api_key: Mapped[str] = mapped_column(EncryptedString(), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    user = relationship("User")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            name="uq_sub2api_user_credential_user_id",
+        ),
+        UniqueConstraint(
+            "sub2api_user_id",
+            name="uq_sub2api_user_credential_sub2api_user_id",
+        ),
+    )
+
+
 class AccessToken(SQLAlchemyBaseAccessTokenTableUUID, Base):
     pass
 
