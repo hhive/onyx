@@ -1,6 +1,7 @@
 import os
 import threading
 import time
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import ANY
 from unittest.mock import patch
@@ -24,6 +25,7 @@ from onyx.llm.models import ReasoningEffort
 from onyx.llm.models import ToolCall
 from onyx.llm.models import UserMessage
 from onyx.llm.multi_llm import LitellmLLM
+from onyx.llm.multi_llm import _openai_sdk_stream_to_model_response
 from onyx.llm.utils import get_max_input_tokens
 
 VERTEX_OPUS_MODELS_REJECTING_OUTPUT_CONFIG = [
@@ -127,6 +129,53 @@ def _accumulate_stream_to_assistant_message(
         content=accumulated_content if accumulated_content else None,
         tool_calls=tool_calls,
     )
+
+
+def test_openai_sdk_stream_to_model_response_handles_usage_only_chunk() -> None:
+    chunks = [
+        SimpleNamespace(
+            id="chatcmpl-test",
+            created=123,
+            choices=[
+                SimpleNamespace(
+                    finish_reason=None,
+                    delta=SimpleNamespace(content="测", reasoning_content=None),
+                )
+            ],
+            usage=None,
+        ),
+        SimpleNamespace(
+            id="chatcmpl-test",
+            created=123,
+            choices=[
+                SimpleNamespace(
+                    finish_reason="stop",
+                    delta=SimpleNamespace(content="试", reasoning_content=None),
+                )
+            ],
+            usage=None,
+        ),
+        SimpleNamespace(
+            id="chatcmpl-test",
+            created=123,
+            choices=[],
+            usage=SimpleNamespace(
+                completion_tokens=1,
+                prompt_tokens=2,
+                total_tokens=3,
+                prompt_tokens_details=SimpleNamespace(cached_tokens=0),
+            ),
+        ),
+    ]
+
+    response = _openai_sdk_stream_to_model_response(chunks)
+
+    assert response.id == "chatcmpl-test"
+    assert response.created == "123"
+    assert response.choice.finish_reason == "stop"
+    assert response.choice.message.content == "测试"
+    assert response.usage is not None
+    assert response.usage.total_tokens == 3
 
 
 @pytest.fixture

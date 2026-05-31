@@ -22,6 +22,8 @@ from onyx.llm.interfaces import ReasoningEffort
 from onyx.llm.interfaces import ToolChoiceOptions
 from onyx.llm.model_response import ModelResponse
 from onyx.llm.model_response import ModelResponseStream
+from onyx.llm.model_response import Choice
+from onyx.llm.model_response import Message
 from onyx.llm.model_response import Usage
 from onyx.llm.models import ANTHROPIC_ADAPTIVE_REASONING_EFFORT
 from onyx.llm.models import ANTHROPIC_REASONING_EFFORT_BUDGET
@@ -274,6 +276,74 @@ def _anthropic_omits_sampling_params(model_name: str) -> bool:
     return any(
         no_sampling_model in normalized_model_name
         for no_sampling_model in _ANTHROPIC_NO_SAMPLING_PARAMS_MODELS
+    )
+
+
+def _openai_sdk_stream_to_model_response(
+    chunks: list[Any],
+) -> ModelResponse:
+    content_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    response_id = ""
+    created = ""
+    finish_reason = None
+    usage = None
+
+    for chunk in chunks:
+        chunk_id = getattr(chunk, "id", None)
+        if chunk_id:
+            response_id = str(chunk_id)
+
+        chunk_created = getattr(chunk, "created", None)
+        if chunk_created is not None:
+            created = str(chunk_created)
+
+        chunk_usage = getattr(chunk, "usage", None)
+        if chunk_usage is not None:
+            usage = Usage(
+                completion_tokens=getattr(chunk_usage, "completion_tokens", 0) or 0,
+                prompt_tokens=getattr(chunk_usage, "prompt_tokens", 0) or 0,
+                total_tokens=getattr(chunk_usage, "total_tokens", 0) or 0,
+                cache_creation_input_tokens=0,
+                cache_read_input_tokens=(
+                    getattr(
+                        getattr(chunk_usage, "prompt_tokens_details", None),
+                        "cached_tokens",
+                        0,
+                    )
+                    or 0
+                ),
+            )
+
+        choices = getattr(chunk, "choices", None) or []
+        if not choices:
+            continue
+
+        choice = choices[0]
+        finish_reason = getattr(choice, "finish_reason", None) or finish_reason
+        delta = getattr(choice, "delta", None)
+        if delta is None:
+            continue
+
+        delta_content = getattr(delta, "content", None)
+        if delta_content:
+            content_parts.append(str(delta_content))
+
+        reasoning_content = getattr(delta, "reasoning_content", None)
+        if reasoning_content:
+            reasoning_parts.append(str(reasoning_content))
+
+    return ModelResponse(
+        id=response_id,
+        created=created,
+        choice=Choice(
+            finish_reason=finish_reason,
+            message=Message(
+                content="".join(content_parts),
+                reasoning_content="".join(reasoning_parts) or None,
+            ),
+        ),
+        usage=usage,
     )
 
 
@@ -873,12 +943,15 @@ class LitellmLLM(LLM):
                 ),
             )
             chunks = list(stream_response)
-            response = cast(
-                LiteLLMModelResponse,
-                stream_chunk_builder(chunks),
-            )
+            if self._litellm_client is not None:
+                model_response = _openai_sdk_stream_to_model_response(chunks)
+            else:
+                response = cast(
+                    LiteLLMModelResponse,
+                    stream_chunk_builder(chunks),
+                )
 
-            model_response = from_litellm_model_response(response)
+                model_response = from_litellm_model_response(response)
 
             # Track LLM cost for Onyx-managed API keys
             if model_response.usage:
