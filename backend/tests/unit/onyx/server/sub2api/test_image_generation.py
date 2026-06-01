@@ -1,4 +1,5 @@
 from onyx.server.sub2api.image_generation import build_sub2api_image_credentials
+from onyx.server.sub2api.image_generation import SUB2API_IMAGE_USER_AGENT
 from onyx.server.sub2api.image_generation import (
     is_sub2api_image_generation_configured,
 )
@@ -29,6 +30,7 @@ def test_build_sub2api_image_credentials_uses_user_key_and_configured_api_base(
 
     assert credentials.api_key == "sk-user"
     assert credentials.api_base == "http://127.0.0.1:8080/v1"
+    assert credentials.additional_headers == {"User-Agent": SUB2API_IMAGE_USER_AGENT}
 
 
 def test_sub2api_image_generation_requires_integration_and_default_model(

@@ -21,9 +21,11 @@ class OpenAIImageGenerationProvider(ImageGenerationProvider):
         self,
         api_key: str,
         api_base: str | None = None,
+        additional_headers: dict[str, str] | None = None,
     ):
         self._api_key = api_key
         self._api_base = api_base
+        self._additional_headers = additional_headers
 
     @classmethod
     def validate_credentials(
@@ -42,6 +44,7 @@ class OpenAIImageGenerationProvider(ImageGenerationProvider):
         return cls(
             api_key=credentials.api_key,
             api_base=credentials.api_base,
+            additional_headers=credentials.additional_headers,
         )
 
     @property
@@ -109,6 +112,7 @@ class OpenAIImageGenerationProvider(ImageGenerationProvider):
                     size=size,
                     n=n,
                     quality=quality,
+                    extra_headers=self._additional_headers,
                     **kwargs,
                 )
 
@@ -128,5 +132,6 @@ class OpenAIImageGenerationProvider(ImageGenerationProvider):
                 size=size,
                 n=n,
                 quality=quality,
+                extra_headers=self._additional_headers,
                 **kwargs,
             )
