@@ -1501,7 +1501,7 @@ export default function AgentEditorPage({
                                 <InputHorizontal
                                   withLabel="coding_agent"
                                   title="Coding Agent"
-                                  description="Investigate a GitHub repository and answer questions about its code."
+                                  description="Investigate a code repository and answer questions about its code."
                                   disabled={!codingAgentTool}
                                 >
                                   <SwitchField

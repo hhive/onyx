@@ -182,11 +182,11 @@ export const connectorConfigs: Record<
     overrideDefaultFreq: 60 * 60 * 24,
   },
   github: {
-    description: "Configure GitHub connector",
+    description: "Configure code repository connector",
     values: [
       {
         type: "text",
-        query: "Enter the GitHub username or organization:",
+        query: "Enter the repository owner or organization:",
         label: "Repository Owner",
         name: "repo_owner",
         optional: false,
@@ -194,7 +194,7 @@ export const connectorConfigs: Record<
       {
         type: "tab",
         name: "github_mode",
-        label: "What should we index from GitHub?",
+        label: "What should we index from the repository service?",
         optional: true,
         tabs: [
           {

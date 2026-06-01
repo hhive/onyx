@@ -375,9 +375,8 @@ export const SOURCE_METADATA_MAP: SourceMap = {
   // Code Repository
   github: {
     icon: SvgGithub,
-    displayName: "Github",
+    displayName: "Code Repository",
     category: SourceCategory.CodeRepository,
-    docs: `${DOCS_ADMINS_PATH}/connectors/official/github`,
     isPopular: true,
   },
   gitlab: {

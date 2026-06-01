@@ -492,7 +492,7 @@ export const credentialTemplates: Record<ValidSources, any> = {
 
 export const credentialDisplayNames: Record<string, string> = {
   // Github
-  github_access_token: "GitHub Access Token",
+  github_access_token: "Repository Access Token",
 
   // Gitlab
   gitlab_url: "GitLab URL",

@@ -889,7 +889,7 @@ export default function ChatPreferencesPage() {
                         <Card border="solid" rounding="lg">
                           <InputHorizontal
                             title="Coding Agent"
-                            description="Investigate a GitHub repository and answer questions about its code."
+                            description="Investigate a code repository and answer questions about its code."
                             disabled={!codingAgentTool}
                             withLabel
                           >
