@@ -465,9 +465,9 @@ function Footer() {
 
   const customFooterContent =
     settings?.enterpriseSettings?.custom_lower_disclaimer_content ||
-    `[Onyx ${
+    `[小逆talk ${
       settings?.webVersion || "dev"
-    }](https://www.onyx.app/) - ${APP_SLOGAN}`;
+    }](/) - ${APP_SLOGAN}`;
 
   return (
     <footer

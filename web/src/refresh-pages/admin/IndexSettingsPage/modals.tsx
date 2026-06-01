@@ -415,7 +415,7 @@ function LiteLLMProviderModal({
         <ApiKeyField provider={provider} />
 
         <ModelSpecFields
-          modelNameSubDescription={`Onyx will connect to this model on your ${provider.displayName} proxy.`}
+          modelNameSubDescription={`小逆talk will connect to this model on your ${provider.displayName} proxy.`}
         />
       </ModalShell>
     </Formik>

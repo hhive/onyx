@@ -72,9 +72,9 @@ export default function NRFChrome() {
 
   const customFooterContent =
     settings?.enterpriseSettings?.custom_lower_disclaimer_content ||
-    `[Onyx ${
+    `[小逆talk ${
       settings?.webVersion || "dev"
-    }](https://www.onyx.app/) - Open Source AI Platform`;
+    }](/) - 小逆talk`;
 
   const showModeToggle =
     businessTier &&

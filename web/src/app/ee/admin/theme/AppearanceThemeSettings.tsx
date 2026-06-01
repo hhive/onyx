@@ -247,7 +247,7 @@ export const AppearanceThemeSettings = forwardRef<
               />
             </FormField.Control>
             <FormField.Description>
-              This name will show across the app and replace "Onyx" in the UI.
+              This name will show across the app and replace "小逆talk" in the UI.
             </FormField.Description>
             <FormField.Message
               messages={{ error: errors.application_name as string }}
@@ -472,7 +472,7 @@ export const AppearanceThemeSettings = forwardRef<
                 ref={customHelpLinkUrlInputRef}
                 data-label="custom-help-link-url-input"
                 clearButton
-                placeholder="https://docs.onyx.app"
+                placeholder="/"
                 variant={
                   !enterpriseTier
                     ? "disabled"
@@ -487,7 +487,7 @@ export const AppearanceThemeSettings = forwardRef<
               />
             </FormField.Control>
             <FormField.Description>
-              Add a custom help link in the user menu in addition to the Onyx
+              Add a custom help link in the user menu in addition to the 小逆talk
               documentation.
             </FormField.Description>
             <FormField.Message
@@ -517,19 +517,19 @@ export const AppearanceThemeSettings = forwardRef<
 
       <Disabled
         disabled={!enterpriseTier}
-        tooltip="Hiding Onyx branding is an Enterprise Plan feature."
+        tooltip="Hiding 小逆talk branding is an Enterprise Plan feature."
       >
         <FormField state="idle" className="gap-0">
           <div className="flex justify-between items-center">
             <FormField.Label>
-              Hide Onyx Branding
+              Hide 小逆talk Branding
               {!enterpriseTier && (
                 <Tag {...planTagProps("enterprise")} size="sm" />
               )}
             </FormField.Label>
             <FormField.Control>
               <Switch
-                aria-label="Hide Onyx Branding"
+                aria-label="Hide 小逆talk Branding"
                 data-label="hide-onyx-branding-toggle"
                 checked={values.hide_onyx_branding}
                 onCheckedChange={(checked) =>
@@ -540,7 +540,7 @@ export const AppearanceThemeSettings = forwardRef<
             </FormField.Control>
           </div>
           <FormField.Description>
-            Remove &ldquo;powered by Onyx&rdquo; and other Onyx branding
+            Remove &ldquo;powered by 小逆talk&rdquo; and other 小逆talk branding
             presence in the app.
           </FormField.Description>
         </FormField>

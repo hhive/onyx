@@ -57,7 +57,7 @@ function EditGroupPage({ groupId }: EditGroupPageProps) {
     Tier.ENTERPRISE
   );
   const tokenLimitsDisabledTooltip = markdown(
-    "Token rate limits are available on the [Enterprise version of Onyx](/admin/billing) only."
+    "Token rate limits are available on the [Enterprise version of 小逆talk](/admin/billing) only."
   );
 
   // Fetch the group data — poll every 5s while syncing so the UI updates

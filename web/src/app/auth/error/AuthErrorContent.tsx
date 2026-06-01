@@ -74,9 +74,9 @@ function AuthErrorContent({ message: rawMessage }: AuthErrorContentProps) {
           {NEXT_PUBLIC_CLOUD_ENABLED ? (
             <>
               If you continue to experience problems, please reach out to the
-              Onyx team at{" "}
-              <a href="mailto:support@onyx.app" className="text-action-link-05">
-                support@onyx.app
+              小逆talk team at{" "}
+              <a href="mailto:support@xiaoni-ai.top" className="text-action-link-05">
+                support@xiaoni-ai.top
               </a>
             </>
           ) : (

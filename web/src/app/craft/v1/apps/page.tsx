@@ -32,7 +32,7 @@ export default function ExternalAppsUserPage() {
       <SettingsLayouts.Header
         icon={SvgPlug}
         title="My Apps"
-        description="Connect your accounts so Onyx Craft can use them as context."
+        description="Connect your accounts so 小逆talk Craft can use them as context."
       />
       <SettingsLayouts.Body>
         {data === undefined ? (

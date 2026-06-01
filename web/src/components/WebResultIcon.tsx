@@ -3,7 +3,6 @@
 import { ValidSources } from "@/lib/types";
 import { SourceIcon } from "./SourceIcon";
 import { useState } from "react";
-import { SvgOnyxLogo } from "@opal/logos";
 
 export function WebResultIcon({
   url,
@@ -17,13 +16,11 @@ export function WebResultIcon({
   try {
     hostname = new URL(url).hostname;
   } catch (e) {
-    hostname = "onyx.app";
+    hostname = "xiaoni-ai.top";
   }
   return (
     <>
-      {hostname.includes("onyx.app") ? (
-        <SvgOnyxLogo size={size} className="dark:text-white text-black" />
-      ) : !error ? (
+      {!error ? (
         <img
           className="my-0 rounded-full py-0"
           src={`https://t3.gstatic.com/faviconV2?client=SOCIAL&type=FAVICON&fallback_opts=TYPE,SIZE,URL&url=https://${hostname}&size=128`}

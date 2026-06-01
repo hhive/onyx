@@ -38,7 +38,7 @@ export default function ApiKeyFormModal({
           description={
             isUpdate
               ? undefined
-              : "Use service account API key to programmatically access Onyx API with user-level permissions. You can modify the account details later."
+              : "Use service account API key to programmatically access 小逆talk API with user-level permissions. You can modify the account details later."
           }
           onClose={onClose}
         />
