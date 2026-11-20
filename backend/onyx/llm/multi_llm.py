@@ -808,6 +808,9 @@ class LitellmLLM(LLM):
 
     _retry_first_chunk = True
 
+    def _allow_chat_tools_reasoning_none(self) -> bool:
+        return True
+
     def __init__(
         self,
         api_key: str | None,
@@ -1178,9 +1181,14 @@ class LitellmLLM(LLM):
             maximum=self.config.reasoning_effort_max,
         )
 
-        litellm_bridges_tool_turn = bool(
-            tools
-        ) and _litellm_bridges_tool_turn_to_responses(model, self._custom_llm_provider)
+        allow_tools_reasoning_none = self._allow_chat_tools_reasoning_none()
+        litellm_bridges_tool_turn = (
+            bool(tools)
+            and allow_tools_reasoning_none
+            and _litellm_bridges_tool_turn_to_responses(
+                model, self._custom_llm_provider
+            )
+        )
         # Every route LiteLLM sends to the Responses API, which returns and
         # replays reasoning items.
         uses_responses_api = (
@@ -1193,6 +1201,7 @@ class LitellmLLM(LLM):
         # working call. Responses routes, registry bridge included, are exempt.
         if (
             tools
+            and allow_tools_reasoning_none
             and not is_openai_model
             and not litellm_bridges_tool_turn
             and (
@@ -1237,6 +1246,7 @@ class LitellmLLM(LLM):
         # The tools block above already forced reasoning_effort "none".
         sends_explicit_reasoning_none = (
             reasoning_effort is ReasoningEffort.OFF
+            and allow_tools_reasoning_none
             and "reasoning_effort" not in optional_kwargs
             and any(
                 openai_model_supports_reasoning_none(name)

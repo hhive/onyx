@@ -33,6 +33,7 @@ async def test_same_model_stream_routes_to_selected_key(
     class FakeGateway(BaseHTTPRequestHandler):
         def do_POST(self) -> None:
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            assert body.get("reasoning_effort") != "none"
             received.append(
                 (
                     self.path,
@@ -77,7 +78,9 @@ async def test_same_model_stream_routes_to_selected_key(
                 "key_models",
                 AsyncMock(
                     return_value=KeyModels(
-                        object="list", platform="openai", data=[ModelEntry(id="same")]
+                        object="list",
+                        platform="openai",
+                        data=[ModelEntry(id="gpt-6.2-sol")],
                     )
                 ),
             )
@@ -86,9 +89,22 @@ async def test_same_model_stream_routes_to_selected_key(
                 model = await chat.selected_chat_model(
                     request,
                     MagicMock(),
-                    Sub2APISelection(key_id=key_id, model_id="same"),
+                    Sub2APISelection(key_id=key_id, model_id="gpt-6.2-sol"),
                 )
-                assert list(model.stream_raw([UserMessage(content="hello")]))
+                assert list(
+                    model.stream_raw(
+                        [UserMessage(content="hello")],
+                        tools=[
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "lookup",
+                                    "parameters": {"type": "object"},
+                                },
+                            }
+                        ],
+                    )
+                )
             with pytest.raises(OnyxError):
                 await chat.selected_chat_model(
                     request,
@@ -104,7 +120,7 @@ async def test_same_model_stream_routes_to_selected_key(
             "Bearer test-grant",
             "test-secret",
             str(key_id),
-            "same",
+            "gpt-6.2-sol",
         )
         for key_id in (10, 20)
     ]

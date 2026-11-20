@@ -7,6 +7,7 @@ from onyx.db.sub2api_user_credentials import get_sub2api_credential_for_user
 from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
 from onyx.llm.constants import LlmProviderNames
+from onyx.llm.model_capabilities import parse_openai_gpt_version
 from onyx.llm.multi_llm import LitellmLLM
 from onyx.server.sub2api import app_client
 from onyx.server.sub2api.app_api import require_grant
@@ -18,6 +19,10 @@ logger = setup_logger()
 
 class Sub2APIChatLLM(LitellmLLM):
     _retry_first_chunk = False
+
+    def _allow_chat_tools_reasoning_none(self) -> bool:
+        version = parse_openai_gpt_version(self.config.model_name)
+        return version is None or version < (6, 0)
 
     def redact_error(self, text: str) -> str:
         redacted = super().redact_error(text)
