@@ -1,6 +1,8 @@
 from types import SimpleNamespace
 from uuid import uuid4
 
+import pytest
+
 from onyx.server.features.tool import api as tool_api
 
 
@@ -31,12 +33,17 @@ def _tool() -> SimpleNamespace:
     )
 
 
+@pytest.mark.parametrize("key_id", [0, 7])
 def test_list_tools_includes_image_generation_with_user_sub2api_credential(
     monkeypatch,
+    key_id: int,
 ) -> None:
+    monkeypatch.setattr(tool_api, "SUB2API_APP_SECRET", "test-secret")
+    monkeypatch.setattr(tool_api, "SUB2API_INTEGRATION_ENABLED", True)
     user = SimpleNamespace(id=uuid4())
     credential = SimpleNamespace(
-        api_key_id=7,
+        api_key_id=key_id,
+        sub2api_user_id=42,
         api_key=_Secret("sk-user"),
         api_base_url="https://sub2api.example.com/v1",
         image_model_name="gpt-image-2",

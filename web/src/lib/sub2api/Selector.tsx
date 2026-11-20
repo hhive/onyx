@@ -7,6 +7,7 @@ import type { Sub2APISelectorState } from "@/lib/sub2api/hooks";
 
 export function Sub2APISelector({ state }: { state: Sub2APISelectorState }) {
   const t = useTranslations("sub2apiSelector");
+  const tools = useTranslations("chat.messages.timeline.toolNames");
 
   function platformName(platform: string) {
     return platform === "composite" ? t("composite") : platform;
@@ -64,6 +65,23 @@ export function Sub2APISelector({ state }: { state: Sub2APISelectorState }) {
                   title: model.id,
                 }))}
               />
+              {state.imageModels.length > 0 && (
+                <InputSingleSelect
+                  search
+                  value={state.imageModelID}
+                  onValueChange={state.selectImageModel}
+                  placeholder={tools("generateImage")}
+                  options={state.imageModels.map((model) => ({
+                    value: model.id,
+                    title: model.id,
+                    suffix:
+                      model.confirmed === false
+                        ? t("unavailableKey")
+                        : undefined,
+                    disabled: model.confirmed === false,
+                  }))}
+                />
+              )}
             </>
           )}
         </>

@@ -23,7 +23,7 @@ export default function BrandedSidebarHeader({
   return (
     <SidebarLayouts.Header
       logo={<SidebarLogoMark size={SIDEBAR_LOGO_SIZE_PX} />}
-      wordmark={<SidebarWordmark size={SIDEBAR_LOGO_SIZE_PX} />}
+      wordmark={<SidebarWordmark />}
       showLogoWhenFolded={showLogoWhenFolded}
     >
       {children}

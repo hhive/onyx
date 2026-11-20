@@ -11,6 +11,7 @@ from onyx.llm.model_capabilities import parse_openai_gpt_version
 from onyx.llm.multi_llm import LitellmLLM
 from onyx.server.sub2api import app_client
 from onyx.server.sub2api.app_api import require_grant
+from onyx.server.sub2api.images import Sub2APIImageProvider
 from onyx.server.sub2api.models import Sub2APISelection
 from onyx.utils.logger import setup_logger
 
@@ -19,6 +20,7 @@ logger = setup_logger()
 
 class Sub2APIChatLLM(LitellmLLM):
     _retry_first_chunk = False
+    image_provider: Sub2APIImageProvider | None = None
 
     def _allow_chat_tools_reasoning_none(self) -> bool:
         version = parse_openai_gpt_version(self.config.model_name)
@@ -55,7 +57,7 @@ async def selected_chat_model(
         selection.key_id,
         models.platform,
     )
-    return Sub2APIChatLLM(
+    llm = Sub2APIChatLLM(
         model_provider=LlmProviderNames.OPENAI_COMPATIBLE,
         model_name=selection.model_id,
         api_key=grant.grant_token.get_secret_value(),
@@ -64,3 +66,13 @@ async def selected_chat_model(
         extra_headers=headers,
         supports_images=False,
     )
+    if selection.image_model_id:
+        if selection.image_model_id not in {model.id for model in models.image_models}:
+            raise OnyxError(
+                OnyxErrorCode.UNAUTHORIZED,
+                "The Sub2API image model is unavailable for this key.",
+            )
+        llm.image_provider = Sub2APIImageProvider(
+            grant.grant_token, selection.key_id, selection.image_model_id
+        )
+    return llm

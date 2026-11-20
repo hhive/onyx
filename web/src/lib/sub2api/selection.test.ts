@@ -19,9 +19,18 @@ test("remembers each account's model for each key", () => {
   expect(readSelection(3)).toEqual({
     keyID: 42,
     models: { 42: "model-a", 61: "model-b" },
+    imageModels: {},
   });
-  expect(readSelection(4)).toEqual({ keyID: 22, models: { 22: "model-c" } });
-  expect(readSelection(5)).toEqual({ keyID: null, models: {} });
+  expect(readSelection(4)).toEqual({
+    keyID: 22,
+    models: { 22: "model-c" },
+    imageModels: {},
+  });
+  expect(readSelection(5)).toEqual({
+    keyID: null,
+    models: {},
+    imageModels: {},
+  });
 });
 
 test("fetches each page of the current user's key list", async () => {

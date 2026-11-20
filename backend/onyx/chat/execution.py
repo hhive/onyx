@@ -81,6 +81,7 @@ from onyx.server.query_and_chat.streaming_models import (
     ToolQuestionResolved,
 )
 from onyx.server.settings.store import load_settings
+from onyx.server.sub2api.chat import Sub2APIChatLLM
 from onyx.tools.constants import (
     ASK_USER_QUESTION_TOOL_NAME,
     IMAGE_GENERATION_TOOL_ID,
@@ -953,7 +954,8 @@ def create_chat_agent(
         source_types = filters.source_type if filters else None
         delegated = setup.new_msg_req.sub2api_selection is not None
         tool_configuration = setup.tool_configuration
-        if delegated:
+        image_provider = llm.image_provider if isinstance(llm, Sub2APIChatLLM) else None
+        if delegated and image_provider is None:
             tool_configuration = tool_configuration.model_copy(
                 update={
                     "tools": [

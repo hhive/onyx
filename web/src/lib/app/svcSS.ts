@@ -1,11 +1,12 @@
 import type { Metadata } from "next";
+import { APP_DISPLAY_NAME, APP_LOGO_URL } from "@/lib/constants";
 import { fetchEnterpriseSettingsSS } from "@/lib/settings/svcSS";
 import { buildUrl } from "@/lib/utilsSS";
 
 /** Server-side twin of useSettings().appName for server components. */
 export async function fetchAppName(): Promise<string> {
   const enterprise = await fetchEnterpriseSettingsSS();
-  return enterprise?.application_name?.trim() || "Onyx";
+  return enterprise?.application_name?.trim() || APP_DISPLAY_NAME;
 }
 
 export async function generateFaviconMetadata(): Promise<Metadata["icons"]> {
@@ -13,7 +14,7 @@ export async function generateFaviconMetadata(): Promise<Metadata["icons"]> {
   return {
     icon: enterprise?.use_custom_logo
       ? "/api/enterprise-settings/logo"
-      : "/onyx.ico",
+      : APP_LOGO_URL,
   };
 }
 

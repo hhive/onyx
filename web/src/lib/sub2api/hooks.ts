@@ -7,6 +7,7 @@ import {
   fetchSub2API,
   readSelection,
   saveSelection,
+  type KeyModels,
   type Sub2APIKey,
   type Sub2APIModel,
   type Sub2APISelection,
@@ -39,6 +40,7 @@ export function useSub2APISelection(onyxUserID: string | undefined) {
     accountID: number;
     keyID: number | null;
     modelID: string;
+    imageModelID: string;
   }>();
   const activeChoice =
     authorized && keys && choice?.accountID === accountID ? choice : undefined;
@@ -50,6 +52,7 @@ export function useSub2APISelection(onyxUserID: string | undefined) {
     accountID: number;
     keyID: number;
     models?: Sub2APIModel[];
+    imageModels?: Sub2APIModel[];
     failed?: boolean;
   }>();
   const [catalogRevision, setCatalogRevision] = useState(0);
@@ -71,6 +74,7 @@ export function useSub2APISelection(onyxUserID: string | undefined) {
           accountID,
           keyID: savedKey?.id ?? null,
           modelID: savedKey ? (saved.models[savedKey.id] ?? "") : "",
+          imageModelID: savedKey ? (saved.imageModels[savedKey.id] ?? "") : "",
         });
         setKeyDirectory({ owner: onyxUserID, accountID, keys: result });
       },
@@ -86,13 +90,15 @@ export function useSub2APISelection(onyxUserID: string | undefined) {
     if (accountID === null || keyID === null || !authorized) return;
     const abort = new AbortController();
     setCatalog({ accountID, keyID });
-    void fetchSub2API<{ data: Sub2APIModel[] }>(
-      `keys/${keyID}/models`,
-      abort.signal
-    ).then(
+    void fetchSub2API<KeyModels>(`keys/${keyID}/models`, abort.signal).then(
       (result) => {
         if (!abort.signal.aborted)
-          setCatalog({ accountID, keyID, models: result.data });
+          setCatalog({
+            accountID,
+            keyID,
+            models: result.data,
+            imageModels: result.image_models,
+          });
       },
       () => {
         if (!abort.signal.aborted)
@@ -110,10 +116,20 @@ export function useSub2APISelection(onyxUserID: string | undefined) {
   const modelID = models.some((model) => model.id === activeChoice?.modelID)
     ? activeChoice!.modelID
     : "";
+  const imageModels = matchingCatalog?.imageModels ?? [];
+  const imageModelID =
+    imageModels.find(
+      (model) =>
+        model.confirmed !== false && model.id === activeChoice?.imageModelID
+    )?.id ?? "";
   const selection: Sub2APISelection | null =
     authorized && keyID !== null && modelID
-      ? { key_id: keyID, model_id: modelID }
+      ? {
+          key_id: keyID,
+          model_id: modelID,
+        }
       : null;
+  if (selection && imageModelID) selection.image_model_id = imageModelID;
 
   function selectKey(value: string) {
     if (accountID === null) return;
@@ -128,15 +144,27 @@ export function useSub2APISelection(onyxUserID: string | undefined) {
       accountID,
       keyID: newKeyID,
       modelID: newKeyID === null ? "" : (saved.models[newKeyID] ?? ""),
+      imageModelID:
+        newKeyID === null ? "" : (saved.imageModels[newKeyID] ?? ""),
     });
     saveSelection(accountID, newKeyID, undefined);
   }
 
   function selectModel(value: string) {
-    if (accountID === null || keyID === null) return;
+    if (!activeChoice || accountID === null || keyID === null) return;
     const chosenModel = models.find((model) => model.id === value);
-    setChoice({ accountID, keyID, modelID: chosenModel?.id ?? "" });
+    setChoice({ ...activeChoice, modelID: chosenModel?.id ?? "" });
     saveSelection(accountID, keyID, chosenModel?.id ?? null);
+  }
+
+  function selectImageModel(value: string) {
+    if (!activeChoice || accountID === null || keyID === null) return;
+    const chosenModel = imageModels.find(
+      (model) => model.confirmed !== false && model.id === value
+    );
+    if (value && !chosenModel) return;
+    setChoice({ ...activeChoice, imageModelID: chosenModel?.id ?? "" });
+    saveSelection(accountID, keyID, undefined, chosenModel?.id ?? null);
   }
 
   return {
@@ -149,6 +177,9 @@ export function useSub2APISelection(onyxUserID: string | undefined) {
     platform: chosenKey?.platform,
     models,
     modelID,
+    imageModels,
+    imageModelID,
+    selectImageModel,
     loading:
       session.isLoading ||
       (authorized && !keys && !currentDirectory?.failed) ||

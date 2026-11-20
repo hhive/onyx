@@ -23,6 +23,7 @@ from onyx.image_gen.generation import (
     resolve_image_size,
 )
 from onyx.image_gen.interfaces import (
+    ImageGenerationProvider,
     ImageGenerationProviderCredentials,
     ImageShape,
     ReferenceImage,
@@ -71,13 +72,14 @@ class ImageGenerationTool(Tool):
         model: str = IMAGE_MODEL_NAME,
         provider: str = IMAGE_MODEL_PROVIDER,
         num_imgs: int = 1,
+        image_provider: ImageGenerationProvider | None = None,
     ) -> None:
         self.model = model
         self._chat_session_id = chat_session_id
         self.provider = provider
         self.num_imgs = num_imgs
 
-        self.img_provider = get_image_generation_provider(
+        self.img_provider = image_provider or get_image_generation_provider(
             provider, image_generation_credentials
         )
 

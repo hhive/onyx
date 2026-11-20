@@ -1,6 +1,7 @@
 export interface Sub2APISelection {
   key_id: number;
   model_id: string;
+  image_model_id?: string;
 }
 
 export interface Sub2APISession {
@@ -20,9 +21,19 @@ export interface Sub2APIKey {
 
 export interface Sub2APIModel {
   id: string;
+  confirmed?: boolean;
 }
 
-type SavedSelection = { keyID: number | null; models: Record<number, string> };
+export interface KeyModels {
+  data: Sub2APIModel[];
+  image_models?: Sub2APIModel[];
+}
+
+type SavedSelection = {
+  keyID: number | null;
+  models: Record<number, string>;
+  imageModels: Record<number, string>;
+};
 
 function selectionStorageKey(userID: number) {
   return `sub2api-chat-selection:v1:${userID}`;
@@ -45,23 +56,29 @@ export function readSelection(userID: number): SavedSelection {
             ? saved.keyID!
             : null,
         models: saved.models,
+        imageModels: saved.imageModels ?? {},
       };
     }
   } catch {
     // The preference can be unavailable in private browsing.
   }
-  return { keyID: null, models: {} };
+  return { keyID: null, models: {}, imageModels: {} };
 }
 
 export function saveSelection(
   userID: number,
   keyID: number | null,
-  modelID: string | null | undefined
+  modelID: string | null | undefined,
+  imageModelID?: string | null
 ) {
   const previous = readSelection(userID);
   if (keyID !== null && modelID !== undefined) {
     if (modelID === null) delete previous.models[keyID];
     else previous.models[keyID] = modelID;
+  }
+  if (keyID !== null && imageModelID !== undefined) {
+    if (imageModelID === null) delete previous.imageModels[keyID];
+    else previous.imageModels[keyID] = imageModelID;
   }
   try {
     localStorage.setItem(

@@ -22,6 +22,7 @@ from onyx.integrations.chat_tools import build_integration_chat_tools
 from onyx.integrations.models import ApprovalMode
 from onyx.llm.interfaces import LLM, LLMConfig
 from onyx.onyxbot.slack.models import SlackContext
+from onyx.server.sub2api.chat import Sub2APIChatLLM
 from onyx.tools.built_in_tools import get_built_in_tool_by_id
 from onyx.tools.interface import Tool
 from onyx.tools.models import (
@@ -293,6 +294,25 @@ def _construct_tools_impl(
 
         if db_tool_model.in_code_tool_id:
             tool_cls = get_built_in_tool_by_id(db_tool_model.in_code_tool_id)
+
+            if tool_cls.__name__ == ImageGenerationTool.__name__ and isinstance(
+                llm, Sub2APIChatLLM
+            ):
+                image_provider = llm.image_provider
+                if image_provider is not None:
+                    tools.append(
+                        ImageGenerationTool(
+                            image_generation_credentials=ImageGenerationProviderCredentials(),
+                            tool_id=db_tool_model.id,
+                            chat_session_id=_require_chat_session_id(
+                                custom_tool_config, ImageGenerationTool.__name__
+                            ),
+                            model=image_provider.model,
+                            provider=ImageGenerationProviderName.OPENAI.value,
+                            image_provider=image_provider,
+                        )
+                    )
+                continue
 
             try:
                 tool_is_available = tool_cls.is_available(db_session)

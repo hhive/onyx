@@ -170,20 +170,35 @@ def _is_sub2api_image_generation_model(
     )
 
 
+class ImageModelEntry(ModelEntry):
+    confirmed: bool
+
+
+class ImageCredential(BaseModel):
+    api_key: SecretStr
+
+
 class KeyModels(BaseModel):
     object: str
     data: list[ModelEntry]
     platform: str
+    image_models: list[ImageModelEntry] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def chat_models(self) -> "KeyModels":
+        self.image_models.extend(
+            ImageModelEntry(**model.model_dump(), confirmed=True)
+            for model in self.data
+            if _is_sub2api_image_generation_model(
+                model.id, model.type, model.model_dump()
+            )
+        )
+        image_ids = {model.id for model in self.image_models}
         self.data = [
             model
             for model in self.data
             if not _is_sub2api_embedding_model(model.id, model.type)
-            and not _is_sub2api_image_generation_model(
-                model.id, model.type, model.model_dump()
-            )
+            and model.id not in image_ids
             and model.type
             not in {"video", "audio", "transcription", "moderation", "rerank"}
         ]
@@ -193,3 +208,4 @@ class KeyModels(BaseModel):
 class Sub2APISelection(BaseModel):
     key_id: int = Field(gt=0)
     model_id: str = Field(min_length=1, max_length=300)
+    image_model_id: str | None = Field(default=None, min_length=1, max_length=300)

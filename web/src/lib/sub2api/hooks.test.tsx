@@ -93,3 +93,58 @@ test("cancels unfinished key pages when the user signs out", async () => {
   expect(result.current.keys).toEqual([]);
   expect(result.current.selection).toBeNull();
 });
+
+test("restores confirmed image models per Key and omits unconfirmed models", async () => {
+  saveSelection(972, 11, "chat", "image-a");
+  saveSelection(972, 22, "chat", "unconfirmed");
+  saveSelection(972, 11, undefined);
+  jest.spyOn(global, "fetch").mockImplementation(async (path) => {
+    switch (path) {
+      case "/api/sub2api/session":
+        return json({ user_id: 972, authorized: true });
+      case "/api/sub2api/keys?page=1&page_size=50":
+        return json({
+          total: 2,
+          items: [
+            { id: 11, selectable: true },
+            { id: 22, selectable: true },
+          ],
+        });
+      case "/api/sub2api/keys/11/models":
+        return json({
+          data: [{ id: "chat" }],
+          image_models: [{ id: "image-a" }],
+        });
+      case "/api/sub2api/keys/22/models":
+        return json({
+          data: [{ id: "chat" }],
+          image_models: [
+            { id: "unconfirmed", confirmed: false },
+            { id: "image-b", confirmed: true },
+          ],
+        });
+      default:
+        throw new Error(String(path));
+    }
+  });
+  const { result } = renderHook(() => useSub2APISelection("onyx-user-image"));
+  await waitFor(() =>
+    expect(result.current.selection?.image_model_id).toBe("image-a")
+  );
+  act(() => result.current.selectKey("22"));
+  await waitFor(() =>
+    expect(result.current.selection).toEqual({ key_id: 22, model_id: "chat" })
+  );
+  act(() => result.current.selectImageModel("unconfirmed"));
+  expect(result.current.selection?.image_model_id).toBeUndefined();
+  act(() => result.current.selectImageModel("image-b"));
+  expect(result.current.selection?.image_model_id).toBe("image-b");
+  act(() => result.current.selectKey("11"));
+  await waitFor(() =>
+    expect(result.current.selection?.image_model_id).toBe("image-a")
+  );
+  act(() => result.current.selectKey("22"));
+  await waitFor(() =>
+    expect(result.current.selection?.image_model_id).toBe("image-b")
+  );
+});

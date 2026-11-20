@@ -5,6 +5,7 @@ export const HOST_URL = process.env.WEB_DOMAIN || "http://localhost:3000";
 export const INTERNAL_URL = process.env.INTERNAL_URL || "http://localhost:8080";
 
 export const APP_DISPLAY_NAME = "小逆talk";
+export const APP_LOGO_URL = "/xiaoni-talk.ico";
 
 // Documentation URLs
 export const DOCS_BASE_URL = "https://docs.onyx.app";

@@ -3,10 +3,14 @@
 import { Text } from "@opal/components";
 import { useTranslations } from "next-intl";
 import { useSettings } from "@/lib/settings/hooks";
-import { DEFAULT_LOGO_SIZE_PX } from "@/lib/constants";
+import {
+  APP_DISPLAY_NAME,
+  APP_LOGO_URL,
+  DEFAULT_LOGO_SIZE_PX,
+} from "@/lib/constants";
 import { Section } from "@opal/layouts";
 import { cn } from "@opal/utils";
-import { SvgOnyxLogo, SvgOnyxLogoWordmark, SvgOnyxWordmark } from "@opal/logos";
+import { SvgOnyxLogo, SvgOnyxLogoWordmark } from "@opal/logos";
 import { IconProps } from "@opal/types";
 
 export interface LogoProps extends IconProps {
@@ -16,16 +20,14 @@ export interface LogoProps extends IconProps {
 }
 
 /**
- * The app mark alone: the uploaded custom logo when one is set, the Onyx
- * mark otherwise. Shaped like an Opal icon, so it fits any `icon` slot and
- * honours the size or style the slot passes.
+ * The configured logo or the default workspace mark.
  */
 export function Logo({ size, className, style, onyxBranded }: LogoProps) {
   const t = useTranslations("common");
   const resolvedSize = size ?? DEFAULT_LOGO_SIZE_PX;
   const { logoUrl } = useSettings();
 
-  if (onyxBranded || !logoUrl) {
+  if (onyxBranded) {
     return (
       <SvgOnyxLogo
         size={resolvedSize}
@@ -45,7 +47,7 @@ export function Logo({ size, className, style, onyxBranded }: LogoProps) {
     >
       <img
         alt={t("logo.image.alt")}
-        src={logoUrl}
+        src={logoUrl || APP_LOGO_URL}
         className="object-cover object-center w-full h-full"
       />
     </div>
@@ -57,8 +59,7 @@ export interface FoldableLogoProps extends LogoProps {
 }
 
 /**
- * The sidebar's brand block: the mark, and when unfolded the application
- * name and the "powered by" line beside it, per the enterprise display style.
+ * The brand block follows the workspace's logo display style.
  */
 export function FoldableLogo({
   folded,
@@ -66,11 +67,11 @@ export function FoldableLogo({
   className,
   onyxBranded,
 }: FoldableLogoProps) {
-  const t = useTranslations("common");
   const resolvedSize = size ?? DEFAULT_LOGO_SIZE_PX;
-  const { enterprise, logoUrl, hide_onyx_branding, isLoading } = useSettings();
+  const { enterprise } = useSettings();
   const logoDisplayStyle = enterprise?.logo_display_style;
-  const applicationName = enterprise?.application_name;
+  const applicationName =
+    enterprise?.application_name?.trim() || APP_DISPLAY_NAME;
 
   if (onyxBranded) {
     return folded ? (
@@ -82,16 +83,25 @@ export function FoldableLogo({
 
   const logo = <Logo size={resolvedSize} className={className} />;
 
-  const renderNameAndPoweredBy = (opts: {
+  const renderBrand = (opts: {
     includeLogo: boolean;
     includeName: boolean;
   }) => {
     return (
-      <div className="flex min-w-0 gap-2">
+      <Section
+        flexDirection="row"
+        alignItems="start"
+        gap={2}
+        className="min-w-0"
+      >
         {opts.includeLogo && logo}
         {!folded && (
           /* H3 text is 4px larger (28px) than the Logo icon (24px), so negative margin hack. */
-          <div className="flex flex-1 flex-col -mt-0.5">
+          <Section
+            flexDirection="column"
+            alignItems="start"
+            className="flex-1 -mt-0.5"
+          >
             {opts.includeName && (
               <Text
                 maxLines={1}
@@ -101,54 +111,23 @@ export function FoldableLogo({
                 font="heading-section"
                 color="text-05"
               >
-                {applicationName ?? ""}
+                {applicationName}
               </Text>
             )}
-            {/* Wait for settings so a hidden tagline never flashes. */}
-            {!isLoading && !hide_onyx_branding && (
-              <Text font="secondary-body" color="text-03" maxLines={1}>
-                {t("logo.poweredBy.label")}
-              </Text>
-            )}
-          </div>
+          </Section>
         )}
-      </div>
+      </Section>
     );
   };
 
-  // No custom name: the Onyx wordmark beside the mark, which a custom logo
-  // overrides.
-  if (!applicationName) {
-    if (folded) return <Logo size={resolvedSize} className={className} />;
-    if (!logoUrl) {
-      return <SvgOnyxLogoWordmark size={resolvedSize} className={className} />;
-    }
-    return (
-      <Section
-        flexDirection="row"
-        alignItems="center"
-        justifyContent="start"
-        gap={2}
-        width="fit"
-        height="fit"
-      >
-        <Logo size={resolvedSize} className={className} />
-        <SvgOnyxWordmark size={resolvedSize} />
-      </Section>
-    );
-  }
-
-  // A custom name, with the custom logo or the Onyx mark. The display style
-  // can leave out either one.
-  return renderNameAndPoweredBy({
+  return renderBrand({
     includeLogo: logoDisplayStyle !== "name_only",
     includeName: logoDisplayStyle !== "logo_only",
   });
 }
 
 /**
- * The sidebar's logo mark: the workspace's custom logo, or the Onyx mark.
- * Renders nothing when a workspace with a custom name shows the name only.
+ * The sidebar logo follows the workspace's logo display style.
  */
 export function SidebarLogoMark({ size }: { size: number }) {
   const { enterprise } = useSettings();
@@ -162,23 +141,15 @@ export function SidebarLogoMark({ size }: { size: number }) {
 }
 
 /**
- * The sidebar's wordmark, beside the mark: the custom name, which overrides
- * the Onyx wordmark, with the "Powered by" line unless Onyx branding is
- * hidden. Without a custom name, the Onyx wordmark.
+ * The sidebar wordmark displays the workspace name.
  */
-export function SidebarWordmark({ size }: { size: number }) {
-  const t = useTranslations("common");
-  const { enterprise, hide_onyx_branding, isLoading } = useSettings();
+export function SidebarWordmark() {
+  const { enterprise } = useSettings();
   const logoDisplayStyle = enterprise?.logo_display_style;
-  const applicationName = enterprise?.application_name;
-
-  if (!applicationName) {
-    return <SvgOnyxWordmark size={size} />;
-  }
+  const applicationName =
+    enterprise?.application_name?.trim() || APP_DISPLAY_NAME;
 
   return (
-    /* The name's line is as tall as the 28px mark, so the two sit level; the
-    "Powered by" line hangs below and never moves the name. */
     <Section
       flexDirection="column"
       alignItems="start"
@@ -197,12 +168,6 @@ export function SidebarWordmark({ size }: { size: number }) {
           color="text-05"
         >
           {applicationName}
-        </Text>
-      )}
-      {/* Wait for settings so a hidden tagline never flashes. */}
-      {!isLoading && !hide_onyx_branding && (
-        <Text font="secondary-body" color="text-03" maxLines={1}>
-          {t("logo.poweredBy.label")}
         </Text>
       )}
     </Section>

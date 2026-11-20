@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from onyx.auth.permission_projection import tool_permissions
 from onyx.auth.permissions import has_global_permission, require_permission
+from onyx.configs.app_configs import SUB2API_APP_SECRET, SUB2API_INTEGRATION_ENABLED
 from onyx.configs.constants import PUBLIC_API_TAGS
 from onyx.db.engine.sql_engine import get_session
 from onyx.db.enums import (
@@ -526,7 +527,14 @@ def list_tools(
                 if tool.in_code_tool_id != IMAGE_GENERATION_TOOL_ID:
                     continue
                 credential = get_sub2api_credential_for_user(db_session, user.id)
-                if credential is None or credential.api_key_id <= 0:
+                if credential is None or (
+                    credential.api_key_id <= 0
+                    and not (
+                        SUB2API_INTEGRATION_ENABLED
+                        and SUB2API_APP_SECRET
+                        and credential.sub2api_user_id > 0
+                    )
+                ):
                     continue
         except KeyError:
             pass

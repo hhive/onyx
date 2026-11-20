@@ -125,13 +125,18 @@ test("sendMessage forwards the Sub2API Key and model selected for the turn", asy
     },
     modelProvider: "workspace-provider",
     modelVersion: "workspace-model",
-    sub2apiSelection: { key_id: 31, model_id: "chosen-model" },
+    sub2apiSelection: {
+      key_id: 31,
+      model_id: "chosen-model",
+      image_model_id: "chosen-image-model",
+    },
   });
   await stream.next().catch(() => {});
   const body = JSON.parse(String(fetchSpy.mock.calls[0]?.[1]?.body));
   expect(body.sub2api_selection).toEqual({
     key_id: 31,
     model_id: "chosen-model",
+    image_model_id: "chosen-image-model",
   });
   expect(body.llm_override).toBeNull();
   expect(body.llm_overrides).toBeNull();

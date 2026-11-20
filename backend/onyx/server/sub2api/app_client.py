@@ -11,7 +11,14 @@ from onyx.configs.app_configs import (
 )
 from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
-from onyx.server.sub2api.models import AppExchange, KeyModels, KeyPage
+from onyx.llm.model_catalog import iter_image_generation_models
+from onyx.server.sub2api.models import (
+    AppExchange,
+    ImageCredential,
+    ImageModelEntry,
+    KeyModels,
+    KeyPage,
+)
 
 APP_SECRET_HEADER = "X-Sub2API-App-Secret"
 KEY_ID_HEADER = "X-Sub2API-Key-ID"
@@ -104,12 +111,34 @@ async def list_keys(grant: SecretStr, page: int, page_size: int) -> KeyPage:
 
 
 async def key_models(grant: SecretStr, key_id: int) -> KeyModels:
-    return validate_response(
+    catalog = validate_response(
         await _request("GET", f"/keys/{key_id}/models", grant), KeyModels
     )
+    if catalog.platform.lower() in {"openai", "composite"}:
+        known_ids = {model.id for model in catalog.image_models}
+        catalog.image_models.extend(
+            ImageModelEntry(id=model_id, confirmed=False)
+            for model_id in iter_image_generation_models("openai")
+            if model_id not in known_ids
+        )
+    return catalog
 
 
 async def revoke(grant: SecretStr) -> None:
     response = await _request("POST", "/revoke", grant)
     if response.status_code not in (200, 204, 401):
         raise OnyxError(OnyxErrorCode.BAD_GATEWAY, "Sub2API logout failed.")
+
+
+def image_credential(client: httpx.Client, grant: SecretStr, key_id: int) -> SecretStr:
+    try:
+        response = client.post(
+            f"{app_endpoint()}/keys/{key_id}/credential",
+            headers=app_headers(grant),
+            timeout=DIRECTORY_TIMEOUT,
+        )
+    except httpx.RequestError:
+        raise OnyxError(
+            OnyxErrorCode.BAD_GATEWAY, "Sub2API image credentials are unavailable."
+        ) from None
+    return validate_response(response, ImageCredential).api_key
