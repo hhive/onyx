@@ -61,6 +61,14 @@ def _https_origin(value: str) -> str | None:
     return f"https://{parts.hostname}{suffix}"
 
 
+def _launch_origins() -> list[str]:
+    return [
+        origin
+        for value in SUB2API_LAUNCH_ORIGIN.split(",")
+        if (origin := _https_origin(value.strip())) is not None
+    ]
+
+
 def valid_origin(headers: list[str], allowed_origin: str, web_domain: str) -> bool:
     source = _https_origin(allowed_origin)
     target = _https_origin(web_domain)
@@ -96,6 +104,25 @@ def _launch_form(ticket: str) -> HTMLResponse:
     )
 
 
+@router.get("/launch", include_in_schema=False)
+async def recover_legacy_launch(request: Request) -> Response:
+    origins = _launch_origins()
+    headers = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"}
+    if not origins:
+        return Response(status_code=404, headers=headers)
+
+    referer = request.headers.get("referer", "")
+    origin = next(
+        (
+            candidate
+            for candidate in origins
+            if referer == candidate or referer.startswith(f"{candidate}/")
+        ),
+        origins[0],
+    )
+    return RedirectResponse(f"{origin}/keys", status_code=303, headers=headers)
+
+
 @router.post("/launch")
 async def launch(
     request: Request,
@@ -105,14 +132,9 @@ async def launch(
     db_session: Session = Depends(get_session),
 ) -> Response:
     origins = request.headers.getlist("origin")
-    allowed_origins = {
-        origin
-        for value in SUB2API_LAUNCH_ORIGIN.split(",")
-        if (origin := _https_origin(value.strip())) is not None
-    }
     if (
         len(origins) != 1
-        or origins[0] not in allowed_origins
+        or origins[0] not in _launch_origins()
         or _https_origin(WEB_DOMAIN) is None
     ):
         raise OnyxError(OnyxErrorCode.UNAUTHORIZED, "Sub2API launch origin rejected.")

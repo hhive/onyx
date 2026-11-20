@@ -98,6 +98,7 @@ PUBLIC_ENDPOINT_SPECS = [
     ("/auth/saml/complete", {"GET"}),
     ("/auth/saml/logout", {"POST"}),
     ("/sub2api/exchange", {"GET"}),
+    ("/sub2api/launch", {"GET"}),
     ("/sub2api/launch", {"POST"}),
     ("/sub2api/launch/finish", {"POST"}),
     # anonymous user on cloud
