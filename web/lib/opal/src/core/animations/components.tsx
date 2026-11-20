@@ -4,7 +4,7 @@ import "@opal/core/animations/styles.css";
 import React from "react";
 import { cn } from "@opal/utils";
 import type { WithoutStyles, ExtremaSizeVariants } from "@opal/types";
-import { widthVariants } from "@opal/shared";
+import { widthVariants, heightVariants } from "@opal/shared";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -17,8 +17,10 @@ interface HoverableRootProps extends WithoutStyles<
 > {
   children: React.ReactNode;
   group: string;
-  /** Width preset. @default "auto" */
+  /** Width preset. @default "full" */
   width?: ExtremaSizeVariants;
+  /** Height preset. When omitted, no height class is applied. */
+  height?: ExtremaSizeVariants;
   /**
    * JS-controllable interaction state override.
    *
@@ -51,6 +53,13 @@ interface HoverableItemProps extends WithoutStyles<
    * Ignored for other variants.
    */
   resting?: React.ReactNode;
+  /**
+   * Shows the item whatever the hover state, e.g. a toggle that stays visible
+   * while it is on. Prefer it to rendering the item with and without the
+   * wrapper: the tree keeps its shape, so the children keep their state and
+   * their transitions. Ignored for `variant="replace-on-hover"`.
+   */
+  revealed?: boolean;
   /** Ref forwarded to the item `<div>`. */
   ref?: React.Ref<HTMLDivElement>;
 }
@@ -82,6 +91,7 @@ function HoverableRoot({
   group,
   children,
   width = "full",
+  height,
   interaction = "rest",
   ref,
   ...props
@@ -90,7 +100,7 @@ function HoverableRoot({
     <div
       {...props}
       ref={ref}
-      className={cn(widthVariants[width])}
+      className={cn(widthVariants[width], height && heightVariants[height])}
       data-hover-group={group}
       data-interaction={interaction !== "rest" ? interaction : undefined}
     >
@@ -131,6 +141,7 @@ function HoverableItem({
   group,
   variant = "appear-on-hover",
   resting,
+  revealed = false,
   children,
   ref,
   ...props
@@ -163,6 +174,7 @@ function HoverableItem({
       className={cn("hoverable-item")}
       data-hoverable-variant={variant}
       data-hoverable-local={isLocal ? "true" : undefined}
+      data-hoverable-revealed={revealed || undefined}
     >
       {children}
     </div>
@@ -185,7 +197,8 @@ function HoverableItem({
  *
  * - `Hoverable.Item` — Hidden by default. In group mode, revealed when
  *   the ancestor Root is hovered. In local mode (no `group`), revealed
- *   when the item itself is hovered.
+ *   when the item itself is hovered. On devices whose primary input
+ *   cannot hover (touch), items are always shown in their revealed state.
  *
  * @example
  * ```tsx

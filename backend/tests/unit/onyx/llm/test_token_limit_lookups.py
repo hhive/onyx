@@ -1,32 +1,74 @@
-"""Tests for the token-limit lookup helpers in `onyx.llm.utils`:
+"""Tests for the token-limit lookup helpers in `onyx.llm.model_capabilities`:
 `llm_max_input_tokens`, `get_llm_max_output_tokens`, and `get_max_input_tokens`."""
 
 from unittest.mock import patch
 
 from onyx.configs.model_configs import GEN_AI_MODEL_FALLBACK_MAX_TOKENS
-from onyx.llm.utils import get_llm_max_output_tokens
-from onyx.llm.utils import get_max_input_tokens
-from onyx.llm.utils import llm_max_input_tokens
+from onyx.llm.model_capabilities import (
+    get_llm_max_output_tokens,
+    get_max_input_tokens,
+    llm_max_input_tokens,
+)
+
+
+def test_model_context_metadata_is_not_inferred_or_overwritten() -> None:
+    """The rendered map carries a catalog entry's limits verbatim — no
+    inferred or synthesized token fields."""
+    from onyx.llm import model_catalog
+
+    catalog = {
+        "openai": {
+            "models": {
+                "gpt-6.1-sol": {
+                    "name": "GPT-6.1 Sol",
+                    "limit": {"context": 922000, "output": 128000},
+                },
+                "gpt-6-sol": {
+                    "name": "GPT-6 Sol",
+                    "limit": {"context": 1048000, "output": 128000},
+                },
+            },
+            "aliases": {},
+        }
+    }
+    with patch.object(model_catalog, "_catalog", return_value=catalog):
+        model_catalog.build_model_map.cache_clear()
+        try:
+            model_map = model_catalog.build_model_map()
+        finally:
+            model_catalog.build_model_map.cache_clear()
+
+    sol = model_map["openai/gpt-6.1-sol"]
+    assert sol["max_input_tokens"] == 922000
+    assert sol["max_output_tokens"] == 128000
+    terra = model_map["openai/gpt-6-sol"]
+    assert terra["max_input_tokens"] == 1048000
+    assert terra["max_output_tokens"] == 128000
+    assert "max_context_tokens" not in sol
+    # Models absent from the catalog do not appear in the map.
+    assert "gpt-6-luna" not in model_map
 
 
 class TestLlmMaxInputTokens:
     def test_prefers_max_input_tokens(self) -> None:
-        model_map = {"openai/gpt-4o": {"max_input_tokens": 128000, "max_tokens": 4096}}
+        model_map = {
+            "openai/gpt-6-astra": {"max_input_tokens": 128000, "max_tokens": 4096}
+        }
         assert (
             llm_max_input_tokens(
                 model_map=model_map,
-                model_name="gpt-4o",
+                model_name="gpt-6-astra",
                 model_provider="openai",
             )
             == 128000
         )
 
     def test_falls_back_to_max_tokens(self) -> None:
-        model_map = {"openai/gpt-4o": {"max_tokens": 4096}}
+        model_map = {"openai/gpt-6-astra": {"max_tokens": 4096}}
         assert (
             llm_max_input_tokens(
                 model_map=model_map,
-                model_name="gpt-4o",
+                model_name="gpt-6-astra",
                 model_provider="openai",
             )
             == 4096
@@ -43,11 +85,11 @@ class TestLlmMaxInputTokens:
         )
 
     def test_model_has_no_token_keys_returns_fallback(self) -> None:
-        model_map = {"openai/gpt-4o": {"input_cost_per_token": 0.0001}}
+        model_map = {"openai/gpt-6-astra": {"input_cost_per_token": 0.0001}}
         assert (
             llm_max_input_tokens(
                 model_map=model_map,
-                model_name="gpt-4o",
+                model_name="gpt-6-astra",
                 model_provider="openai",
             )
             == GEN_AI_MODEL_FALLBACK_MAX_TOKENS
@@ -88,12 +130,12 @@ class TestLlmMaxInputTokens:
         )
 
     def test_override_env_var_wins(self) -> None:
-        model_map = {"openai/gpt-4o": {"max_input_tokens": 128000}}
-        with patch("onyx.llm.utils.GEN_AI_MAX_TOKENS", 5000):
+        model_map = {"openai/gpt-6-astra": {"max_input_tokens": 128000}}
+        with patch("onyx.llm.model_capabilities.GEN_AI_MAX_TOKENS", 5000):
             assert (
                 llm_max_input_tokens(
                     model_map=model_map,
-                    model_name="gpt-4o",
+                    model_name="gpt-6-astra",
                     model_provider="openai",
                 )
                 == 5000
@@ -103,37 +145,48 @@ class TestLlmMaxInputTokens:
 class TestGetLlmMaxOutputTokens:
     def test_prefers_max_output_tokens(self) -> None:
         model_map = {
-            "openai/gpt-4o": {"max_output_tokens": 16384, "max_tokens": 128000}
+            "openai/gpt-6-astra": {"max_output_tokens": 16384, "max_tokens": 128000}
         }
         assert (
             get_llm_max_output_tokens(
                 model_map=model_map,
-                model_name="gpt-4o",
+                model_name="gpt-6-astra",
                 model_provider="openai",
             )
             == 16384
         )
 
     def test_falls_back_to_ten_percent_of_max_tokens(self) -> None:
-        model_map = {"openai/gpt-4o": {"max_tokens": 100000}}
+        model_map = {"openai/gpt-6-astra": {"max_tokens": 100000}}
         assert (
             get_llm_max_output_tokens(
                 model_map=model_map,
-                model_name="gpt-4o",
+                model_name="gpt-6-astra",
                 model_provider="openai",
             )
             == 10000
         )
 
     def test_lookup_without_provider_prefix(self) -> None:
-        model_map = {"gpt-4o": {"max_output_tokens": 4096}}
+        model_map = {"gpt-6-astra": {"max_output_tokens": 4096}}
         assert (
             get_llm_max_output_tokens(
                 model_map=model_map,
-                model_name="gpt-4o",
+                model_name="gpt-6-astra",
                 model_provider="openai",
             )
             == 4096
+        )
+
+    def test_lookup_strips_proxy_provider_prefix(self) -> None:
+        model_map = {"azure/gpt-6.2-sol": {"max_output_tokens": 128000}}
+        assert (
+            get_llm_max_output_tokens(
+                model_map=model_map,
+                model_name="openai/gpt-6.2-sol",
+                model_provider="azure",
+            )
+            == 128000
         )
 
     def test_model_not_found_returns_fallback(self) -> None:
@@ -173,11 +226,11 @@ class TestGetLlmMaxOutputTokens:
 
 class TestGetMaxInputTokens:
     def test_subtracts_reserved_output_tokens(self) -> None:
-        model_map = {"openai/gpt-4o": {"max_input_tokens": 128000}}
-        with patch("onyx.llm.utils.get_model_map", return_value=model_map):
+        model_map = {"openai/gpt-6-astra": {"max_input_tokens": 128000}}
+        with patch("onyx.llm.model_capabilities.get_model_map", return_value=model_map):
             assert (
                 get_max_input_tokens(
-                    model_name="gpt-4o",
+                    model_name="gpt-6-astra",
                     model_provider="openai",
                     output_tokens=1024,
                 )
@@ -186,7 +239,7 @@ class TestGetMaxInputTokens:
 
     def test_non_positive_budget_falls_back(self) -> None:
         model_map = {"tiny/model": {"max_input_tokens": 100}}
-        with patch("onyx.llm.utils.get_model_map", return_value=model_map):
+        with patch("onyx.llm.model_capabilities.get_model_map", return_value=model_map):
             assert (
                 get_max_input_tokens(
                     model_name="model",
@@ -205,7 +258,7 @@ class TestGetMaxInputTokens:
                 "max_tokens": None,
             }
         }
-        with patch("onyx.llm.utils.get_model_map", return_value=model_map):
+        with patch("onyx.llm.model_capabilities.get_model_map", return_value=model_map):
             result = get_max_input_tokens(
                 model_name="gpt-oss:20b-cloud",
                 model_provider="ollama_chat",

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useTranslations } from "next-intl";
 import {
   setCursorToEnd as setCursorToEndUtil,
   setCursorAfterNode,
@@ -6,14 +7,45 @@ import {
   insertTextAtCursor as insertTextAtCursorUtil,
   insertNodeAtCursor as insertNodeAtCursorUtil,
   getTextContent,
+  readContent,
+  deleteTokenAtCursor,
+  stripLeadingBr,
+  captureSnapshot,
+  restoreSnapshot,
+  snapshotsEqual,
+  pushBoundedSnapshot,
+  type CaretText,
+  type EditableSnapshot,
 } from "@/lib/contentEditable";
 import {
   createRichInputTileNode,
   getAdjacentRichTile,
   shouldCreatePasteTile,
-  getPasteTilePreview,
-  getPasteTileMeta,
+  getPasteTileText,
+  isMentionTile,
+  MENTION_TILE_TYPE,
+  setRichTileText,
+  type RichTileText,
 } from "@/lib/richInputTile";
+import { MENTION_TRIGGER, placeMentions } from "@/lib/chat/mentions";
+import type { ComposedMention, Mention, PlacedMention } from "@/lib/chat/types";
+
+type PasteTileData = { text: string; tile: HTMLElement };
+
+// App-level undo history: the native undo stack can't see programmatic
+// mutations (paste, tiles, drafts), so it must never run against the input.
+const UNDO_COALESCE_MS = 1000;
+
+const CARET_KEYS = new Set([
+  "ArrowLeft",
+  "ArrowRight",
+  "ArrowUp",
+  "ArrowDown",
+  "Home",
+  "End",
+  "PageUp",
+  "PageDown",
+]);
 
 export interface UseContentEditableOptions {
   initialContent?: string;
@@ -28,14 +60,27 @@ export interface UseContentEditableOptions {
 export interface UseContentEditableReturn {
   ref: React.RefObject<HTMLDivElement | null>;
   message: string;
-  setMessage: (text: string) => void;
+  /** One mention per mention tile in the input, in text order, at the
+   * offset of its `@name` in `message`. */
+  mentions: PlacedMention[];
+  /** Replaces the content and puts a mention tile where
+   * `lib/chat/mentions.ts:placeMentions` places each of `mentions`. */
+  setMessage: (text: string, mentions?: readonly ComposedMention[]) => void;
   clearMessage: () => void;
+  /** Delete `token` around the caret: `token.before` ends at the caret. */
+  deleteToken: (token: CaretText) => boolean;
   handleInput: (event: React.SyntheticEvent<HTMLDivElement>) => string;
   handleCompositionStart: () => void;
   handleCompositionEnd: () => void;
   insertTextAtCursor: (text: string) => void;
-  insertTileAtCursor: (text: string) => void;
+  insertTileAtCursor: (text: string) => HTMLElement | null;
+  expandTile: (tile: HTMLElement) => void;
+  /** Insert a mention tile and a space, replacing `token` (the `@<query>`
+   * word around the caret). */
+  insertMentionTile: (mention: Mention, token: CaretText) => boolean;
   pasteText: (text: string) => void;
+  /** Whether to show the "paste again to expand" hint — true while a paste tile exists. */
+  pasteExpandHintVisible: boolean;
   handleCopy: (event: React.ClipboardEvent<HTMLDivElement>) => void;
   handleCut: (event: React.ClipboardEvent<HTMLDivElement>) => void;
   setCursorToEnd: () => void;
@@ -43,7 +88,7 @@ export interface UseContentEditableReturn {
   handleTileMouseDown: (event: React.MouseEvent<HTMLDivElement>) => void;
   handleTileClick: (event: React.MouseEvent<HTMLDivElement>) => void;
   handleTileKeyDown: (event: React.KeyboardEvent<HTMLDivElement>) => boolean;
-  tilePopover: { text: string; tile: HTMLElement } | null;
+  tilePopover: PasteTileData | null;
   dismissTilePopover: () => void;
   updateTileText: (newText: string) => void;
 }
@@ -57,18 +102,24 @@ export function useContentEditable({
   onContentChange,
   disabled = false,
 }: UseContentEditableOptions): UseContentEditableReturn {
+  const t = useTranslations("chat.input.richTile");
   const ref = useRef<HTMLDivElement>(null);
   const [message, setMessageState] = useState(initialContent);
   const messageRef = useRef(initialContent);
+  // Owned by the DOM like `message`; mirrored so drafts and sends react to it.
+  const [mentions, setMentionsState] = useState<PlacedMention[]>([]);
   const isComposingRef = useRef(false);
   const onContentChangeRef = useRef(onContentChange);
   const rafRef = useRef<number | null>(null);
   const wrapperPaddingYRef = useRef(0);
   const selectedTileRef = useRef<HTMLElement | null>(null);
-  const [tilePopover, setTilePopover] = useState<{
-    text: string;
-    tile: HTMLElement;
-  } | null>(null);
+  const plainPasteRef = useRef(false);
+  const undoStackRef = useRef<EditableSnapshot[]>([]);
+  const redoStackRef = useRef<EditableSnapshot[]>([]);
+  const lastEditKindRef = useRef<string | null>(null);
+  const lastEditAtRef = useRef(0);
+  const [tilePopover, setTilePopover] = useState<PasteTileData | null>(null);
+  const [pasteExpandHintVisible, setPasteExpandHintVisible] = useState(false);
 
   useEffect(() => {
     onContentChangeRef.current = onContentChange;
@@ -85,7 +136,7 @@ export function useContentEditable({
   useEffect(() => {
     if (disabled) return;
     ref.current?.focus();
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     return () => {
@@ -106,16 +157,15 @@ export function useContentEditable({
       const sel = window.getSelection();
       const tiles = el.querySelectorAll("[data-rich-tile]");
       tiles.forEach((tile) => {
-        const htmlTile = tile as HTMLElement;
         if (
           sel &&
           sel.rangeCount > 0 &&
           !sel.isCollapsed &&
           sel.getRangeAt(0).intersectsNode(tile)
         ) {
-          htmlTile.classList.add("rich-input-tile-in-selection");
+          tile.classList.add("rich-input-tile-in-selection");
         } else {
-          htmlTile.classList.remove("rich-input-tile-in-selection");
+          tile.classList.remove("rich-input-tile-in-selection");
         }
       });
     }
@@ -145,6 +195,37 @@ export function useContentEditable({
     wrapper.style.height = `${clamped}px`;
   }, [wrapperRef, minHeight, maxHeight]);
 
+  const setMentions = useCallback((next: PlacedMention[]) => {
+    setMentionsState((current) =>
+      current.length === next.length &&
+      current.every(
+        (mention, index) =>
+          mention.type === next[index]?.type &&
+          mention.name === next[index]?.name &&
+          mention.index === next[index]?.index
+      )
+        ? current
+        : next
+    );
+  }, []);
+
+  // The tile reads and serializes as the `@name` it stands for.
+  const createMentionTile = useCallback(
+    (mention: Mention): HTMLSpanElement => {
+      const text = `${MENTION_TRIGGER}${mention.name}`;
+      return createRichInputTileNode({
+        type: MENTION_TILE_TYPE,
+        text,
+        preview: text,
+        meta: "",
+        mention,
+        label: text,
+        removeLabel: t("mentionTile.removeButton.ariaLabel", { name: text }),
+      });
+    },
+    [t]
+  );
+
   const syncFromDOM = useCallback((): string => {
     const el = ref.current;
     if (!el) return "";
@@ -153,17 +234,121 @@ export function useContentEditable({
       el.innerHTML = "";
     }
 
-    const text = getTextContent(el);
+    const { text, tiles } = readContent(el);
     messageRef.current = text;
     setMessageState(text);
+    setMentions(
+      tiles.flatMap(({ tile, index }): PlacedMention[] => {
+        const type = tile.getAttribute("data-mention-type");
+        const name = tile.getAttribute("data-mention-name");
+        return type === "skill" && name ? [{ type, name, index }] : [];
+      })
+    );
+    setPasteExpandHintVisible(
+      !!el.querySelector('[data-rich-tile][data-tile-type="paste"]')
+    );
     onContentChangeRef.current?.(text);
     return text;
+  }, [setMentions]);
+
+  /** Push the current state as an undo restore point (starts a new undo unit). */
+  const pushUndoSnapshot = useCallback((previous?: EditableSnapshot) => {
+    const el = ref.current;
+    if (!el) return;
+    redoStackRef.current = [];
+    lastEditKindRef.current = null;
+    const stack = undoStackRef.current;
+    const snapshot = previous ?? captureSnapshot(el);
+    const top = stack[stack.length - 1];
+    if (top && snapshotsEqual(top, snapshot)) return;
+    pushBoundedSnapshot(stack, snapshot);
   }, []);
+
+  /** Record an edit, coalescing bursts of the same kind into one undo unit. */
+  const noteEdit = useCallback(
+    (kind: string) => {
+      const coalescible =
+        kind === "typing" || kind === "deleting" || kind === "tile-edit";
+      // Replacing a selection (e.g. Cmd+A then typing) is never a
+      // continuation of a burst — its restore point must be pushed.
+      const el = ref.current;
+      const sel = window.getSelection();
+      const replacesSelection =
+        !!el &&
+        !!sel &&
+        sel.rangeCount > 0 &&
+        !sel.isCollapsed &&
+        el.contains(sel.getRangeAt(0).commonAncestorContainer);
+      const now = Date.now();
+      if (
+        !coalescible ||
+        replacesSelection ||
+        lastEditKindRef.current !== kind ||
+        now - lastEditAtRef.current > UNDO_COALESCE_MS
+      ) {
+        pushUndoSnapshot();
+      }
+      lastEditKindRef.current = coalescible ? kind : null;
+      lastEditAtRef.current = now;
+    },
+    [pushUndoSnapshot]
+  );
+
+  const clearUndoHistory = useCallback(() => {
+    undoStackRef.current = [];
+    redoStackRef.current = [];
+    lastEditKindRef.current = null;
+  }, []);
+
+  const performUndo = useCallback(() => {
+    const el = ref.current;
+    if (!el) return;
+    const current = captureSnapshot(el);
+    const stack = undoStackRef.current;
+    let snapshot = stack.pop();
+    // Skip no-op restore points (e.g. an op that bailed without mutating).
+    while (snapshot && snapshotsEqual(snapshot, current))
+      snapshot = stack.pop();
+    if (!snapshot) return;
+    pushBoundedSnapshot(redoStackRef.current, current);
+    restoreSnapshot(el, snapshot);
+    lastEditKindRef.current = null;
+    clearTileSelection();
+    setTilePopover(null);
+    syncFromDOM();
+    resize();
+  }, [clearTileSelection, syncFromDOM, resize]);
+
+  const performRedo = useCallback(() => {
+    const el = ref.current;
+    if (!el) return;
+    const snapshot = redoStackRef.current.pop();
+    if (!snapshot) return;
+    pushBoundedSnapshot(undoStackRef.current, captureSnapshot(el));
+    restoreSnapshot(el, snapshot);
+    lastEditKindRef.current = null;
+    clearTileSelection();
+    setTilePopover(null);
+    syncFromDOM();
+    resize();
+  }, [clearTileSelection, syncFromDOM, resize]);
 
   const handleInput = useCallback(
     (_event: React.SyntheticEvent<HTMLDivElement>): string => {
       if (isComposingRef.current) return messageRef.current;
       clearTileSelection();
+      const el = ref.current;
+      if (el && stripLeadingBr(el)) {
+        // The stray <br> sat before the caret-at-start; collapse to the start.
+        const s = window.getSelection();
+        if (s) {
+          const r = document.createRange();
+          r.setStart(el, 0);
+          r.collapse(true);
+          s.removeAllRanges();
+          s.addRange(r);
+        }
+      }
       const text = syncFromDOM();
       resize();
       return text;
@@ -172,14 +357,17 @@ export function useContentEditable({
   );
 
   const handleCompositionStart = useCallback(() => {
+    pushUndoSnapshot();
     isComposingRef.current = true;
     if (ref.current) {
       ref.current.removeAttribute("data-empty");
     }
-  }, []);
+  }, [pushUndoSnapshot]);
 
   const handleCompositionEnd = useCallback(() => {
     isComposingRef.current = false;
+    plainPasteRef.current = false;
+    lastEditKindRef.current = null;
     syncFromDOM();
     resize();
   }, [syncFromDOM, resize]);
@@ -189,16 +377,112 @@ export function useContentEditable({
     disabledRef.current = disabled;
   }, [disabled]);
 
-  const setMessage = useCallback(
-    (text: string) => {
-      if (!ref.current) return;
+  // Undo/redo entry points and typed-edit tracking, as native listeners so
+  // every consumer of the hook is covered.
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
 
+    function handleBeforeInput(event: Event) {
+      if (disabledRef.current) return;
+      const inputType = (event as InputEvent).inputType;
+      if (inputType === "historyUndo") {
+        event.preventDefault();
+        performUndo();
+        return;
+      }
+      if (inputType === "historyRedo") {
+        event.preventDefault();
+        performRedo();
+        return;
+      }
+      if (isComposingRef.current || inputType === "insertCompositionText") {
+        return;
+      }
+      if (
+        inputType === "insertText" ||
+        inputType === "insertParagraph" ||
+        inputType === "insertLineBreak"
+      ) {
+        noteEdit("typing");
+      } else if (
+        inputType === "deleteContentBackward" ||
+        inputType === "deleteContentForward"
+      ) {
+        noteEdit("deleting");
+      } else {
+        noteEdit(inputType);
+      }
+    }
+
+    function handleUndoKeys(event: KeyboardEvent) {
+      if (disabledRef.current) return;
+      const mod = event.metaKey || event.ctrlKey;
+      if (mod && !event.altKey && event.key.toLowerCase() === "z") {
+        // Intercept even with empty stacks so native undo never runs.
+        event.preventDefault();
+        if (event.shiftKey) {
+          performRedo();
+        } else {
+          performUndo();
+        }
+        return;
+      }
+      if (
+        mod &&
+        !event.altKey &&
+        !event.shiftKey &&
+        event.key.toLowerCase() === "y"
+      ) {
+        event.preventDefault();
+        performRedo();
+        return;
+      }
+      if (CARET_KEYS.has(event.key)) {
+        lastEditKindRef.current = null;
+      }
+    }
+
+    function handleCaretMouseDown() {
+      lastEditKindRef.current = null;
+    }
+
+    el.addEventListener("beforeinput", handleBeforeInput);
+    el.addEventListener("keydown", handleUndoKeys);
+    el.addEventListener("mousedown", handleCaretMouseDown);
+    return () => {
+      el.removeEventListener("beforeinput", handleBeforeInput);
+      el.removeEventListener("keydown", handleUndoKeys);
+      el.removeEventListener("mousedown", handleCaretMouseDown);
+    };
+  }, [performUndo, performRedo, noteEdit]);
+
+  const setMessage = useCallback(
+    (text: string, picked: readonly ComposedMention[] = []) => {
+      const el = ref.current;
+      if (!el) return;
+
+      pushUndoSnapshot();
       clearTileSelection();
       setTilePopover(null);
+      setPasteExpandHintVisible(false);
 
-      ref.current.textContent = text;
+      el.textContent = "";
+      let textStart = 0;
+      const placed = placeMentions(text, picked);
+      for (const mention of placed) {
+        el.append(
+          text.slice(textStart, mention.index),
+          createMentionTile(mention)
+        );
+        textStart =
+          mention.index + MENTION_TRIGGER.length + mention.name.length;
+      }
+      el.append(text.slice(textStart));
+      el.normalize();
       messageRef.current = text;
       setMessageState(text);
+      setMentions(placed);
       resize();
       onContentChangeRef.current?.(text);
 
@@ -215,59 +499,178 @@ export function useContentEditable({
         }
       });
     },
-    [resize, clearTileSelection]
+    [
+      resize,
+      clearTileSelection,
+      pushUndoSnapshot,
+      setMentions,
+      createMentionTile,
+    ]
   );
 
   const clearMessage = useCallback(() => {
     if (!ref.current) return;
 
+    // Submit/reset starts fresh history — a sent message is not undoable.
+    clearUndoHistory();
     clearTileSelection();
     setTilePopover(null);
+    setPasteExpandHintVisible(false);
 
     ref.current.innerHTML = "";
     messageRef.current = "";
     setMessageState("");
+    setMentions([]);
     resize();
     onContentChangeRef.current?.("");
-  }, [resize, clearTileSelection]);
+  }, [resize, clearTileSelection, clearUndoHistory, setMentions]);
+
+  const deleteToken = useCallback(
+    (token: CaretText): boolean => {
+      const el = ref.current;
+      if (!el) return false;
+      const snapshot = captureSnapshot(el);
+      if (!deleteTokenAtCursor(el, token)) return false;
+      pushUndoSnapshot(snapshot);
+      syncFromDOM();
+      resize();
+      return true;
+    },
+    [pushUndoSnapshot, syncFromDOM, resize]
+  );
 
   const insertTextAtCursor = useCallback(
     (text: string) => {
       if (!ref.current) return;
+      pushUndoSnapshot();
       insertTextAtCursorUtil(ref.current, text);
       syncFromDOM();
       resize();
     },
-    [syncFromDOM, resize]
+    [syncFromDOM, resize, pushUndoSnapshot]
+  );
+
+  const pasteTileText = useCallback(
+    (text: string): RichTileText =>
+      getPasteTileText(text, (values) => t("pasteTile.ariaLabel", values)),
+    [t]
   );
 
   const insertTileAtCursor = useCallback(
-    (text: string) => {
-      if (!ref.current) return;
+    (text: string): HTMLElement | null => {
+      if (!ref.current) return null;
+      pushUndoSnapshot();
       const tile = createRichInputTileNode({
         type: "paste",
-        text,
-        preview: getPasteTilePreview(text),
-        meta: getPasteTileMeta(text),
+        ...pasteTileText(text),
+        removeLabel: t("pasteTile.removeButton.ariaLabel"),
       });
       insertNodeAtCursorUtil(ref.current, tile);
       setCursorAfterNode(tile);
 
       syncFromDOM();
       resize();
+      return tile;
     },
-    [syncFromDOM, resize]
+    [syncFromDOM, resize, pushUndoSnapshot, pasteTileText, t]
+  );
+
+  const expandTile = useCallback(
+    (tile: HTMLElement) => {
+      const el = ref.current;
+      if (!el || !el.contains(tile)) return;
+
+      pushUndoSnapshot();
+      const sel = window.getSelection();
+      const caret =
+        sel && sel.rangeCount > 0 ? sel.getRangeAt(0).cloneRange() : null;
+
+      const textNode = document.createTextNode(
+        tile.getAttribute("data-text") ?? ""
+      );
+      tile.replaceWith(textNode);
+
+      if (selectedTileRef.current === tile) selectedTileRef.current = null;
+      setTilePopover(null);
+
+      el.focus();
+      // Restore the caret if it's still in the input; a caret on the now-detached
+      // tile (or in the popover) fails this and falls back to the text end.
+      if (
+        caret &&
+        el.contains(caret.startContainer) &&
+        el.contains(caret.endContainer)
+      ) {
+        sel!.removeAllRanges();
+        sel!.addRange(caret);
+      } else {
+        setCursorAfterNode(textNode);
+        el.normalize();
+      }
+
+      syncFromDOM();
+      resize();
+    },
+    [syncFromDOM, resize, pushUndoSnapshot]
+  );
+
+  const insertMentionTile = useCallback(
+    (mention: Mention, token: CaretText): boolean => {
+      const el = ref.current;
+      if (!el) return false;
+      pushUndoSnapshot();
+      // Bail if the typed `@<query>` can't be verifiably removed, since the
+      // tile would then sit beside its own partial text.
+      if (!deleteTokenAtCursor(el, token)) return false;
+      insertNodeAtCursorUtil(el, createMentionTile(mention));
+      insertTextAtCursorUtil(el, " ");
+      syncFromDOM();
+      resize();
+      return true;
+    },
+    [syncFromDOM, resize, pushUndoSnapshot, createMentionTile]
+  );
+
+  const findMatchingPasteTile = useCallback(
+    (text: string): HTMLElement | null => {
+      const el = ref.current;
+      if (!el) return null;
+      const tiles = Array.from(
+        el.querySelectorAll<HTMLElement>("[data-rich-tile]")
+      );
+      return (
+        tiles.find(
+          (tile) =>
+            !isMentionTile(tile) && tile.getAttribute("data-text") === text
+        ) ?? null
+      );
+    },
+    []
   );
 
   const pasteText = useCallback(
     (text: string) => {
-      if (pasteTilesEnabled && shouldCreatePasteTile(text)) {
+      const plainPaste = plainPasteRef.current;
+      plainPasteRef.current = false;
+
+      if (pasteTilesEnabled && !plainPaste && shouldCreatePasteTile(text)) {
+        const existing = findMatchingPasteTile(text);
+        if (existing) {
+          expandTile(existing);
+          return;
+        }
         insertTileAtCursor(text);
       } else {
         insertTextAtCursor(text);
       }
     },
-    [pasteTilesEnabled, insertTileAtCursor, insertTextAtCursor]
+    [
+      pasteTilesEnabled,
+      insertTileAtCursor,
+      insertTextAtCursor,
+      expandTile,
+      findMatchingPasteTile,
+    ]
   );
 
   const handleTileMouseDown = useCallback(
@@ -282,13 +685,14 @@ export function useContentEditable({
       event.preventDefault();
       const tile = removeBtn.closest("[data-rich-tile]");
       if (tile) {
+        pushUndoSnapshot();
         tile.remove();
         setTilePopover(null);
         syncFromDOM();
         resize();
       }
     },
-    [syncFromDOM, resize, clearTileSelection]
+    [syncFromDOM, resize, clearTileSelection, pushUndoSnapshot]
   );
 
   const handleTileClick = useCallback(
@@ -298,8 +702,10 @@ export function useContentEditable({
       const target = event.target as HTMLElement;
       if (target.closest("[data-rich-tile-remove]")) return;
 
-      const tile = target.closest("[data-rich-tile]") as HTMLElement | null;
+      const tile = target.closest<HTMLElement>("[data-rich-tile]");
       if (tile) {
+        // Mention tiles don't use the paste-edit popover.
+        if (isMentionTile(tile)) return;
         const text = tile.getAttribute("data-text") ?? "";
         setTilePopover({ text, tile });
       } else {
@@ -335,6 +741,7 @@ export function useContentEditable({
       const { tile } = tilePopover;
 
       if (!newText.trim()) {
+        pushUndoSnapshot();
         const next = tile.nextSibling;
         const prev = tile.previousSibling;
         tile.remove();
@@ -354,30 +761,46 @@ export function useContentEditable({
         return;
       }
 
-      tile.setAttribute("data-text", newText);
-      tile.title = newText.length > 200 ? newText.slice(0, 200) + "…" : newText;
-
-      const preview = tile.querySelector(".rich-input-tile-preview");
-      if (preview) {
-        preview.textContent = getPasteTilePreview(newText);
-      }
-      const meta = tile.querySelector(".rich-input-tile-meta");
-      if (meta) {
-        meta.textContent = getPasteTileMeta(newText);
-      }
+      noteEdit("tile-edit");
+      setRichTileText(tile, pasteTileText(newText));
+      syncFromDOM();
     },
-    [tilePopover, syncFromDOM, resize]
+    [
+      tilePopover,
+      syncFromDOM,
+      resize,
+      pushUndoSnapshot,
+      noteEdit,
+      pasteTileText,
+    ]
   );
 
   const handleTileKeyDown = useCallback(
     (event: React.KeyboardEvent<HTMLDivElement>): boolean => {
+      const isModifier =
+        event.key === "Control" ||
+        event.key === "Meta" ||
+        event.key === "Shift" ||
+        event.key === "Alt";
+      const isPasteShortcut =
+        (event.ctrlKey || event.metaKey) &&
+        (event.key === "v" || event.key === "V");
+      // Arm plain paste on Ctrl/Cmd+Shift+V; any other key disarms a stale flag.
+      if (isPasteShortcut) {
+        plainPasteRef.current = event.shiftKey;
+      } else if (!isModifier) {
+        plainPasteRef.current = false;
+      }
+
       const isNav = event.key === "ArrowLeft" || event.key === "ArrowRight";
       const isDelete = event.key === "Backspace" || event.key === "Delete";
 
-      // Enter on selected tile → open popover
+      // Enter on selected tile → open popover (paste tiles only; mention tiles
+      // have no editable text, so Enter is a no-op that keeps them selected).
       if (event.key === "Enter" && selectedTileRef.current) {
         event.preventDefault();
         const tile = selectedTileRef.current;
+        if (isMentionTile(tile)) return true;
         const text = tile.getAttribute("data-text") ?? "";
         setTilePopover({ text, tile });
         return true;
@@ -406,26 +829,16 @@ export function useContentEditable({
         const selected = selectedTileRef.current;
 
         if (isNav) {
-          // Arrow on selected tile → deselect and move cursor past it
-          event.preventDefault();
+          // Deselect; let the native arrow collapse the selection to the right
+          // edge (it renders the caret correctly, unlike a manual tile-boundary
+          // range, which had no caret rect and needed a second press).
           clearTileSelection();
-          if (event.key === "ArrowRight") {
-            setCursorAfterNode(selected);
-          } else {
-            const s = window.getSelection();
-            if (s) {
-              const r = document.createRange();
-              r.setStartBefore(selected);
-              r.collapse(true);
-              s.removeAllRanges();
-              s.addRange(r);
-            }
-          }
-          return true;
+          return false;
         }
 
         if (isDelete) {
           event.preventDefault();
+          pushUndoSnapshot();
           selected.remove();
           selectedTileRef.current = null;
           syncFromDOM();
@@ -444,11 +857,36 @@ export function useContentEditable({
       }
 
       const range = sel.getRangeAt(0);
+
+      // Chrome deletes a leading contentEditable=false tile when Backspace is
+      // pressed with nothing before the caret. That deletion is a no-op anyway
+      // (nothing to the left), so block it — otherwise it eats the tile or
+      // leaves an empty first line above it.
+      const el = ref.current;
+      if (
+        event.key === "Backspace" &&
+        el &&
+        el.contains(range.startContainer)
+      ) {
+        const before = document.createRange();
+        before.selectNodeContents(el);
+        before.setEnd(range.startContainer, range.startOffset);
+        // Collapsed ⇒ nothing precedes the caret.
+        if (before.collapsed) {
+          event.preventDefault();
+          return true;
+        }
+      }
+
       let direction: "before" | "after";
       if (isDelete) {
         direction = event.key === "Backspace" ? "before" : "after";
       } else {
-        direction = event.key === "ArrowLeft" ? "before" : "after";
+        // Arrow keys are physical, so in RTL the left arrow moves toward
+        // the DOM-following tile.
+        const rtl = el ? getComputedStyle(el).direction === "rtl" : false;
+        const towardStart = (event.key === "ArrowLeft") !== rtl;
+        direction = towardStart ? "before" : "after";
       }
 
       let tile = getAdjacentRichTile(range, direction);
@@ -468,7 +906,7 @@ export function useContentEditable({
       }
       return true;
     },
-    [syncFromDOM, resize, clearTileSelection]
+    [syncFromDOM, resize, clearTileSelection, pushUndoSnapshot]
   );
 
   const handleCopy = useCallback(
@@ -508,11 +946,13 @@ export function useContentEditable({
       event.preventDefault();
       event.clipboardData.setData("text/plain", getTextContent(temp));
 
+      pushUndoSnapshot();
       range.deleteContents();
+      selectedTileRef.current = null;
       syncFromDOM();
       resize();
     },
-    [syncFromDOM, resize]
+    [syncFromDOM, resize, pushUndoSnapshot]
   );
 
   const setCursorToEnd = useCallback(() => {
@@ -523,14 +963,19 @@ export function useContentEditable({
   return {
     ref,
     message,
+    mentions,
     setMessage,
     clearMessage,
+    deleteToken,
     handleInput,
     handleCompositionStart,
     handleCompositionEnd,
     insertTextAtCursor,
     insertTileAtCursor,
+    expandTile,
+    insertMentionTile,
     pasteText,
+    pasteExpandHintVisible,
     handleCopy,
     handleCut,
     setCursorToEnd,

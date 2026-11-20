@@ -7,11 +7,9 @@ from prometheus_client import REGISTRY
 from redis.exceptions import RedisError
 
 from onyx.cache.factory import get_cache_backend
-from onyx.natural_language_processing.query_embedding_cache import _build_key
 from onyx.natural_language_processing.query_embedding_cache import (
+    _build_key,
     cache_query_embeddings,
-)
-from onyx.natural_language_processing.query_embedding_cache import (
     get_cached_query_embeddings,
 )
 from shared_configs.contextvars import CURRENT_TENANT_ID_CONTEXTVAR
@@ -47,7 +45,7 @@ class TestCacheThenRetrieve:
         cache_query_embeddings(
             queries=[query],
             embeddings=[test_embedding],
-            search_settings_id=1,
+            model_cache_key="1",
             provider_type=None,
             ttl_seconds=60,
         )
@@ -55,7 +53,7 @@ class TestCacheThenRetrieve:
         # Under test.
         got = get_cached_query_embeddings(
             queries=[query],
-            search_settings_id=1,
+            model_cache_key="1",
             provider_type=None,
             ttl_seconds=60,
         )
@@ -71,7 +69,7 @@ class TestCacheThenRetrieve:
         # Under test.
         got = get_cached_query_embeddings(
             queries=[_unique_query()],
-            search_settings_id=1,
+            model_cache_key="1",
             provider_type=None,
             ttl_seconds=60,
         )
@@ -96,7 +94,7 @@ class TestPartialFill:
         cache_query_embeddings(
             queries=[q_hit_a, q_hit_b],
             embeddings=[emb_a, emb_b],
-            search_settings_id=42,
+            model_cache_key="42",
             provider_type=None,
             ttl_seconds=60,
         )
@@ -104,7 +102,7 @@ class TestPartialFill:
         # Under test.
         results = get_cached_query_embeddings(
             queries=[q_hit_a, q_miss, q_hit_b],
-            search_settings_id=42,
+            model_cache_key="42",
             provider_type=None,
             ttl_seconds=60,
         )
@@ -125,7 +123,7 @@ class TestModelIdIsolation:
         cache_query_embeddings(
             queries=[query],
             embeddings=[[1.0, 2.0]],
-            search_settings_id=100,
+            model_cache_key="100",
             provider_type=None,
             ttl_seconds=60,
         )
@@ -133,7 +131,7 @@ class TestModelIdIsolation:
         # Under test.
         got = get_cached_query_embeddings(
             queries=[query],
-            search_settings_id=101,  # Different search settings ID.
+            model_cache_key="101",  # Different search settings ID.
             provider_type=None,
             ttl_seconds=60,
         )
@@ -152,7 +150,7 @@ class TestTenantIsolation:
         cache_query_embeddings(
             queries=[query],
             embeddings=[[1.0, 2.0]],
-            search_settings_id=200,
+            model_cache_key="200",
             provider_type=None,
             ttl_seconds=60,
         )
@@ -163,7 +161,7 @@ class TestTenantIsolation:
             # Under test.
             got = get_cached_query_embeddings(
                 queries=[query],
-                search_settings_id=200,
+                model_cache_key="200",
                 provider_type=None,
                 ttl_seconds=60,
             )
@@ -184,18 +182,18 @@ class TestTTLRefresh:
         cache_query_embeddings(
             queries=[query],
             embeddings=[[1.0]],
-            search_settings_id=300,
+            model_cache_key="300",
             provider_type=None,
             ttl_seconds=1,
         )
         backend = get_cache_backend()
-        key = _build_key(query, 300)
+        key = _build_key(query, "300")
         assert backend.ttl(key) <= 1
 
         # Under test.
         get_cached_query_embeddings(
             queries=[query],
-            search_settings_id=300,
+            model_cache_key="300",
             provider_type=None,
             ttl_seconds=600,
         )
@@ -218,7 +216,7 @@ class TestFailOpen:
         cache_query_embeddings(
             queries=[query],
             embeddings=[[1.0]],
-            search_settings_id=400,
+            model_cache_key="400",
             provider_type=None,
             ttl_seconds=60,
         )
@@ -230,7 +228,7 @@ class TestFailOpen:
             # Under test.
             got = get_cached_query_embeddings(
                 queries=[query],
-                search_settings_id=400,
+                model_cache_key="400",
                 provider_type=None,
                 ttl_seconds=60,
             )
@@ -253,7 +251,7 @@ class TestFailOpen:
             cache_query_embeddings(
                 queries=[query],
                 embeddings=[[1.0]],
-                search_settings_id=401,
+                model_cache_key="401",
                 provider_type=None,
                 ttl_seconds=60,
             )

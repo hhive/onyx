@@ -1,0 +1,153 @@
+@reference "#reference.css";
+
+/* ---------------------------------------------------------------------------
+   Modal
+
+   Three layers share the chrome:
+   - .opal-modal-overlay: the scrim behind the card (fade in/out).
+   - .opal-modal-positioner: the fixed, top-aligned frame that carries width
+     and the viewport clamp. It animates in and out (see Motion below). When a
+     [data-main-container] center is in effect, the owner supplies left inline
+     and omits [data-viewport-centered].
+   - .opal-modal-card: the bordered card that carries background and height.
+
+   Without a bottom slot, one element wears positioner + card. With one, the
+   positioner wraps a .opal-modal-stack column of card + slot.
+   --------------------------------------------------------------------------- */
+
+.opal-modal-overlay {
+  @apply fixed inset-0 bg-mask-03 backdrop-blur-03 pointer-events-none;
+  z-index: var(--z-modal-overlay);
+}
+.opal-modal-overlay[data-state="open"] {
+  @apply animate-in fade-in-0;
+}
+.opal-modal-overlay[data-state="closed"] {
+  @apply animate-out fade-out-0;
+}
+
+/* Every modal is top-aligned: its top edge stays put and a height change
+   grows or shrinks it downward, so the card never jumps. */
+.opal-modal-positioner {
+  @apply fixed -translate-x-1/2;
+  @apply max-w-[calc(100dvw-2rem)];
+  /* The bottom gap is never less than the top one. */
+  --opal-modal-gap: max(2rem, 12dvh);
+  --opal-modal-top: var(--opal-modal-gap);
+  --opal-modal-available-height: calc(
+    100dvh - var(--opal-modal-top) - var(--opal-modal-gap)
+  );
+  top: var(--opal-modal-top);
+  max-height: var(--opal-modal-available-height);
+  z-index: var(--z-modal);
+}
+.opal-modal-positioner[data-viewport-centered] {
+  @apply left-1/2;
+}
+
+/* Motion. The card fades and scales in from its top edge, and fades out on
+   close; Radix keeps it mounted until the exit animation ends. Only
+   transform and opacity move, so the `translate` that centres the card
+   stays put. */
+.opal-modal-positioner {
+  transform-origin: top center;
+}
+.opal-modal-positioner[data-state="open"] {
+  animation: opal-modal-in 200ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+.opal-modal-positioner[data-state="closed"] {
+  animation: opal-modal-out 120ms cubic-bezier(0.4, 0, 1, 1) forwards;
+}
+@keyframes opal-modal-in {
+  from {
+    opacity: 0;
+    transform: translateY(-0.5rem) scale(0.97);
+  }
+}
+@keyframes opal-modal-out {
+  to {
+    opacity: 0;
+    transform: translateY(-0.25rem) scale(0.98);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .opal-modal-positioner[data-state] {
+    animation: none;
+  }
+}
+
+.opal-modal-positioner[data-width="sm"] {
+  @apply w-120;
+}
+.opal-modal-positioner[data-width="md"] {
+  @apply w-160;
+}
+.opal-modal-positioner[data-width="lg"] {
+  @apply w-200;
+}
+.opal-modal-positioner[data-width="xl"] {
+  @apply w-240;
+}
+.opal-modal-positioner[data-width="full"] {
+  @apply w-[80dvw];
+}
+
+.opal-modal-card {
+  @apply overflow-hidden bg-background-tint-00 border rounded-16 shadow-2xl flex flex-col;
+}
+.opal-modal-card[data-background="gray"] {
+  @apply bg-background-tint-01;
+}
+.opal-modal-card[data-height="fit"] {
+  @apply h-fit;
+}
+.opal-modal-card[data-height="sm"] {
+  @apply overflow-y-auto;
+  max-height: min(30rem, var(--opal-modal-available-height));
+}
+.opal-modal-card[data-height="lg"] {
+  @apply overflow-y-auto;
+  max-height: min(calc(100dvh - 4rem), var(--opal-modal-available-height));
+}
+.opal-modal-card[data-height="full"] {
+  @apply h-[80dvh] overflow-y-auto;
+}
+
+.opal-modal-stack {
+  @apply flex flex-col gap-4 items-center;
+}
+.opal-modal-stack > .opal-modal-card {
+  @apply w-full min-h-0;
+}
+.opal-modal-bottom-slot {
+  @apply w-full shrink-0;
+}
+
+/* Header: the close button overlaps the content's top-right per the Figma
+   mocks, so the description keeps the full width. */
+.opal-modal-header-content {
+  @apply relative w-full;
+}
+.opal-modal-header-close {
+  @apply absolute top-0 end-0;
+}
+.opal-modal-close-focus {
+  @apply outline-hidden;
+}
+.opal-modal-a11y-description {
+  @apply hidden;
+}
+
+.opal-modal-body {
+  @apply flex-auto min-h-0 w-full flex flex-col;
+}
+.opal-modal-body-frame {
+  @apply flex-auto;
+}
+.opal-modal-body-scroll {
+  @apply flex-auto min-h-0;
+  scrollbar-gutter: stable both-edges;
+}
+.opal-modal-body[data-two-tone] {
+  @apply bg-background-tint-01;
+}

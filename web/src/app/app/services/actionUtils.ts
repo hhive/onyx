@@ -1,6 +1,6 @@
 import { JSX } from "react";
 import type { IconProps } from "@opal/types";
-import { ToolSnapshot } from "@/lib/tools/interfaces";
+import { ToolSnapshot } from "@/lib/tools/types";
 import {
   SvgCpu,
   SvgGlobe,
@@ -52,16 +52,9 @@ const isOpenUrlTool = (tool: ToolSnapshot): boolean => {
 const isCodeInterpreterTool = (tool: ToolSnapshot): boolean => {
   return (
     tool.in_code_tool_id === "PythonTool" ||
+    tool.name === "run_python" ||
     tool.name === "python" ||
     tool.display_name?.toLowerCase().includes("code interpreter")
-  );
-};
-
-const isCodingAgentTool = (tool: ToolSnapshot): boolean => {
-  return (
-    tool.in_code_tool_id === "CodingAgentTool" ||
-    tool.name === "coding_agent" ||
-    tool.display_name?.toLowerCase().includes("coding agent")
   );
 };
 
@@ -74,7 +67,6 @@ export function getIconForAction(
   if (isKnowledgeGraphTool(action)) return SvgServer;
   if (isOpenUrlTool(action)) return SvgLink;
   if (isCodeInterpreterTool(action)) return SvgTerminal;
-  if (isCodingAgentTool(action)) return SvgCpu;
   return SvgCpu;
 }
 

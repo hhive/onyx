@@ -1,6 +1,6 @@
 # Onyx File Store
 
-The Onyx file store provides a unified interface for storing files and large binary objects. It supports three storage backends: S3-compatible storage (AWS S3, MinIO, Digital Ocean Spaces, etc.), Google Cloud Storage (GCS), and PostgreSQL Large Objects.
+The Onyx file store provides a unified interface for storing files and large binary objects. It supports four storage backends: S3-compatible storage (AWS S3, MinIO, Digital Ocean Spaces, etc.), Google Cloud Storage (GCS), Azure Blob Storage, and PostgreSQL Large Objects.
 
 ## Architecture
 
@@ -28,6 +28,7 @@ The backend is selected via the `FILE_STORE_BACKEND` environment variable:
 |---|---|---|
 | `s3` (default) | S3-compatible | AWS S3, MinIO, Digital Ocean Spaces, etc. |
 | `gcs` | Google Cloud Storage | Native GCS with ADC/Workload Identity support |
+| `azure` | Azure Blob Storage | Native Azure with Workload Identity / managed identity support |
 | `postgres` | PostgreSQL Large Objects | No external storage service required |
 
 ## Configuration
@@ -105,6 +106,39 @@ At the project level (only if `initialize()` should auto-create the bucket):
 
 The predefined role `roles/storage.objectAdmin` (granted on the bucket) covers all object operations. For initial bucket creation, `roles/storage.admin` at the project level is needed.
 
+### Azure Blob Storage
+
+```bash
+FILE_STORE_BACKEND=azure
+AZURE_FILE_STORE_CONTAINER_NAME=your-container-name  # Required
+AZURE_FILE_STORE_PREFIX=onyx-files                   # Optional, defaults to 'onyx-files'
+AZURE_STORAGE_ACCOUNT_NAME=yourstorageaccount        # Required unless using a connection string
+# Optional endpoint override — derived from the account name when unset.
+# Set explicitly for Azurite or sovereign clouds (e.g. *.blob.core.usgovcloudapi.net):
+AZURE_STORAGE_ACCOUNT_URL=https://yourstorageaccount.blob.core.windows.net
+
+# Authentication (use one of these methods, in priority order):
+
+# 1. Connection string
+AZURE_STORAGE_CONNECTION_STRING='DefaultEndpointsProtocol=https;AccountName=...;AccountKey=...;EndpointSuffix=core.windows.net'
+
+# 2. Account key (requires AZURE_STORAGE_ACCOUNT_NAME)
+AZURE_STORAGE_ACCOUNT_KEY=your-account-key
+
+# 3. DefaultAzureCredential (recommended for AKS)
+#    No additional configuration needed. Credentials are resolved automatically
+#    from the environment: AKS Workload Identity, managed identity, environment
+#    credentials (AZURE_CLIENT_ID/AZURE_TENANT_ID/etc.), or local `az login`.
+```
+
+**Required RBAC role:** `Storage Blob Data Contributor` on the storage account (or container)
+covers all object operations. For `initialize()` to auto-create the container, the identity
+also needs container-create rights, which the account-scoped role includes.
+
+**Local development:** [Azurite](https://learn.microsoft.com/en-us/azure/storage/common/storage-use-azurite)
+(`mcr.microsoft.com/azure-storage/azurite`) emulates Azure Blob Storage, playing the role MinIO
+plays for S3. Use its well-known development connection string.
+
 ### Other S3-Compatible Services
 
 The file store works with any S3-compatible service. Simply configure:
@@ -122,10 +156,11 @@ FILE_STORE_BACKEND=postgres
 
 ## Implementation
 
-The system provides three implementations of the abstract `FileStore` interface:
+The system provides four implementations of the abstract `FileStore` interface:
 
 - `S3BackedFileStore` (`file_store.py`): For S3-compatible storage (AWS S3, MinIO, etc.)
 - `GCSBackedFileStore` (`gcs_file_store.py`): For Google Cloud Storage with native ADC support
+- `AzureBlobBackedFileStore` (`azure_blob_file_store.py`): For Azure Blob Storage with DefaultAzureCredential support
 - `PostgresBackedFileStore` (`postgres_file_store.py`): For PostgreSQL Large Objects
 
 The factory function `get_default_file_store()` returns the appropriate implementation based on `FILE_STORE_BACKEND`. The database uses generic column names (`bucket_name`, `object_key`) to maintain compatibility across all backends.
@@ -144,6 +179,89 @@ The `FileStore` abstract base class defines the following methods:
 - `get_file_with_mime_type(file_id)`: Get file with parsed MIME type
 - `change_file_id(old_file_id, new_file_id)`: Rename a file
 - `list_files_by_prefix(prefix)`: List files matching a prefix
+
+## Presigned URLs
+
+A presigned URL lets a client without storage credentials (for example a Craft
+sandbox node) read or write one object directly. The api_server signs each URL
+for one object and one method. The default TTL is 5 minutes and the maximum is
+15 minutes (`FILE_STORE_PRESIGN_DEFAULT_TTL_SECONDS` and
+`FILE_STORE_PRESIGN_MAX_TTL_SECONDS` in `app_configs.py`).
+
+- `presign_download(file_id)` returns a GET request for an existing file.
+- `presign_upload(display_name, file_origin, file_type, size, sha256)` reserves a
+  file ID and returns a PUT request and a pending upload ID. It writes no
+  `file_record` row. The pending upload is kept in the cache backend.
+- Uploads are at most 5 GiB (`FILE_STORE_PRESIGN_MAX_UPLOAD_BYTES`), the largest
+  single S3 PUT. Azure allows at most 5000 MiB, the largest single Put Blob.
+- `presign_download` checks no user. Authorize the caller before you hand out
+  the URL.
+- `finalize_presigned_upload(pending_upload_id)` checks the size and SHA-256 of
+  the uploaded object, then writes the `file_record` row. On a mismatch it
+  deletes the object and raises `PresignedUploadVerificationError`.
+
+The client must send every header in `PresignedRequest.headers` unchanged.
+An upload object that is never finalized stays in the bucket without a record.
+
+Only the cloud backends (S3, GCS, Azure) have presigned URLs. These methods are
+on the `PresignableFileStore` subclass, not on `FileStore`, so callers check
+`isinstance(store, PresignableFileStore)`.
+The PostgreSQL backend has none. GCS and Azure raise
+`PresignedUrlsNotSupportedError` when their credentials are not allowed to sign.
+S3 signs locally, so a credential problem only shows when the client uses the
+URL. Temporary errors (network, metadata server) are raised as they are.
+
+### S3 and S3-compatible stores
+
+- URLs use SigV4. The signature covers `Content-Length` and
+  `x-amz-checksum-sha256`, so an upload URL accepts only the expected bytes.
+  Finalize reads the SHA-256 from a HEAD request.
+- IAM roles (IRSA) and other session credentials work. A URL stops working when
+  the session credentials that signed it expire, even before its TTL.
+- The URL host comes from `S3_ENDPOINT_URL`, and the host is part of the
+  signature. Clients must reach the store at that same host. If clients reach
+  the store at a different host than the api_server does, the URLs do not work,
+  and a proxy that changes the `Host` header breaks the signature.
+- Legacy MinIO store (`S3_LEGACY_ENDPOINT_URL`): a presigned PUT skips the dual
+  write. Finalize marks the object out of sync, and the replay loop
+  (`legacy_copy --replay`) copies it into MinIO within a few minutes. A file
+  that is only in the legacy store gets no download URL.
+
+### Google Cloud Storage
+
+- URLs use V4 signing. A service account key file signs locally.
+- Workload Identity or the metadata server (no key file) signs through the IAM
+  Credentials `signBlob` API. Grant `roles/iam.serviceAccountTokenCreator` on
+  the service account to the service account itself. Without it, the presign
+  methods raise `PresignedUrlsNotSupportedError`.
+- Signing needs an IAM service account. A direct Workload Identity principal
+  (`principal://...`, the default of `deployment/terraform/modules/gcp`) has
+  none, so it cannot sign. Map the Kubernetes service account to an IAM service
+  account first. That module does this when `craft_sandbox_runtime =
+  "firecracker"`.
+- An upload URL signs `x-goog-if-generation-match: 0` and
+  `x-goog-content-length-range`, so it creates the object once and with the
+  expected size. GCS keeps no SHA-256, so finalize reads the object once and
+  hashes it.
+
+### Azure Blob Storage
+
+- An account key (`AZURE_STORAGE_ACCOUNT_KEY`, or `AccountKey` in the connection
+  string) signs a service SAS.
+- Workload Identity or a managed identity (`DefaultAzureCredential`) signs a
+  user delegation SAS. No account key is needed, so shared key access can stay
+  off. The store gets a delegation key for 1 hour and keeps it until less than
+  the maximum TTL remains.
+- The identity needs `Storage Blob Data Contributor` on the storage account.
+  That role has `generateUserDelegationKey` and the blob read and write rights
+  that the SAS uses. Assign it at the account scope: a container-scope
+  assignment cannot get a delegation key. Without it, the presign methods raise
+  `PresignedUrlsNotSupportedError`. `deployment/terraform/modules/azure/aks`
+  assigns this role.
+- Each SAS is for one blob, with one permission (`r` for downloads, `c` for
+  uploads) and a short expiry. Create permission cannot overwrite a blob. A SAS
+  cannot limit the size or content, so finalize checks the size and reads the
+  blob once to hash it.
 
 ## Usage Example
 
@@ -164,14 +282,12 @@ with open("example.pdf", "rb") as f:
         display_name="Important Document.pdf",
         file_origin=FileOrigin.OTHER,
         file_type="application/pdf",
-        file_metadata={"department": "engineering", "version": "1.0"}
+        file_metadata={"department": "engineering", "version": "1.0"},
     )
 
 # Check if a file exists
 exists = file_store.has_file(
-    file_id=file_id,
-    file_origin=FileOrigin.OTHER,
-    file_type="application/pdf"
+    file_id=file_id, file_origin=FileOrigin.OTHER, file_type="application/pdf"
 )
 
 # Read a file

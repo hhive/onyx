@@ -1,13 +1,13 @@
+import threading
 import time
 from collections.abc import Callable
 from functools import wraps
-from typing import Any
-from typing import cast
-from typing import TypeVar
+from typing import Any, TypeVar, cast
 
 import requests
 
 from onyx.utils.logger import setup_logger
+from onyx.utils.retry_after import parse_retry_after_seconds
 
 logger = setup_logger()
 
@@ -26,7 +26,8 @@ class _RateLimitDecorator:
     Implementation inspired by the `ratelimit` library:
     https://github.com/tomasbasham/ratelimit.
 
-    NOTE: is not thread safe.
+    Thread safe: a lock guards the call history, and the wrapped call runs
+    outside the lock.
     """
 
     def __init__(
@@ -45,33 +46,36 @@ class _RateLimitDecorator:
 
         self.call_history: list[float] = []
         self.curr_calls = 0
+        self._lock = threading.Lock()
 
     def __call__(self, func: F) -> F:
         @wraps(func)
         def wrapped_func(*args: list, **kwargs: dict[str, Any]) -> Any:
-            # cleanup calls which are no longer relevant
-            self._cleanup()
-
-            # check if we've exceeded the rate limit
-            sleep_cnt = 0
-            while len(self.call_history) == self.max_calls:
-                sleep_time = self.sleep_time * (self.sleep_backoff**sleep_cnt)
-                logger.notice(
-                    "Rate limit exceeded for function %s. Waiting %s seconds before retrying.",
-                    func.__name__,
-                    sleep_time,
-                )
-                time.sleep(sleep_time)
-                sleep_cnt += 1
-                if self.max_num_sleep != 0 and sleep_cnt >= self.max_num_sleep:
-                    raise RateLimitTriedTooManyTimesError(
-                        f"Exceeded '{self.max_num_sleep}' retries for function '{func.__name__}'"
-                    )
-
+            # A waiting caller holds the lock, so the others queue behind it.
+            with self._lock:
+                # cleanup calls which are no longer relevant
                 self._cleanup()
 
-            # add the current call to the call history
-            self.call_history.append(time.monotonic())
+                # check if we've exceeded the rate limit
+                sleep_cnt = 0
+                while len(self.call_history) >= self.max_calls:
+                    sleep_time = self.sleep_time * (self.sleep_backoff**sleep_cnt)
+                    logger.notice(
+                        "Rate limit exceeded for function %s. Waiting %s seconds before retrying.",
+                        func.__name__,  # ty: ignore[unresolved-attribute]
+                        sleep_time,
+                    )
+                    time.sleep(sleep_time)
+                    sleep_cnt += 1
+                    if self.max_num_sleep != 0 and sleep_cnt >= self.max_num_sleep:
+                        raise RateLimitTriedTooManyTimesError(
+                            f"Exceeded '{self.max_num_sleep}' retries for function '{func.__name__}'"  # ty: ignore[unresolved-attribute]
+                        )
+
+                    self._cleanup()
+
+                # add the current call to the call history
+                self.call_history.append(time.monotonic())
             return func(*args, **kwargs)
 
         return cast(F, wrapped_func)
@@ -96,18 +100,19 @@ R = TypeVar("R", bound=Callable[..., requests.Response])
 
 
 def wrap_request_to_handle_ratelimiting(
-    request_fn: R, default_wait_time_sec: int = 30, max_waits: int = 30
+    request_fn: R,
+    default_wait_time_sec: int = 30,
+    max_waits: int = 30,
+    max_wait_time_sec: int = 300,
 ) -> R:
     def wrapped_request(*args: list, **kwargs: dict[str, Any]) -> requests.Response:
         for _ in range(max_waits):
             response = request_fn(*args, **kwargs)
             if response.status_code == 429:
-                try:
-                    wait_time = int(
-                        response.headers.get("Retry-After", default_wait_time_sec)
-                    )
-                except ValueError:
-                    wait_time = default_wait_time_sec
+                parsed = parse_retry_after_seconds(response.headers.get("Retry-After"))
+                wait_time = parsed if parsed is not None else default_wait_time_sec
+                # Cap so an absurd Retry-After can't stall the caller indefinitely.
+                wait_time = min(wait_time, max_wait_time_sec)
 
                 time.sleep(wait_time)
                 continue

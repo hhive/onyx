@@ -1,12 +1,13 @@
 "use client";
 
+import { IconLoader } from "@opal/loaders";
 import { useCallback, useEffect } from "react";
+import { useTranslations } from "next-intl";
 import { SvgPlayCircle, SvgStop } from "@opal/icons";
 import { Button } from "@opal/components";
 import { useVoicePlayback } from "@/hooks/useVoicePlayback";
 import { useVoiceMode } from "@/providers/VoiceModeProvider";
-import { toast } from "@/hooks/useToast";
-import SimpleLoader from "@/refresh-components/loaders/SimpleLoader";
+import { toast } from "@opal/layouts";
 
 interface TTSButtonProps {
   text: string;
@@ -15,6 +16,7 @@ interface TTSButtonProps {
 }
 
 function TTSButton({ text, voice, speed }: TTSButtonProps) {
+  const t = useTranslations("chat.messages");
   const { isPlaying, isLoading, error, play, pause, stop } = useVoicePlayback();
   const { isTTSPlaying, isTTSLoading, isAwaitingAutoPlaybackStart, stopTTS } =
     useVoiceMode();
@@ -40,7 +42,7 @@ function TTSButton({ text, voice, speed }: TTSButtonProps) {
         await play(text, voice, speed);
       } catch (err) {
         console.error("TTS playback failed:", err);
-        toast.error("Could not play audio");
+        toast.error(t("tts.playbackError.toast"));
       }
     }
   }, [
@@ -54,6 +56,7 @@ function TTSButton({ text, voice, speed }: TTSButtonProps) {
     pause,
     stop,
     stopTTS,
+    t,
   ]);
 
   // Surface streaming voice playback errors to the user via toast
@@ -64,16 +67,16 @@ function TTSButton({ text, voice, speed }: TTSButtonProps) {
   }, [error]);
 
   const icon = isButtonLoading
-    ? SimpleLoader
+    ? IconLoader
     : isButtonPlaying
       ? SvgStop
       : SvgPlayCircle;
 
   const tooltip = isButtonPlaying
-    ? "Stop playback"
+    ? t("tts.stopButton.tooltip")
     : isButtonLoading
-      ? "Loading..."
-      : "Read aloud";
+      ? t("tts.loadingButton.tooltip")
+      : t("tts.playButton.tooltip");
 
   return (
     <Button

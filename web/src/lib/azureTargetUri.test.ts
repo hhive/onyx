@@ -1,0 +1,107 @@
+import {
+  buildTargetUri,
+  isValidAzureTargetUri,
+  parseAzureTargetUri,
+} from "@/lib/azureTargetUri";
+import { LLMProviderView } from "@/lib/languageModels/types";
+
+const baseProvider: LLMProviderView = {
+  id: 1,
+  name: "azure",
+  provider: "azure",
+  api_key: "sk-test",
+  api_base: "https://my-resource.openai.azure.com",
+  api_version: "2025-01-01-preview",
+  custom_config: null,
+  is_public: true,
+  is_auto_mode: true,
+  groups: [],
+  personas: [],
+  deployment_name: null,
+  model_configurations: [],
+};
+
+describe("buildTargetUri", () => {
+  it("returns an empty string when api_base or api_version is missing", () => {
+    expect(buildTargetUri(undefined)).toBe("");
+    expect(buildTargetUri({ ...baseProvider, api_base: null })).toBe("");
+    expect(buildTargetUri({ ...baseProvider, api_version: null })).toBe("");
+  });
+
+  it("does not fabricate a deployment for per-model-routing providers (#13590)", () => {
+    // A provider created with deployment_name === null routes each model to a
+    // deployment named after the model. Editing it must NOT invent a
+    // provider-level deployment, which previously produced the placeholder
+    // "your-deployment" and broke every model with Azure DeploymentNotFound.
+    const uri = buildTargetUri(baseProvider);
+
+    expect(uri).not.toContain("your-deployment");
+    expect(uri).not.toContain("/openai/deployments/");
+    expect(isValidAzureTargetUri(uri)).toBe(true);
+
+    // The reconstructed URI round-trips back to an empty deployment, so on save
+    // `processValues` keeps deployment_name null rather than fabricating one.
+    const parsed = parseAzureTargetUri(uri);
+    expect(parsed.deploymentName).toBe("");
+    expect(parsed.apiVersion).toBe("2025-01-01-preview");
+    expect(parsed.url.origin).toBe("https://my-resource.openai.azure.com");
+  });
+
+  it("round-trips a provider that has an explicit deployment_name", () => {
+    const provider: LLMProviderView = {
+      ...baseProvider,
+      deployment_name: "gpt-6-sol",
+    };
+    const uri = buildTargetUri(provider);
+
+    expect(uri).toContain("/openai/deployments/gpt-6-sol/chat/completions");
+    expect(isValidAzureTargetUri(uri)).toBe(true);
+
+    const parsed = parseAzureTargetUri(uri);
+    expect(parsed.deploymentName).toBe("gpt-6-sol");
+    expect(parsed.apiVersion).toBe("2025-01-01-preview");
+    expect(parsed.url.origin).toBe("https://my-resource.openai.azure.com");
+  });
+});
+
+describe("Azure v1 target URIs", () => {
+  it.each([
+    "https://my-resource.openai.azure.com/openai/v1/",
+    "https://my-resource.openai.azure.com/openai/v1",
+    "https://my-resource.openai.azure.com/openai/v1/chat/completions",
+  ])("accepts %s and defaults api_version to v1", (uri) => {
+    expect(isValidAzureTargetUri(uri)).toBe(true);
+
+    const parsed = parseAzureTargetUri(uri);
+    expect(parsed.apiVersion).toBe("v1");
+    expect(parsed.deploymentName).toBe("");
+    expect(parsed.url.origin).toBe("https://my-resource.openai.azure.com");
+  });
+
+  it("keeps an explicit api-version on a v1 URL", () => {
+    const parsed = parseAzureTargetUri(
+      "https://my-resource.openai.azure.com/openai/v1/?api-version=preview"
+    );
+    expect(parsed.apiVersion).toBe("preview");
+  });
+
+  it("still rejects other paths without an api-version", () => {
+    expect(
+      isValidAzureTargetUri("https://my-resource.openai.azure.com/openai/v10/")
+    ).toBe(false);
+    expect(
+      isValidAzureTargetUri(
+        "https://my-resource.openai.azure.com/openai/responses"
+      )
+    ).toBe(false);
+  });
+
+  it("round-trips a provider saved with api_version v1", () => {
+    const uri = buildTargetUri({ ...baseProvider, api_version: "v1" });
+
+    expect(uri).toBe("https://my-resource.openai.azure.com/openai/v1/");
+    const parsed = parseAzureTargetUri(uri);
+    expect(parsed.apiVersion).toBe("v1");
+    expect(parsed.deploymentName).toBe("");
+  });
+});

@@ -1,30 +1,41 @@
 // Always require withSentryConfig
 const { withSentryConfig } = require("@sentry/nextjs");
+const { PHASE_DEVELOPMENT_SERVER } = require("next/constants");
+const createNextIntlPlugin = require("next-intl/plugin");
 
-const cspHeader = `
-    style-src 'self' 'unsafe-inline' https://fonts.googleapis.com;
-    font-src 'self' https://fonts.gstatic.com;
-    object-src 'none';
-    base-uri 'self';
-    form-action 'self';
-    ${
-      process.env.NEXT_PUBLIC_CLOUD_ENABLED === "true" &&
-      process.env.NODE_ENV !== "development"
-        ? "upgrade-insecure-requests;"
-        : ""
-    }
-`;
+// Points next-intl at the request-scoped locale/message resolution.
+const withNextIntl = createNextIntlPlugin("./src/i18n/request.ts");
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   productionBrowserSourceMaps: false,
+  poweredByHeader: false,
   output: "standalone",
-  // Hosts allowed to load Next.js dev resources (e.g. HMR) cross-origin.
-  // Needed when accessing the local dev server through a tunnel like ngrok.
-  allowedDevOrigins: ["cataract-brunette-icon.ngrok-free.dev"],
-  transpilePackages: ["@onyx-ai/opal"],
+  typescript: {
+    ignoreBuildErrors: process.env.SKIP_TYPE_CHECK === "1",
+  },
+  experimental: {
+    // TypeScript 7 has no classic JS API, so `next build` must type-check
+    // through the `tsc` CLI.
+    useTypeScriptCli: true,
+    // Next truncates larger bodies before they reach the API catch-all. This
+    // applies when requests reach Next directly (local dev); nginx and the Helm
+    // ingress send /api to the backend. Skill uploads allow a 25 MiB ZIP.
+    proxyClientMaxBodySize: "32mb",
+  },
+  transpilePackages: ["@onyx-ai/opal", "@onyx-ai/shared"],
   typedRoutes: true,
-  reactCompiler: true,
+  // `next dev` otherwise appends its own managed block to web/AGENTS.md on every
+  // start, which dirties the tree. Keep our agent instructions author-owned.
+  agentRules: false,
+  // NOTE: `reactCompiler` is set per-phase in module.exports below — enabled for
+  // builds, disabled for the dev server. See the comment there for the rationale.
+  // Pin the workspace root to this directory so Turbopack resolves modules
+  // against web/bun.lock. Without this, Next.js detects multiple lockfiles
+  // (the repo-root bun.lock and web/bun.lock) and infers the wrong root.
+  turbopack: {
+    root: __dirname,
+  },
   images: {
     // Used to fetch favicons
     remotePatterns: [
@@ -42,10 +53,6 @@ const nextConfig = {
       {
         source: "/(.*)",
         headers: [
-          {
-            key: "Content-Security-Policy",
-            value: cspHeader.replace(/\n/g, ""),
-          },
           {
             key: "Strict-Transport-Security",
             value: "max-age=63072000; includeSubDomains; preload",
@@ -69,6 +76,13 @@ const nextConfig = {
   },
   async rewrites() {
     return [
+      {
+        source:
+          "/api/build/sessions/:sessionId/webapp/_next/:hmrEndpoint(hmr|webpack-hmr)",
+        destination: `${
+          process.env.INTERNAL_URL || "http://localhost:8080"
+        }/build/sessions/:sessionId/webapp/_next/:hmrEndpoint`,
+      },
       {
         source: "/ph_ingest/static/:path*",
         destination: "https://us-assets.i.posthog.com/static/:path*",
@@ -133,6 +147,79 @@ const nextConfig = {
         permanent: true,
       },
       {
+        source: "/admin/craft/instructions",
+        destination: "/admin/craft/preferences",
+        permanent: true,
+      },
+      // Old plugin and action pages. Their ids are not integration ids.
+      {
+        source: "/admin/mcp-actions/:path*",
+        destination: "/admin/integrations",
+        permanent: false,
+      },
+      {
+        source: "/admin/openapi-actions",
+        destination: "/admin/integrations",
+        permanent: false,
+      },
+      {
+        source: "/admin/craft/apps",
+        destination: "/admin/integrations",
+        permanent: false,
+      },
+      {
+        source: "/admin/plugins",
+        destination: "/admin/integrations",
+        permanent: false,
+      },
+      {
+        source: "/admin/plugins/mcp/:id",
+        destination: "/admin/integrations",
+        permanent: false,
+      },
+      {
+        source: "/admin/plugins/openapi/:id",
+        destination: "/admin/integrations",
+        permanent: false,
+      },
+      {
+        source: "/admin/plugins/external-app/:id",
+        destination: "/admin/integrations",
+        permanent: false,
+      },
+      // The member plugin and skill pages moved to Customize. Next.js passes
+      // the query of the old URL on to the new one.
+      {
+        source: "/app/plugins",
+        destination: "/app/customize/plugins",
+        permanent: false,
+      },
+      {
+        source: "/app/plugins/:pluginId",
+        destination: "/app/customize/plugins/:pluginId",
+        permanent: false,
+      },
+      {
+        source: "/craft/v1/skills",
+        destination: "/app/customize/skills",
+        permanent: false,
+      },
+      {
+        source: "/craft/v1/skills/new",
+        destination: "/app/customize/skills/new",
+        permanent: false,
+      },
+      {
+        source: "/craft/v1/skills/edit/:id",
+        destination: "/app/customize/skills/:id?edit=1",
+        permanent: false,
+      },
+      {
+        source: "/craft/v1/plugins",
+        destination: "/app/customize/integrations",
+        permanent: false,
+      },
+      {
         source: "/admin/assistants/:path*",
         destination: "/admin/agents/:path*",
         permanent: true,
@@ -142,14 +229,111 @@ const nextConfig = {
         destination: "/ee/agents/:path*",
         permanent: true,
       },
+      // Next.js does not chain redirects, so these two point at the flattened
+      // paths directly rather than at their old /admin/configuration/ targets.
       {
         source: "/admin/configuration/search",
-        destination: "/admin/configuration/index-settings",
+        destination: "/admin/index-settings",
         permanent: true,
       },
       {
         source: "/admin/configuration/llm",
-        destination: "/admin/configuration/language-models",
+        destination: "/admin/language-models",
+        permanent: true,
+      },
+      // Legacy /admin/configuration/* → /admin/* redirects. The segment provided no additional value.
+      {
+        source: "/admin/configuration/chat-preferences",
+        destination: "/admin/chat-preferences",
+        permanent: true,
+      },
+      {
+        source: "/admin/configuration/code-interpreter",
+        destination: "/admin/code-interpreter",
+        permanent: true,
+      },
+      {
+        source: "/admin/configuration/document-processing",
+        destination: "/admin/document-processing",
+        permanent: true,
+      },
+      {
+        source: "/admin/configuration/image-generation",
+        destination: "/admin/image-generation",
+        permanent: true,
+      },
+      {
+        source: "/admin/configuration/index-settings",
+        destination: "/admin/index-settings",
+        permanent: true,
+      },
+      {
+        source: "/admin/configuration/language-models",
+        destination: "/admin/language-models",
+        permanent: true,
+      },
+      {
+        source: "/admin/configuration/voice",
+        destination: "/admin/voice",
+        permanent: true,
+      },
+      {
+        source: "/admin/configuration/web-search",
+        destination: "/admin/web-search",
+        permanent: true,
+      },
+      // The connector catalog moved from /admin/add-connector to
+      // /admin/connectors, beside the per-source wizard at /admin/connectors/:source.
+      {
+        source: "/admin/add-connector",
+        destination: "/admin/connectors",
+        permanent: true,
+      },
+      // The indexing status page moved from /admin/indexing/status to
+      // /admin/indexing-status; the /indexing/ segment held nothing else.
+      {
+        source: "/admin/indexing/status",
+        destination: "/admin/indexing-status",
+        permanent: true,
+      },
+      // Replaces the redirect page that used to live at
+      // /admin/configuration/craft, kept for /admin/craft/access bookmarks.
+      {
+        source: "/admin/configuration/craft",
+        destination: "/admin/craft/access",
+        permanent: true,
+      },
+      // Legacy /admin/actions/* → /admin/*. Only `mcp` and `open-api` held a
+      // real page; `actions`, `new`, `edit-mcp` and `edit/:toolId` were all
+      // redirect pages pointing at the MCP list, so they redirect there too.
+      {
+        source: "/admin/actions/mcp",
+        destination: "/admin/mcp-actions",
+        permanent: true,
+      },
+      {
+        source: "/admin/actions/open-api",
+        destination: "/admin/openapi-actions",
+        permanent: true,
+      },
+      {
+        source: "/admin/actions",
+        destination: "/admin/mcp-actions",
+        permanent: true,
+      },
+      {
+        source: "/admin/actions/new",
+        destination: "/admin/mcp-actions",
+        permanent: true,
+      },
+      {
+        source: "/admin/actions/edit-mcp",
+        destination: "/admin/mcp-actions",
+        permanent: true,
+      },
+      {
+        source: "/admin/actions/edit/:toolId",
+        destination: "/admin/mcp-actions",
         permanent: true,
       },
     ];
@@ -184,5 +368,47 @@ const sentryWebpackPluginOptions = {
   }),
 };
 
-// Export the module with conditional Sentry configuration
-module.exports = withSentryConfig(nextConfig, sentryWebpackPluginOptions);
+// Export the module with conditional Sentry configuration.
+//
+// React Compiler is a production runtime optimization (automatic memoization). It
+// provides no runtime benefit during local development, but it is expensive in the
+// dev server: under Turbopack there is no native SWC path, so Next runs
+// `babel-plugin-react-compiler` through a JS babel-loader that Turbopack executes
+// in a pool of per-CPU-core worker subprocesses. On a many-core machine this roughly
+// doubles dev-server peak memory and adds ~35-50% to route compile times.
+//
+// So enable it for builds (`next build`) and disable it for the dev server
+// (`next dev`). Set ENABLE_REACT_COMPILER=1 to force it on locally when you want to
+// validate React Compiler behavior in dev.
+module.exports = (phase) => {
+  const isDevServer = phase === PHASE_DEVELOPMENT_SERVER;
+  return withNextIntl(
+    withSentryConfig(
+      {
+        ...nextConfig,
+        ...(isDevServer && {
+          async rewrites() {
+            return [
+              {
+                source: "/.well-known/oauth-authorization-server/:path*",
+                destination: `${
+                  process.env.INTERNAL_URL || "http://localhost:8080"
+                }/oauth-provider/metadata`,
+              },
+              {
+                source: "/.well-known/oauth-protected-resource/:path*",
+                destination: `${
+                  process.env.MCP_INTERNAL_URL || "http://127.0.0.1:8090"
+                }/.well-known/oauth-protected-resource/:path*`,
+              },
+              ...(await nextConfig.rewrites()),
+            ];
+          },
+        }),
+        reactCompiler:
+          !isDevServer || process.env.ENABLE_REACT_COMPILER === "1",
+      },
+      sentryWebpackPluginOptions
+    )
+  );
+};

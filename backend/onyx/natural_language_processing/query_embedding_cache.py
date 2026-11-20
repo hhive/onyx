@@ -3,12 +3,8 @@
 Sits in front of ``EmbeddingModel.encode`` for ``EmbedTextType.QUERY`` calls. A
 cache hit avoids a network round-trip to the embedding provider.
 
-Tenancy is handled by ``TenantRedis`` automatically prefixing every key with the
-current tenant id, so two tenants never share an entry even if model id and
-query text are identical. Model identity comes from ``search_settings.id`` —
-``PRESERVED_SEARCH_FIELDS`` guarantees that every field that affects the
-resulting vector is immutable for a given id, so a model swap allocates a new
-row + new id and old entries simply expire.
+The cache backend scopes keys to the current tenant. The model cache key
+identifies the search settings and effective provider configuration.
 
 Vectors are stored as packed little-endian ``float32`` (``4 * dim`` bytes); the
 consumer already knows the dim from ``SearchSettings`` so no length prefix is
@@ -20,10 +16,12 @@ import struct
 
 from onyx.cache.factory import get_cache_backend
 from onyx.cache.interface import CACHE_TRANSIENT_ERRORS
-from onyx.server.metrics.embedding import observe_query_embedding_cache_lookup
-from onyx.server.metrics.embedding import observe_query_embedding_cache_write
-from onyx.server.metrics.embedding import QueryEmbeddingCacheLookupOutcome
-from onyx.server.metrics.embedding import QueryEmbeddingCacheWriteOutcome
+from onyx.server.metrics.embedding import (
+    QueryEmbeddingCacheLookupOutcome,
+    QueryEmbeddingCacheWriteOutcome,
+    observe_query_embedding_cache_lookup,
+    observe_query_embedding_cache_write,
+)
 from onyx.utils.logger import setup_logger
 from shared_configs.enums import EmbeddingProvider
 from shared_configs.model_server_models import Embedding
@@ -34,9 +32,9 @@ logger = setup_logger()
 _EMBEDDING_CACHE_KEY_PREFIX = "query_emb"
 
 
-def _build_key(query: str, search_settings_id: int) -> str:
-    digest = hashlib.sha256(query.encode("utf-8")).hexdigest()
-    return f"{_EMBEDDING_CACHE_KEY_PREFIX}:{search_settings_id}:{digest}"
+def _build_key(query: str, model_cache_key: str) -> str:
+    digest = hashlib.sha256(query.encode("utf-8", errors="surrogatepass")).hexdigest()
+    return f"{_EMBEDDING_CACHE_KEY_PREFIX}:{model_cache_key}:{digest}"
 
 
 def _safe_pack_or_none(vector: Embedding) -> bytes | None:
@@ -77,7 +75,7 @@ def _safe_unpack_or_none(buf: bytes) -> Embedding | None:
 
 def get_cached_query_embeddings(
     queries: list[str],
-    search_settings_id: int,
+    model_cache_key: str,
     provider_type: EmbeddingProvider | None,
     ttl_seconds: int,
 ) -> list[Embedding | None]:
@@ -92,9 +90,7 @@ def get_cached_query_embeddings(
 
     Args:
         queries: The queries to look up.
-        search_settings_id: The row ID of the search settings. NOTE: This is
-            only uniquely-identifying within a tenant. This function must use a
-            Redis client that is scoped to the current tenant.
+        model_cache_key: The identity of the model that embeds the query.
         provider_type: The type of the embedding provider. Only used for
             observability.
         ttl_seconds: The TTL for the cache entries in seconds.
@@ -126,7 +122,7 @@ def get_cached_query_embeddings(
     errors = 0
 
     for i, query in enumerate(queries):
-        key = _build_key(query, search_settings_id)
+        key = _build_key(query, model_cache_key)
         try:
             raw = cache_backend.get(key)
         except CACHE_TRANSIENT_ERRORS:
@@ -177,7 +173,7 @@ def get_cached_query_embeddings(
 def cache_query_embeddings(
     queries: list[str],
     embeddings: list[Embedding],
-    search_settings_id: int,
+    model_cache_key: str,
     provider_type: EmbeddingProvider | None,
     ttl_seconds: int,
 ) -> None:
@@ -189,9 +185,7 @@ def cache_query_embeddings(
     Args:
         queries: The queries to cache.
         embeddings: The embeddings to cache.
-        search_settings_id: The row ID of the search settings. NOTE: This is
-            only uniquely-identifying within a tenant. This function must use a
-            Redis client that is scoped to the current tenant.
+        model_cache_key: The identity of the model that embeds the query.
         provider_type: The type of the embedding provider. Only used for
             observability.
         ttl_seconds: The TTL for the cache entries in seconds.
@@ -225,8 +219,8 @@ def cache_query_embeddings(
 
     successes = 0
     errors = 0
-    for query, embedding in zip(queries, embeddings):
-        key = _build_key(query, search_settings_id)
+    for query, embedding in zip(queries, embeddings, strict=True):
+        key = _build_key(query, model_cache_key)
         try:
             packed = _safe_pack_or_none(embedding)
             if packed is None:

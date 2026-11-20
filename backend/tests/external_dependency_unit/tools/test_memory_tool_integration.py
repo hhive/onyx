@@ -4,13 +4,13 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from onyx.db.memory import add_memory
-from onyx.db.memory import get_memories
-from onyx.db.memory import MAX_MEMORIES_PER_USER
-from onyx.db.memory import update_memory_at_index
-from onyx.db.models import Memory
-from onyx.db.models import User
-from onyx.tools.tool_implementations.memory.models import MemoryToolResponse
+from onyx.db.memory import (
+    MAX_MEMORIES_PER_USER,
+    add_memory,
+    get_memories,
+    update_memory_at_index,
+)
+from onyx.db.models import Memory, User
 from tests.external_dependency_unit.conftest import create_test_user
 
 
@@ -128,26 +128,6 @@ class TestUpdateMemoryAtIndex:
         )
 
         assert result is None
-
-
-class TestMemoryToolResponse:
-    def test_response_with_add(self) -> None:
-        """Verify MemoryToolResponse correctly carries add (index_to_replace=None)."""
-        response = MemoryToolResponse(
-            memory_text="User likes Python",
-            index_to_replace=None,
-        )
-        assert response.memory_text == "User likes Python"
-        assert response.index_to_replace is None
-
-    def test_response_with_update(self) -> None:
-        """Verify MemoryToolResponse correctly carries update (index_to_replace=int)."""
-        response = MemoryToolResponse(
-            memory_text="User likes TypeScript",
-            index_to_replace=2,
-        )
-        assert response.memory_text == "User likes TypeScript"
-        assert response.index_to_replace == 2
 
 
 class TestMemoryCap:

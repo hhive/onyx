@@ -1,42 +1,83 @@
-from datetime import datetime
-from datetime import timezone
+import re
+import time
+from collections.abc import Generator
+from datetime import datetime, timezone
 from enum import StrEnum
-from typing import Any
-from typing import cast
-from typing import NoReturn
+from typing import Any, NoReturn, cast
 
-from pydantic import BaseModel
-from retry import retry
+from pydantic import BaseModel, Field
 from typing_extensions import override
 
 from onyx.access.models import ExternalAccess
 from onyx.configs.app_configs import INDEX_BATCH_SIZE
 from onyx.configs.constants import DocumentSource
-from onyx.connectors.canvas.access import get_course_permissions
-from onyx.connectors.canvas.client import CanvasApiClient
-from onyx.connectors.exceptions import ConnectorValidationError
-from onyx.connectors.exceptions import CredentialExpiredError
-from onyx.connectors.exceptions import InsufficientPermissionsError
-from onyx.connectors.exceptions import UnexpectedValidationError
-from onyx.connectors.interfaces import CheckpointedConnectorWithPermSync
-from onyx.connectors.interfaces import CheckpointOutput
-from onyx.connectors.interfaces import GenerateSlimDocumentOutput
-from onyx.connectors.interfaces import SecondsSinceUnixEpoch
-from onyx.connectors.interfaces import SlimConnectorWithPermSync
-from onyx.connectors.models import ConnectorCheckpoint
-from onyx.connectors.models import ConnectorFailure
-from onyx.connectors.models import ConnectorMissingCredentialError
-from onyx.connectors.models import Document
-from onyx.connectors.models import DocumentFailure
-from onyx.connectors.models import EntityFailure
-from onyx.connectors.models import ImageSection
-from onyx.connectors.models import TextSection
+from onyx.connectors.canvas.access import (
+    build_course_permission_context,
+    get_announcement_permissions,
+    get_assignment_permissions,
+    get_page_permissions,
+)
+from onyx.connectors.canvas.client import CanvasApiClient, CanvasUnsafeUrlError
+from onyx.connectors.exceptions import (
+    ConnectorValidationError,
+    CredentialExpiredError,
+    InsufficientPermissionsError,
+    UnexpectedValidationError,
+)
+from onyx.connectors.interfaces import (
+    CheckpointedConnectorWithPermSync,
+    CheckpointOutput,
+    GenerateSlimDocumentOutput,
+    Resolver,
+    SecondsSinceUnixEpoch,
+    SlimConnectorWithPermSync,
+)
+from onyx.connectors.models import (
+    ConnectorCheckpoint,
+    ConnectorFailure,
+    ConnectorMissingCredentialError,
+    Document,
+    DocumentFailure,
+    EntityFailure,
+    HierarchyNode,
+    ImageSection,
+    SlimDocument,
+    TextSection,
+)
 from onyx.error_handling.exceptions import OnyxError
 from onyx.file_processing.html_utils import parse_html_page_basic
 from onyx.indexing.indexing_heartbeat import IndexingHeartbeatInterface
 from onyx.utils.logger import setup_logger
+from onyx.utils.retry_wrapper import retry_builder
 
 logger = setup_logger()
+
+_SLIM_DOC_SYNC_LABEL = "canvas_retrieve_all_slim_docs_perm_sync"
+_ACTIVE_ENROLLMENT_STATES = {"active", "invited"}
+# Matches the ids the crawl writes: canvas-<page|assignment|announcement>-<course id>-<object id>
+_DOC_ID_PATTERN = re.compile(r"^canvas-(page|assignment|announcement)-(\d+)-(\d+)$")
+
+
+CANVAS_COURSE_GROUP_ID_PREFIX = "canvas-course"
+CANVAS_SECTION_GROUP_ID_PREFIX = "canvas-section"
+CANVAS_GROUP_GROUP_ID_PREFIX = "canvas-group"
+CANVAS_ALL_USERS_GROUP_ID = "canvas-all-users"
+
+
+def canvas_course_group_id(course_id: int) -> str:
+    return f"{CANVAS_COURSE_GROUP_ID_PREFIX}-{course_id}"
+
+
+def canvas_section_group_id(section_id: int) -> str:
+    return f"{CANVAS_SECTION_GROUP_ID_PREFIX}-{section_id}"
+
+
+def canvas_group_group_id(group_id: int) -> str:
+    return f"{CANVAS_GROUP_GROUP_ID_PREFIX}-{group_id}"
+
+
+def canvas_all_users_group_id() -> str:
+    return CANVAS_ALL_USERS_GROUP_ID
 
 
 def _handle_canvas_api_error(e: OnyxError) -> NoReturn:
@@ -78,7 +119,11 @@ _STAGE_CONFIG: dict[CanvasStage, dict[str, Any]] = {
     },
     CanvasStage.ASSIGNMENTS: {
         "endpoint": "courses/{course_id}/assignments",
-        "params": {"per_page": "100", "published": "true"},
+        "params": {
+            "per_page": "100",
+            "published": "true",
+            "include[]": ["overrides", "assignment_visibility"],
+        },
     },
     CanvasStage.ANNOUNCEMENTS: {
         "endpoint": "announcements",
@@ -86,6 +131,7 @@ _STAGE_CONFIG: dict[CanvasStage, dict[str, Any]] = {
             "per_page": "100",
             "context_codes[]": "course_{course_id}",
             "active_only": "true",
+            "include[]": "sections",
         },
     },
 }
@@ -98,9 +144,7 @@ def _parse_canvas_dt(timestamp_str: str) -> datetime:
     Canvas returns timestamps with a trailing 'Z' instead of '+00:00',
     so we normalise before parsing.
     """
-    return datetime.fromisoformat(timestamp_str.replace("Z", "+00:00")).astimezone(
-        timezone.utc
-    )
+    return datetime.fromisoformat(timestamp_str).astimezone(timezone.utc)
 
 
 def _unix_to_canvas_time(epoch: float) -> str:
@@ -111,6 +155,53 @@ def _unix_to_canvas_time(epoch: float) -> str:
 def _in_time_window(timestamp_str: str, start: float, end: float) -> bool:
     """Check whether a Canvas ISO-8601 timestamp falls within (start, end]."""
     return start < _parse_canvas_dt(timestamp_str).timestamp() <= end
+
+
+def _format_stage_params(
+    params: dict[str, Any],
+    course_id: int,
+) -> dict[str, Any]:
+    formatted_params: dict[str, Any] = {}
+    for key, value in params.items():
+        if isinstance(value, list):
+            formatted_params[key] = [
+                item.format(course_id=course_id) if isinstance(item, str) else item
+                for item in value
+            ]
+            continue
+        formatted_params[key] = (
+            value.format(course_id=course_id) if isinstance(value, str) else value
+        )
+    return formatted_params
+
+
+_EXCLUDED_WORKFLOW_STATES = {"unpublished", "deleted", "post_delayed"}
+
+
+def _listing_exclusion_reason(
+    stage: CanvasStage, payload: dict[str, Any]
+) -> str | None:
+    """Return why the crawl listing (`_STAGE_CONFIG` filters plus the
+    `_process_items` checks) would leave this single-item payload out, or None
+    if it would include it. Time-window checks are not applied."""
+    if not payload.get("published"):
+        return "not published"
+    if payload.get("workflow_state") in _EXCLUDED_WORKFLOW_STATES:
+        return f"workflow_state is {payload.get('workflow_state')}"
+    if stage != CanvasStage.ANNOUNCEMENTS:
+        return None
+
+    # Mirrors `active_only=true`: published and not scheduled for later.
+    if not payload.get("is_announcement"):
+        return "discussion topic is not an announcement"
+    delayed_post_at = payload.get("delayed_post_at")
+    if delayed_post_at and _parse_canvas_dt(delayed_post_at) > datetime.now(
+        timezone.utc
+    ):
+        return "post is delayed"
+    if not payload.get("posted_at"):
+        return "not posted"
+    return None
 
 
 class CanvasCourse(BaseModel):
@@ -153,6 +244,20 @@ class CanvasPage(BaseModel):
         )
 
 
+class CanvasAssignmentOverride(BaseModel):
+    student_ids: list[int] = Field(default_factory=list)
+    course_section_id: int | None = None
+    group_id: int | None = None
+
+    @classmethod
+    def from_api(cls, payload: dict[str, Any]) -> "CanvasAssignmentOverride":
+        return cls(
+            student_ids=payload.get("student_ids") or [],
+            course_section_id=payload.get("course_section_id"),
+            group_id=payload.get("group_id"),
+        )
+
+
 class CanvasAssignment(BaseModel):
     id: int
     name: str
@@ -162,9 +267,15 @@ class CanvasAssignment(BaseModel):
     created_at: str | None = None
     updated_at: str | None = None
     due_at: str | None = None
+    only_visible_to_overrides: bool = False
+    overrides: list[CanvasAssignmentOverride] = Field(default_factory=list)
+    assignment_visibility: list[int] = Field(default_factory=list)
 
     @classmethod
     def from_api(cls, payload: dict[str, Any], course_id: int) -> "CanvasAssignment":
+        raw_overrides = (
+            payload.get("overrides") or payload.get("assignment_overrides") or []
+        )
         return cls(
             id=payload["id"],
             name=payload["name"],
@@ -174,7 +285,22 @@ class CanvasAssignment(BaseModel):
             created_at=payload.get("created_at"),
             updated_at=payload.get("updated_at"),
             due_at=payload.get("due_at"),
+            only_visible_to_overrides=payload.get("only_visible_to_overrides") or False,
+            overrides=[
+                CanvasAssignmentOverride.from_api(override)
+                for override in raw_overrides
+                if isinstance(override, dict)
+            ],
+            assignment_visibility=payload.get("assignment_visibility") or [],
         )
+
+
+class CanvasAnnouncementSection(BaseModel):
+    id: int
+
+    @classmethod
+    def from_api(cls, payload: dict[str, Any]) -> "CanvasAnnouncementSection":
+        return cls(id=payload["id"])
 
 
 class CanvasAnnouncement(BaseModel):
@@ -183,17 +309,28 @@ class CanvasAnnouncement(BaseModel):
     message: str | None = None
     html_url: str
     posted_at: str | None = None
+    created_at: str | None = None
     course_id: int
+    is_section_specific: bool = False
+    sections: list[CanvasAnnouncementSection] = Field(default_factory=list)
 
     @classmethod
     def from_api(cls, payload: dict[str, Any], course_id: int) -> "CanvasAnnouncement":
+        raw_sections = payload.get("sections") or []
         return cls(
             id=payload["id"],
             title=payload["title"],
             message=payload.get("message"),
             html_url=payload["html_url"],
             posted_at=payload.get("posted_at"),
+            created_at=payload.get("created_at"),
             course_id=course_id,
+            is_section_specific=payload.get("is_section_specific") or False,
+            sections=[
+                CanvasAnnouncementSection.from_api(section)
+                for section in raw_sections
+                if isinstance(section, dict) and section.get("id") is not None
+            ],
         )
 
 
@@ -212,7 +349,7 @@ class CanvasConnectorCheckpoint(ConnectorCheckpoint):
         "pages" and next_url must be reset to None.
     """
 
-    course_ids: list[int] = []
+    course_ids: list[int] = Field(default_factory=list)
     current_course_index: int = 0
     stage: CanvasStage = CanvasStage.PAGES
     next_url: str | None = None
@@ -239,10 +376,17 @@ class CanvasConnectorCheckpoint(ConnectorCheckpoint):
             self.advance_course()
 
 
+CanvasItem = CanvasPage | CanvasAssignment | CanvasAnnouncement
+
+
 class CanvasConnector(
     CheckpointedConnectorWithPermSync[CanvasConnectorCheckpoint],
     SlimConnectorWithPermSync,
+    Resolver,
 ):
+    # The slim listings of pages and assignments ignore `start`.
+    slim_listing_honors_indexing_start = False
+
     def __init__(
         self,
         canvas_base_url: str,
@@ -251,7 +395,7 @@ class CanvasConnector(
         self.canvas_base_url = canvas_base_url.rstrip("/").removesuffix("/api/v1")
         self.batch_size = batch_size
         self._canvas_client: CanvasApiClient | None = None
-        self._course_permissions_cache: dict[int, ExternalAccess | None] = {}
+        self._course_permission_context_cache: dict[int, Any | None] = {}
 
     @property
     def canvas_client(self) -> CanvasApiClient:
@@ -259,16 +403,17 @@ class CanvasConnector(
             raise ConnectorMissingCredentialError("Canvas")
         return self._canvas_client
 
-    def _get_course_permissions(self, course_id: int) -> ExternalAccess | None:
-        """Get course permissions with caching."""
-        if course_id not in self._course_permissions_cache:
-            self._course_permissions_cache[course_id] = get_course_permissions(
-                canvas_client=self.canvas_client,
-                course_id=course_id,
+    def _get_course_permission_context(self, course_id: int) -> Any | None:
+        if course_id not in self._course_permission_context_cache:
+            self._course_permission_context_cache[course_id] = (
+                build_course_permission_context(
+                    canvas_client=self.canvas_client,
+                    course_id=course_id,
+                )
             )
-        return self._course_permissions_cache[course_id]
+        return self._course_permission_context_cache[course_id]
 
-    @retry(tries=3, delay=1, backoff=2)
+    @retry_builder(tries=3, delay=1, backoff=2)
     def _list_courses(self) -> list[CanvasCourse]:
         """Fetch all courses accessible to the authenticated user."""
         logger.debug("Fetching Canvas courses")
@@ -280,47 +425,56 @@ class CanvasConnector(
             courses.extend(CanvasCourse.from_api(c) for c in page)
         return courses
 
-    @retry(tries=3, delay=1, backoff=2)
+    @retry_builder(tries=3, delay=1, backoff=2)
     def _list_pages(self, course_id: int) -> list[CanvasPage]:
         """Fetch all pages for a given course."""
         logger.debug("Fetching pages for course %s", course_id)
 
         pages: list[CanvasPage] = []
+        config = _STAGE_CONFIG[CanvasStage.PAGES]
         for page in self.canvas_client.paginate(
-            f"courses/{course_id}/pages",
-            params={"per_page": "100", "include[]": "body", "published": "true"},
+            config["endpoint"].format(course_id=course_id),
+            params=_format_stage_params(config["params"], course_id),
         ):
             pages.extend(CanvasPage.from_api(p, course_id=course_id) for p in page)
         return pages
 
-    @retry(tries=3, delay=1, backoff=2)
+    @retry_builder(tries=3, delay=1, backoff=2)
     def _list_assignments(self, course_id: int) -> list[CanvasAssignment]:
         """Fetch all assignments for a given course."""
         logger.debug("Fetching assignments for course %s", course_id)
 
         assignments: list[CanvasAssignment] = []
+        config = _STAGE_CONFIG[CanvasStage.ASSIGNMENTS]
         for page in self.canvas_client.paginate(
-            f"courses/{course_id}/assignments",
-            params={"per_page": "100", "published": "true"},
+            config["endpoint"].format(course_id=course_id),
+            params=_format_stage_params(config["params"], course_id),
         ):
             assignments.extend(
                 CanvasAssignment.from_api(a, course_id=course_id) for a in page
             )
         return assignments
 
-    @retry(tries=3, delay=1, backoff=2)
-    def _list_announcements(self, course_id: int) -> list[CanvasAnnouncement]:
+    @retry_builder(tries=3, delay=1, backoff=2)
+    def _list_announcements(
+        self,
+        course_id: int,
+        start: SecondsSinceUnixEpoch | None = None,
+        end: SecondsSinceUnixEpoch | None = None,
+    ) -> list[CanvasAnnouncement]:
         """Fetch all announcements for a given course."""
         logger.debug("Fetching announcements for course %s", course_id)
 
         announcements: list[CanvasAnnouncement] = []
+        config = _STAGE_CONFIG[CanvasStage.ANNOUNCEMENTS]
+        params = _format_stage_params(config["params"], course_id)
+        params["start_date"] = _unix_to_canvas_time(start if start is not None else 0.0)
+        params["end_date"] = _unix_to_canvas_time(
+            end if end is not None else time.time()
+        )
         for page in self.canvas_client.paginate(
-            "announcements",
-            params={
-                "per_page": "100",
-                "context_codes[]": f"course_{course_id}",
-                "active_only": "true",
-            },
+            config["endpoint"].format(course_id=course_id),
+            params=params,
         ):
             announcements.extend(
                 CanvasAnnouncement.from_api(a, course_id=course_id) for a in page
@@ -334,6 +488,7 @@ class CanvasConnector(
         text: str,
         semantic_identifier: str,
         doc_updated_at: datetime | None,
+        doc_created_at: datetime | None,
         course_id: int,
         doc_type: str,
     ) -> Document:
@@ -347,6 +502,7 @@ class CanvasConnector(
             source=DocumentSource.CANVAS,
             semantic_identifier=semantic_identifier,
             doc_updated_at=doc_updated_at,
+            doc_created_at=doc_created_at,
             metadata={"course_id": str(course_id), "type": doc_type},
         )
 
@@ -360,6 +516,8 @@ class CanvasConnector(
             text_parts.append(body_text)
 
         doc_updated_at = _parse_canvas_dt(page.updated_at) if page.updated_at else None
+        # NOTE: doc_created_at population not yet verified against live data
+        doc_created_at = _parse_canvas_dt(page.created_at) if page.created_at else None
 
         document = self._build_document(
             doc_id=f"canvas-page-{page.course_id}-{page.page_id}",
@@ -367,6 +525,7 @@ class CanvasConnector(
             text="\n\n".join(text_parts),
             semantic_identifier=page.title or f"Page {page.page_id}",
             doc_updated_at=doc_updated_at,
+            doc_created_at=doc_created_at,
             course_id=page.course_id,
             doc_type="page",
         )
@@ -389,6 +548,10 @@ class CanvasConnector(
         doc_updated_at = (
             _parse_canvas_dt(assignment.updated_at) if assignment.updated_at else None
         )
+        # NOTE: doc_created_at population not yet verified against live data
+        doc_created_at = (
+            _parse_canvas_dt(assignment.created_at) if assignment.created_at else None
+        )
 
         document = self._build_document(
             doc_id=f"canvas-assignment-{assignment.course_id}-{assignment.id}",
@@ -396,6 +559,7 @@ class CanvasConnector(
             text="\n\n".join(text_parts),
             semantic_identifier=assignment.name or f"Assignment {assignment.id}",
             doc_updated_at=doc_updated_at,
+            doc_created_at=doc_created_at,
             course_id=assignment.course_id,
             doc_type="assignment",
         )
@@ -415,6 +579,12 @@ class CanvasConnector(
         doc_updated_at = (
             _parse_canvas_dt(announcement.posted_at) if announcement.posted_at else None
         )
+        # NOTE: doc_created_at population not yet verified against live data
+        doc_created_at = (
+            _parse_canvas_dt(announcement.created_at)
+            if announcement.created_at
+            else None
+        )
 
         document = self._build_document(
             doc_id=f"canvas-announcement-{announcement.course_id}-{announcement.id}",
@@ -422,6 +592,7 @@ class CanvasConnector(
             text="\n\n".join(text_parts),
             semantic_identifier=announcement.title or f"Announcement {announcement.id}",
             doc_updated_at=doc_updated_at,
+            doc_created_at=doc_created_at,
             course_id=announcement.course_id,
             doc_type="announcement",
         )
@@ -503,12 +674,7 @@ class CanvasConnector(
                             break
                         # ts > end: page is newer than our window, skip it
                         continue
-                    doc = self._convert_page_to_document(page)
-                    results.append(
-                        self._maybe_attach_permissions(
-                            doc, course_id, include_permissions
-                        )
-                    )
+                    results.append(self._item_to_document(page, include_permissions))
 
                 elif stage == CanvasStage.ASSIGNMENTS:
                     assignment = CanvasAssignment.from_api(item, course_id=course_id)
@@ -516,11 +682,8 @@ class CanvasConnector(
                         assignment.updated_at, start, end
                     ):
                         continue
-                    doc = self._convert_assignment_to_document(assignment)
                     results.append(
-                        self._maybe_attach_permissions(
-                            doc, course_id, include_permissions
-                        )
+                        self._item_to_document(assignment, include_permissions)
                     )
 
                 elif stage == CanvasStage.ANNOUNCEMENTS:
@@ -536,11 +699,8 @@ class CanvasConnector(
                         continue
                     if not _in_time_window(announcement.posted_at, start, end):
                         continue
-                    doc = self._convert_announcement_to_document(announcement)
                     results.append(
-                        self._maybe_attach_permissions(
-                            doc, course_id, include_permissions
-                        )
+                        self._item_to_document(announcement, include_permissions)
                     )
 
             except Exception as e:
@@ -565,15 +725,48 @@ class CanvasConnector(
 
         return results, early_exit
 
+    def _get_item_permissions(
+        self,
+        course_id: int,
+        item: CanvasItem,
+    ) -> ExternalAccess | None:
+        course_context = self._get_course_permission_context(course_id)
+        if course_context is None:
+            return None
+        if isinstance(item, CanvasPage):
+            return get_page_permissions(course_context)
+        if isinstance(item, CanvasAssignment):
+            return get_assignment_permissions(course_context, item)
+        return get_announcement_permissions(course_context, item)
+
     def _maybe_attach_permissions(
         self,
-        document: Document,
+        doc: Document,
         course_id: int,
         include_permissions: bool,
+        item: CanvasItem,
     ) -> Document:
-        if include_permissions:
-            document.external_access = self._get_course_permissions(course_id)
-        return document
+        if not include_permissions:
+            return doc
+
+        doc.external_access = self._get_item_permissions(course_id, item)
+        return doc
+
+    def _item_to_document(
+        self, item: CanvasItem, include_permissions: bool
+    ) -> Document:
+        if isinstance(item, CanvasPage):
+            doc = self._convert_page_to_document(item)
+        elif isinstance(item, CanvasAssignment):
+            doc = self._convert_assignment_to_document(item)
+        else:
+            doc = self._convert_announcement_to_document(item)
+        return self._maybe_attach_permissions(
+            doc=doc,
+            course_id=item.course_id,
+            include_permissions=include_permissions,
+            item=item,
+        )
 
     def _load_from_checkpoint(
         self,
@@ -618,7 +811,7 @@ class CanvasConnector(
         # Build endpoint + params from the static template.
         config = _STAGE_CONFIG[stage]
         endpoint = config["endpoint"].format(course_id=course_id)
-        params = {k: v.format(course_id=course_id) for k, v in config["params"].items()}
+        params = _format_stage_params(config["params"], course_id)
         # Only the announcements API supports server-side date filtering
         # (start_date/end_date). Pages support server-side sorting
         # (sort=updated_at desc) enabling early exit, but not date
@@ -762,6 +955,121 @@ class CanvasConnector(
     ) -> CanvasConnectorCheckpoint:
         return CanvasConnectorCheckpoint.model_validate_json(checkpoint_json)
 
+    def _fetch_item(
+        self, stage: CanvasStage, course_id: int, item_id: int
+    ) -> CanvasItem:
+        """Fetch one item by id. Raises ValueError if the crawl listing would
+        not return it."""
+        if stage == CanvasStage.PAGES:
+            payload, _ = self.canvas_client.get(f"courses/{course_id}/pages/{item_id}")
+        elif stage == CanvasStage.ASSIGNMENTS:
+            config = _STAGE_CONFIG[CanvasStage.ASSIGNMENTS]
+            payload, _ = self.canvas_client.get(
+                f"courses/{course_id}/assignments/{item_id}",
+                params={"include[]": config["params"]["include[]"]},
+            )
+        else:
+            payload, _ = self.canvas_client.get(
+                f"courses/{course_id}/discussion_topics/{item_id}",
+                params={"include[]": "sections"},
+            )
+
+        reason = _listing_exclusion_reason(stage, payload)
+        if reason is not None:
+            raise ValueError(
+                f"Canvas {stage.removesuffix('s')} {item_id} is not indexed: {reason}"
+            )
+
+        if stage == CanvasStage.PAGES:
+            return CanvasPage.from_api(payload, course_id=course_id)
+        if stage == CanvasStage.ASSIGNMENTS:
+            return CanvasAssignment.from_api(payload, course_id=course_id)
+        return CanvasAnnouncement.from_api(payload, course_id=course_id)
+
+    def _raise_if_token_rejected(self) -> None:
+        """Raise CredentialExpiredError if Canvas rejects the token itself.
+        Every valid token can read its own user."""
+        try:
+            self.canvas_client.get("users/self")
+        except CanvasUnsafeUrlError:
+            raise
+        except OnyxError as e:
+            if e.status_code == 401:
+                _handle_canvas_api_error(e)  # NoReturn — always raises
+
+    @override
+    def reindex(
+        self,
+        errors: list[ConnectorFailure],
+        include_permissions: bool = False,
+    ) -> Generator[Document | ConnectorFailure | HierarchyNode, None, None]:
+        targets: list[tuple[str, CanvasStage, int, int]] = []
+        for failure in errors:
+            # Entity failures name a whole course or stage, not a document.
+            if failure.failed_document is None:
+                continue
+            doc_id = failure.failed_document.document_id
+            match = _DOC_ID_PATTERN.match(doc_id)
+            if match is None:
+                yield ConnectorFailure(
+                    failed_document=DocumentFailure(document_id=doc_id),
+                    failure_message=(
+                        f"'{doc_id}' is not a Canvas document id; expected "
+                        "canvas-<page|assignment|announcement>-<course id>-<item id>"
+                    ),
+                )
+                continue
+            targets.append(
+                (
+                    doc_id,
+                    CanvasStage(f"{match.group(1)}s"),
+                    int(match.group(2)),
+                    int(match.group(3)),
+                )
+            )
+
+        if not targets:
+            return
+
+        try:
+            course_ids = {course.id for course in self._list_courses()}
+        except OnyxError as e:
+            if e.status_code in (401, 403):
+                _handle_canvas_api_error(e)  # NoReturn — always raises
+            raise
+
+        for doc_id, stage, course_id, item_id in targets:
+            if course_id not in course_ids:
+                yield ConnectorFailure(
+                    failed_document=DocumentFailure(document_id=doc_id),
+                    failure_message=(
+                        f"Canvas course {course_id} is not available to this connector"
+                    ),
+                )
+                continue
+            try:
+                item = self._fetch_item(stage, course_id, item_id)
+                yield self._item_to_document(item, include_permissions)
+            except CanvasUnsafeUrlError:
+                raise
+            except OnyxError as e:
+                # Canvas also answers 401/403 for one item the user may not
+                # read, so only a rejected token stops the whole run.
+                if e.status_code in (401, 403):
+                    self._raise_if_token_rejected()
+                yield ConnectorFailure(
+                    failed_document=DocumentFailure(document_id=doc_id),
+                    failure_message=f"Failed to reindex Canvas document {doc_id}: {e}",
+                    exception=e,
+                )
+            except Exception as e:
+                logger.exception("Failed to reindex Canvas document %s", doc_id)
+                yield ConnectorFailure(
+                    failed_document=DocumentFailure(document_id=doc_id),
+                    failure_message=f"Failed to reindex Canvas document {doc_id}: {e}",
+                    exception=e,
+                )
+
     @override
     def validate_connector_settings(self) -> None:
         """Validate Canvas connector settings by testing API access."""
@@ -777,6 +1085,55 @@ class CanvasConnector(
                 f"Unexpected error during Canvas settings validation: {exc}"
             )
 
+    def probe_course_user_email_visibility(self) -> None:
+        courses = self._list_courses()
+        if not courses:
+            logger.warning("Canvas perm-sync validation found no courses to probe")
+            return
+
+        course_id = courses[0].id
+        users: list[dict[str, Any]] = []
+        for page in self.canvas_client.paginate(
+            f"courses/{course_id}/users",
+            params={
+                "per_page": "100",
+                "include[]": ["email", "enrollments"],
+                "enrollment_state[]": list(_ACTIVE_ENROLLMENT_STATES),
+            },
+        ):
+            users.extend(user for user in page if isinstance(user, dict))
+
+        if not users:
+            logger.warning(
+                "Canvas perm-sync validation found no users in course %s to probe",
+                course_id,
+            )
+            return
+
+        if any(user.get("email") for user in users):
+            return
+
+        raise InsufficientPermissionsError(
+            "Canvas permission sync requires course roster email visibility. "
+            "Reconnect with a token that can read course users with email addresses."
+        )
+
+    def probe_account_user_listing_permission(self) -> bool:
+        try:
+            self.canvas_client.get(
+                "accounts/self/users",
+                params={"per_page": "1", "include[]": "email"},
+            )
+            return True
+        except OnyxError as e:
+            if e.status_code in (401, 403):
+                logger.warning(
+                    "Canvas token cannot enumerate account users. Public Canvas courses "
+                    "will be permissioned to their course roster only."
+                )
+                return False
+            raise
+
     @override
     def retrieve_all_slim_docs_perm_sync(
         self,
@@ -784,5 +1141,61 @@ class CanvasConnector(
         end: SecondsSinceUnixEpoch | None = None,
         callback: IndexingHeartbeatInterface | None = None,
     ) -> GenerateSlimDocumentOutput:
-        # TODO(benwu408): implemented in PR4 (perm sync)
-        raise NotImplementedError
+        slim_doc_batch: list[SlimDocument | HierarchyNode] = []
+
+        for course in self._list_courses():
+            for slim_doc in self._retrieve_course_slim_docs(
+                course.id,
+                start,
+                end,
+            ):
+                slim_doc_batch.append(slim_doc)
+                if len(slim_doc_batch) < self.batch_size:
+                    continue
+
+                if callback:
+                    if callback.should_stop():
+                        raise RuntimeError(
+                            f"{_SLIM_DOC_SYNC_LABEL}: Stop signal detected"
+                        )
+                    callback.progress(_SLIM_DOC_SYNC_LABEL, 1)
+                yield slim_doc_batch
+                slim_doc_batch = []
+
+        if slim_doc_batch:
+            yield slim_doc_batch
+
+    def _retrieve_course_slim_docs(
+        self,
+        course_id: int,
+        start: SecondsSinceUnixEpoch | None,
+        end: SecondsSinceUnixEpoch | None,
+    ) -> list[SlimDocument]:
+        slim_docs: list[SlimDocument] = [
+            SlimDocument(
+                id=f"canvas-page-{page.course_id}-{page.page_id}",
+                external_access=self._get_item_permissions(course_id, page)
+                or ExternalAccess.empty(),
+            )
+            for page in self._list_pages(course_id)
+        ]
+
+        slim_docs.extend(
+            SlimDocument(
+                id=f"canvas-assignment-{assignment.course_id}-{assignment.id}",
+                external_access=self._get_item_permissions(course_id, assignment)
+                or ExternalAccess.empty(),
+            )
+            for assignment in self._list_assignments(course_id)
+        )
+
+        slim_docs.extend(
+            SlimDocument(
+                id=f"canvas-announcement-{announcement.course_id}-{announcement.id}",
+                external_access=self._get_item_permissions(course_id, announcement)
+                or ExternalAccess.empty(),
+            )
+            for announcement in self._list_announcements(course_id, start, end)
+        )
+
+        return slim_docs

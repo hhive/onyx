@@ -1,30 +1,33 @@
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 
 from sqlalchemy.orm import Session
 
 from ee.onyx.db.search import create_search_query
 from ee.onyx.secondary_llm_flows.query_expansion import expand_keywords
-from ee.onyx.server.query_and_chat.models import SearchDocWithContent
-from ee.onyx.server.query_and_chat.models import SearchFullResponse
-from ee.onyx.server.query_and_chat.models import SendSearchQueryRequest
-from ee.onyx.server.query_and_chat.streaming_models import LLMSelectedDocsPacket
-from ee.onyx.server.query_and_chat.streaming_models import SearchDocsPacket
-from ee.onyx.server.query_and_chat.streaming_models import SearchErrorPacket
-from ee.onyx.server.query_and_chat.streaming_models import SearchQueriesPacket
-from onyx.context.search.models import BaseFilters
-from onyx.context.search.models import ChunkSearchRequest
-from onyx.context.search.models import InferenceChunk
-from onyx.context.search.pipeline import merge_individual_chunks
-from onyx.context.search.pipeline import search_pipeline
+from ee.onyx.server.query_and_chat.models import (
+    SearchDocWithContent,
+    SearchFullResponse,
+    SendSearchQueryRequest,
+)
+from ee.onyx.server.query_and_chat.streaming_models import (
+    LLMSelectedDocsPacket,
+    SearchDocsPacket,
+    SearchErrorPacket,
+    SearchQueriesPacket,
+)
+from onyx.context.search.models import BaseFilters, ChunkSearchRequest, InferenceChunk
+from onyx.context.search.pipeline import merge_individual_chunks, search_pipeline
 from onyx.db.models import User
 from onyx.db.search_settings import get_current_search_settings
 from onyx.document_index.factory import get_default_document_index
-from onyx.document_index.interfaces_new import DocumentIndex
-from onyx.llm.factory import get_default_llm
+from onyx.document_index.interfaces import DocumentIndex
+from onyx.llm.factory import get_default_llm, get_search_selection_llm
+from onyx.llm.interfaces import LLM
 from onyx.secondary_llm_flows.document_filter import select_sections_for_expansion
 from onyx.tools.tool_implementations.search.search_utils import (
     weighted_reciprocal_rank_fusion,
 )
+from onyx.utils.fleet_query_telemetry import QueryMode, telemetry_query
 from onyx.utils.logger import setup_logger
 from onyx.utils.threadpool_concurrency import run_functions_tuples_in_parallel
 
@@ -60,13 +63,18 @@ def _run_single_search(
         user=user,
         persona_search_info=None,
         db_session=db_session,
+        # Search UI is the only surface that enforces FORCED_DOCUMENT_SET_NAMES.
+        force_configured_document_set_scope=True,
     )
 
 
+@telemetry_query(mode=QueryMode.SEARCH)
 def stream_search_query(
     request: SendSearchQueryRequest,
     user: User,
     db_session: Session,
+    primary_llm: LLM | None = None,
+    selection_llm_factory: Callable[[], LLM] | None = None,
 ) -> Generator[
     SearchQueriesPacket | SearchDocsPacket | LLMSelectedDocsPacket | SearchErrorPacket,
     None,
@@ -78,8 +86,7 @@ def stream_search_query(
     """
     # Get document index.
     search_settings = get_current_search_settings(db_session)
-    # This flow is for search so we do not get all indices.
-    document_index = get_default_document_index(search_settings, None, db_session)
+    document_index = get_default_document_index(search_settings, None)
 
     # Determine queries to execute
     original_query = request.search_query
@@ -87,10 +94,11 @@ def stream_search_query(
 
     if request.run_query_expansion:
         try:
-            llm = get_default_llm()
+            if primary_llm is None:
+                primary_llm = get_default_llm()
             keyword_expansions = expand_keywords(
                 user_query=original_query,
-                llm=llm,
+                llm=primary_llm,
             )
             if keyword_expansions:
                 logger.debug(
@@ -109,7 +117,7 @@ def stream_search_query(
             db_session=db_session,
             user_id=user.id,
             query=request.search_query,
-            query_expansions=keyword_expansions if keyword_expansions else None,
+            query_expansions=keyword_expansions or None,
         )
 
     # Execute search(es)
@@ -203,14 +211,21 @@ def stream_search_query(
     llm_selection_failed = False
     if run_llm_selection and sections:
         try:
-            llm = get_default_llm()
+            if primary_llm is None:
+                primary_llm = get_default_llm()
+            selection_llm = (
+                selection_llm_factory()
+                if selection_llm_factory is not None
+                else get_search_selection_llm(fallback=primary_llm)
+            )
             sections_to_evaluate = sections[: request.num_docs_fed_to_llm_selection]
             selected_sections, _ = select_sections_for_expansion(
                 sections=sections_to_evaluate,
                 user_query=original_query,
-                llm=llm,
+                llm=selection_llm,
                 max_sections=TARGET_NUM_SECTIONS_FOR_LLM_SELECTION,
                 try_to_fill_to_max=True,
+                enforce_llm_input_budget=selection_llm is not primary_llm,
             )
             # Extract unique document IDs from selected sections (may be empty)
             llm_selected_doc_ids = list(

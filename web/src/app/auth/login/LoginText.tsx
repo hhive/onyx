@@ -1,21 +1,23 @@
 "use client";
 
-import React, { useContext } from "react";
-import { SettingsContext } from "@/providers/SettingsProvider";
-import Text from "@/refresh-components/texts/Text";
-import { APP_DISPLAY_NAME } from "@/lib/constants";
+import React from "react";
+import { useTranslations } from "next-intl";
+import { useSettings } from "@/lib/settings/hooks";
+import { Text } from "@opal/components";
 
 export default function LoginText() {
-  const settings = useContext(SettingsContext);
+  const t = useTranslations("auth");
+  const { appName, enterprise } = useSettings();
+  const subtitle =
+    enterprise?.custom_login_subtitle?.trim() ||
+    t("login.welcomeSubtitle.text");
   return (
     <div className="w-full flex flex-col ">
-      <Text as="p" headingH2 text05>
-        Welcome to{" "}
-        {(settings && settings?.enterpriseSettings?.application_name) ||
-          APP_DISPLAY_NAME}
+      <Text as="p" font="heading-headline" color="text-05">
+        {t("login.welcomeHeading.title", { appName })}
       </Text>
-      <Text as="p" text03 mainUiMuted>
-        Your open source AI platform for work
+      <Text as="p" font="main-ui-muted" color="text-03">
+        {subtitle}
       </Text>
     </div>
   );

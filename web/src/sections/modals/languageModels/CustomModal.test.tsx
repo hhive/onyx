@@ -8,7 +8,7 @@
 import { render, screen, setupUser, waitFor } from "@tests/setup/test-utils";
 import { PointerEventsCheckLevel } from "@testing-library/user-event";
 import CustomModal from "@/sections/modals/languageModels/CustomModal";
-import { toast } from "@/hooks/useToast";
+import { toast } from "@opal/layouts";
 import { SWR_KEYS } from "@/lib/swr-keys";
 
 // Mock SWR's mutate function and useSWR
@@ -17,6 +17,7 @@ const MOCK_CUSTOM_PROVIDER_OPTIONS = [
   { value: "anthropic", label: "Anthropic" },
   { value: "cloudflare", label: "Cloudflare" },
   { value: "openai", label: "OpenAI" },
+  { value: "typesafe", label: "TypeSafe" },
 ];
 jest.mock("swr", () => {
   const actual = jest.requireActual("swr");
@@ -36,7 +37,7 @@ jest.mock("swr", () => {
 });
 
 // Mock toast
-jest.mock("@/hooks/useToast", () => {
+jest.mock("@opal/layouts/toast/store", () => {
   const success = jest.fn();
   const error = jest.fn();
   const toastFn = Object.assign(jest.fn(), {
@@ -61,7 +62,7 @@ jest.mock("@/hooks/useToast", () => {
 // Mock useTierAtLeast — return false so the test exercises the
 // non-paid-tier code path, matching the prior usePaidEnterpriseFeaturesEnabled
 // mock behavior.
-jest.mock("@/hooks/useTierAtLeast", () => ({
+jest.mock("@/lib/tiers/hooks", () => ({
   useTierAtLeast: () => false,
 }));
 
@@ -158,6 +159,13 @@ describe("Custom LLM Provider Configuration Workflow", () => {
       );
     });
 
+    // Custom providers must never be created in auto mode — auto mode would
+    // merge the recommended models for matching providers (e.g. "openai").
+    const createCall = fetchSpy.mock.calls.find(
+      ([url]) => url === "/api/admin/llm/provider?is_creation=true"
+    );
+    expect(JSON.parse(createCall![1].body as string).is_auto_mode).toBe(false);
+
     // Verify success toast
     await waitFor(() => {
       expect(toast.success).toHaveBeenCalledWith(
@@ -166,7 +174,9 @@ describe("Custom LLM Provider Configuration Workflow", () => {
     });
 
     // Verify SWR cache was invalidated
-    expect(mockMutate).toHaveBeenCalledWith("/api/admin/llm/provider");
+    expect(mockMutate).toHaveBeenCalledWith(
+      "/api/admin/llm/provider?page_models=true"
+    );
     expect(mockMutate).toHaveBeenCalledWith("/api/llm/provider");
 
     const personaProvidersMutateCall = mockMutate.mock.calls.find(
@@ -248,11 +258,14 @@ describe("Custom LLM Provider Configuration Workflow", () => {
           max_input_tokens: null,
           supports_image_input: false,
           supports_reasoning: false,
+          effectiveDisplayName: "",
         },
       ],
       custom_config: {},
       is_public: true,
-      is_auto_mode: false,
+      // Simulates a provider saved before custom providers were excluded from
+      // auto mode; the next update must flip it back to false.
+      is_auto_mode: true,
       groups: [],
       personas: [],
       deployment_name: null,
@@ -289,6 +302,12 @@ describe("Custom LLM Provider Configuration Workflow", () => {
       );
     });
 
+    // The update must force auto mode off, repairing the stored provider.
+    const updateCall = fetchSpy.mock.calls.find(
+      ([url]) => url === "/api/admin/llm/provider"
+    );
+    expect(JSON.parse(updateCall![1].body as string).is_auto_mode).toBe(false);
+
     // Credential test should NOT have been called when only model name changed
     expect(fetchSpy).not.toHaveBeenCalledWith(
       "/api/admin/llm/test",
@@ -323,6 +342,7 @@ describe("Custom LLM Provider Configuration Workflow", () => {
           max_input_tokens: null,
           supports_image_input: false,
           supports_reasoning: false,
+          effectiveDisplayName: "",
         },
       ],
       custom_config: {},
@@ -420,6 +440,7 @@ describe("Custom LLM Provider Configuration Workflow", () => {
         id: 5,
         name: "New Default Provider",
         provider: "openai",
+        model_configurations: [{ name: "gpt-4", supports_chat: true }],
       }),
     } as Response);
 
@@ -456,6 +477,47 @@ describe("Custom LLM Provider Configuration Workflow", () => {
       expect(body.provider_id).toBe(5);
       expect(body).toHaveProperty("model_name");
     });
+  });
+
+  test("never makes a decision-only provider the chat default", async () => {
+    const user = setupUser({
+      pointerEventsCheck: PointerEventsCheckLevel.Never,
+    });
+    fetchSpy.mockResolvedValueOnce(new Response("{}"));
+    fetchSpy.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          id: 5,
+          name: "Decisions",
+          provider: "typesafe",
+          model_configurations: [
+            {
+              name: "system-one",
+              supports_chat: false,
+              supports_decisions: true,
+            },
+          ],
+        })
+      )
+    );
+    const onSuccess = jest.fn();
+    render(
+      <CustomModal
+        shouldMarkAsDefault={true}
+        onOpenChange={() => {}}
+        onSuccess={onSuccess}
+      />
+    );
+    await fillBasicFields(user, {
+      name: "Decisions",
+      provider: "typesafe",
+      modelName: "system-one",
+    });
+    await user.click(screen.getByRole("button", { name: /connect/i }));
+    await waitFor(() => expect(onSuccess).toHaveBeenCalled());
+    expect(
+      fetchSpy.mock.calls.some(([url]) => url === "/api/admin/llm/default")
+    ).toBe(false);
   });
 
   test("shows error when provider creation fails", async () => {

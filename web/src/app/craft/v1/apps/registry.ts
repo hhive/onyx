@@ -1,15 +1,44 @@
-import { SvgSlack, SvgLinear } from "@opal/logos";
-import { SvgCalendar, SvgPlug } from "@opal/icons";
+import {
+  SvgSlack,
+  SvgLinear,
+  SvgGmail,
+  SvgGitHub,
+  SvgGoogleCalendar,
+  SvgGoogleDrive,
+  SvgHubSpot,
+  SvgNotion,
+  SvgZendesk,
+} from "@opal/logos";
+import { SvgPlug } from "@opal/icons";
 import { IconFunctionComponent } from "@opal/types";
 
 // Mirrors `onyx.db.enums.ExternalAppType` on the backend.
-export type ExternalAppType = "SLACK" | "GOOGLE_CALENDAR" | "LINEAR" | "CUSTOM";
+export const EXTERNAL_APP_TYPES = [
+  "SLACK",
+  "GOOGLE_CALENDAR",
+  "GOOGLE_DRIVE",
+  "GMAIL",
+  "LINEAR",
+  "GITHUB",
+  "HUBSPOT",
+  "NOTION",
+  "ZENDESK",
+  "CUSTOM",
+] as const;
+
+export type ExternalAppType = (typeof EXTERNAL_APP_TYPES)[number];
 
 const _BUILT_IN_LOGOS: Partial<Record<ExternalAppType, IconFunctionComponent>> =
   {
     SLACK: SvgSlack,
-    GOOGLE_CALENDAR: SvgCalendar,
+    GOOGLE_CALENDAR: SvgGoogleCalendar,
+    GOOGLE_DRIVE: SvgGoogleDrive,
+    GMAIL: SvgGmail,
     LINEAR: SvgLinear,
+    GITHUB: SvgGitHub,
+    HUBSPOT: SvgHubSpot,
+    NOTION: SvgNotion,
+    ZENDESK: SvgZendesk,
   };
 
 /** Logo for a known `app_type`, with a generic fallback for CUSTOM /
@@ -22,56 +51,7 @@ export function getAppTypeLogo(
 }
 
 // Keep in sync with backend Pydantic models in
-// `server/features/build/api/models.py`.
+// `server/features/build/external_apps/models.py`.
 
-export interface OrgCredentialFieldDescriptor {
-  key: string;
-  label: string;
-  description: string;
-  secret: boolean;
-}
-
-export interface BuiltInExternalAppDescriptor {
-  app_type: ExternalAppType;
-  name: string;
-  description: string;
-  upstream_url_patterns: string[];
-  auth_template: Record<string, string>;
-  required_org_credential_fields: OrgCredentialFieldDescriptor[];
-  setup_instructions: string;
-}
-
-export interface ExternalAppAdminResponse {
-  id: number;
-  name: string;
-  description: string;
-  app_type: ExternalAppType;
-  upstream_url_patterns: string[];
-  auth_template: Record<string, string>;
-  organization_credentials: Record<string, string>;
-  enabled: boolean;
-}
-
-export interface ExternalAppUserResponse {
-  id: number;
-  name: string;
-  description: string;
-  app_type: ExternalAppType;
-  credential_keys: string[];
-  credential_values: Record<string, string>;
-  authenticated: boolean;
-}
-
-export function findAppForType(
-  apps: ExternalAppAdminResponse[],
-  app_type: ExternalAppType
-): ExternalAppAdminResponse | null {
-  return apps.find((a) => a.app_type === app_type) ?? null;
-}
-
-export function findUserAppByName(
-  apps: ExternalAppUserResponse[],
-  name: string
-): ExternalAppUserResponse | null {
-  return apps.find((a) => a.name === name) ?? null;
-}
+// Mirrors `onyx.db.enums.ActionPolicy` on the backend.
+export type ActionPolicy = "ALWAYS" | "ASK" | "DENY";

@@ -1,84 +1,132 @@
-"""HTTP client for ``opencode serve``.
+"""HTTP client for ``opencode serve`` — the only transport Onyx Craft
+uses to drive in-sandbox agent turns.
 
-Replaces the per-message ``opencode acp`` subprocess clients in
-``sandbox/kubernetes/internal/acp_exec_client.py`` and
-``sandbox/docker/internal/acp_exec_client.py``. The plan is documented in
-``docs/craft/opencode-serve-migration.md`` and the design in
-``docs/craft/features/opencode-serve-client.md``.
-
-Public surface (mirrors the existing ACP clients enough that the sandbox
-managers swap in one method call):
+Public surface:
 
 - :class:`OpencodeServeClient`
 - :class:`ClientTimeouts`
 
-Phase 1 deliverable: the client library only — no sandbox-manager wire-up.
-Gated behind ``AGENT_TRANSPORT={"acp","serve"}`` in ``configs.py``.
+Sandbox-event types come from :mod:`onyx.server.features.build.sandbox.event_schema`.
+
+Event-stream rules. Each rule prevents a bug that this translator had:
+
+1. A turn has many steps. opencode sets ``time.completed`` on the
+   ``message.updated`` of EVERY step (tool-call step, answer step, ...). Only
+   ``session.idle`` or ``session.status`` with ``status.type == "idle"`` ends
+   the turn. ``message.updated`` only caches role, finish reason, and errors.
+2. ``session.status.status`` is a tagged union (``idle``/``busy``/``retry``).
+   Compare ``status["type"]``, not ``status``. Build test fixtures from
+   captured payloads, not hand-typed shapes.
+3. ``message.part.delta`` can arrive up to ~300 ms before the
+   ``message.updated`` that gives its role. ``_is_assistant_message``
+   REST-fetches an unknown message once (``get_message``) and caches the
+   result. Do not buffer deltas until metadata arrives: a stream drop would
+   lose them.
+4. ``/event`` does not support ``Last-Event-ID``. After a reconnect, the
+   cumulative ``part.text`` on the next ``message.part.updated`` fills the gap
+   (``_reconcile_part_text``).
+5. The stream is a hint; opencode's REST state is the truth. When the stream
+   is ambiguous, read REST state. Do not add compensating stream logic.
+
+``permission.asked`` for ``connect_app`` drives the connect-card flow. Every
+other category is auto-allowed with a WARN log: production ``opencode.json``
+allows all categories, so an ask means the config is missing a category.
+The HTTP Basic username is ``OPENCODE_SERVER_USERNAME`` (``"opencode"``).
 """
 
 from __future__ import annotations
 
 import queue
 import time
-from collections.abc import Callable
-from collections.abc import Generator
-from collections.abc import Iterable
-from dataclasses import dataclass
-from dataclasses import field
-from typing import Any
-from typing import cast
+from collections.abc import Callable, Generator, Iterable
+from pathlib import PurePosixPath
+from typing import Any, cast
+from uuid import uuid4
 
 import httpx
-from acp.schema import AgentMessageChunk
-from acp.schema import AgentThoughtChunk
-from acp.schema import Error
-from acp.schema import PromptResponse
-from acp.schema import ToolCallProgress
-from acp.schema import ToolCallStart
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from onyx.server.features.build.configs import ACP_MESSAGE_TIMEOUT
-from onyx.server.features.build.configs import OPENCODE_SERVE_CONNECT_TIMEOUT
-from onyx.server.features.build.configs import OPENCODE_SERVE_EVENT_READ_TIMEOUT
-from onyx.server.features.build.configs import OPENCODE_SERVE_REQUEST_TIMEOUT
-from onyx.server.features.build.configs import OPENCODE_SERVER_USERNAME
-from onyx.server.features.build.configs import SSE_KEEPALIVE_INTERVAL
-from onyx.server.features.build.sandbox.base import SSEKeepalive
-from onyx.server.features.build.sandbox.opencode.event_bus import _Subscription
-from onyx.server.features.build.sandbox.opencode.event_bus import BUS_CLOSED_SENTINEL
-from onyx.server.features.build.sandbox.opencode.event_bus import PodEventBus
+from onyx.cache.factory import get_cache_backend
+from onyx.cache.interface import CacheBackend
+from onyx.server.features.build import connect_app
+from onyx.server.features.build.configs import (
+    OPENCODE_PROMPT_INACTIVITY_TIMEOUT_SECONDS,
+    OPENCODE_SERVE_ABORT_TIMEOUT,
+    OPENCODE_SERVE_CONNECT_TIMEOUT,
+    OPENCODE_SERVE_EVENT_READ_TIMEOUT,
+    OPENCODE_SERVE_REQUEST_TIMEOUT,
+    OPENCODE_SERVE_SESSION_INIT_TIMEOUT,
+    OPENCODE_SERVER_USERNAME,
+    SANDBOX_APPROVAL_WAIT_TIMEOUT_SECONDS,
+    SSE_KEEPALIVE_INTERVAL,
+)
+from onyx.server.features.build.packets import (
+    CompactionPacket,
+    ContextUsagePacket,
+    SubagentStartedPacket,
+)
+from onyx.server.features.build.sandbox.event_schema import (
+    TURN_ERROR_CODE_SESSION,
+    TURN_ERROR_CODE_TIMEOUT,
+    TURN_ERROR_CODE_TRANSPORT,
+    ActivityTimeoutError,
+    AgentMessageChunk,
+    AgentThoughtChunk,
+    Error,
+    OnyxSearchMeta,
+    OnyxToolMeta,
+    PromptResponse,
+    TextPartMetadata,
+    ToolCallProgress,
+    ToolCallStart,
+)
+from onyx.server.features.build.sandbox.models import PromptAttachment
+from onyx.server.features.build.sandbox.opencode.event_bus import (
+    BUS_CLOSED_SENTINEL,
+    PodEventBus,
+    _Subscription,
+)
+from onyx.server.features.build.sandbox.sse import SSEKeepalive
 from onyx.utils.logger import setup_logger
+from shared_configs.contextvars import get_current_tenant_id
 
 logger = setup_logger()
 
+# opencode permission category emitted by the no-op ``connect_app`` tool
+_CONNECT_APP_PERMISSION = "connect_app"
 
-# Acp event union (kept narrow — only the types we actually translate to).
-ACPEvent = (
+
+# Event union (kept narrow — only the types we actually translate to).
+SandboxEvent = (
     AgentMessageChunk
     | AgentThoughtChunk
     | ToolCallStart
     | ToolCallProgress
     | PromptResponse
     | Error
+    | SubagentStartedPacket
     | SSEKeepalive
 )
 
 
 # ---------------------------------------------------------------------------
-# Public dataclasses
+# Public models
 # ---------------------------------------------------------------------------
 
 
-@dataclass
-class ClientTimeouts:
+class ClientTimeouts(BaseModel):
     """HTTP timeouts for one ``OpencodeServeClient`` instance.
 
-    Defaults pull from ``configs.py`` so deployment can tune via env without
-    touching the client.
+    Defaults come from ``configs.py``. Session initialization has a separate
+    budget for cold directory startup.
     """
+
+    model_config = ConfigDict(strict=True)
 
     connect_timeout: float = OPENCODE_SERVE_CONNECT_TIMEOUT
     request_timeout: float = OPENCODE_SERVE_REQUEST_TIMEOUT
     event_read_timeout: float = OPENCODE_SERVE_EVENT_READ_TIMEOUT
+    session_init_timeout: float = OPENCODE_SERVE_SESSION_INIT_TIMEOUT
 
 
 # ---------------------------------------------------------------------------
@@ -87,17 +135,19 @@ class ClientTimeouts:
 # ---------------------------------------------------------------------------
 
 
-@dataclass
-class _TurnState:
+class _TurnState(BaseModel):
     """Mutable per-turn state used by the translator.
 
-    Lives only for the duration of one ``send_message`` call. Not exposed
-    outside this module.
+    Each prompt driver or live subscriber owns one instance.
     """
 
+    model_config = ConfigDict(strict=True)
+
     session_id: str
+    # Live readers replace identified parts; durable writers consume deltas.
+    emit_part_snapshots: bool = False
     # ToolCallStart is emitted only on the FIRST sighting of a callID.
-    seen_tool_calls: set[str] = field(default_factory=set)
+    seen_tool_calls: set[str] = Field(default_factory=set)
     # PromptResponse is yielded at most once per turn; subsequent backstop
     # signals are no-ops.
     terminator_yielded: bool = False
@@ -105,30 +155,42 @@ class _TurnState:
     # already yielded as AgentMessageChunk content. Used to gap-fill when a
     # ``message.part.updated`` for a text part reveals more text than we've
     # delivered (which happens after an ``/event`` reconnect).
-    local_text: dict[str, str] = field(default_factory=dict)
+    local_text: dict[str, str] = Field(default_factory=dict)
     # MessageIDs of every assistant message in this turn. opencode creates
     # one assistant message per step, so a single user turn that involves
     # a tool call yields at least two: the message containing the
     # pre-tool thoughts + tool call, and a follow-up message containing
     # the post-tool synthesized answer. Text parts whose ``messageID``
     # isn't in this set are filtered (user echoes, prior-turn messages).
-    assistant_message_ids: set[str] = field(default_factory=set)
+    assistant_message_ids: set[str] = Field(default_factory=set)
     # PartID → "text" | "reasoning" | "tool" | ... (the delta routes on this).
-    part_types: dict[str, str] = field(default_factory=dict)
+    part_types: dict[str, str] = Field(default_factory=dict)
     # MessageIDs we've ruled out as assistant (user role, malformed body,
     # or fetch failed). Kept so subsequent deltas short-circuit without
     # re-issuing the REST hydrate.
-    user_message_ids: set[str] = field(default_factory=set)
+    user_message_ids: set[str] = Field(default_factory=set)
+    # `task` callID → claimed child session (parallel tasks get distinct children).
+    task_child_by_call: dict[str, str] = Field(default_factory=dict)
+    # Descendant sessions share this parent turn stream but not opencode-local
+    # ids. Keep each child session's message/part/tool caches isolated.
+    child_states: dict[str, _TurnState] = Field(default_factory=dict)
     # Last LLM finish reason seen on any assistant message.updated. Only the
     # terminator (fired from session.idle/status) consumes it — message.updated
     # itself is per-step and can't terminate the turn.
     last_finish: str | None = None
+    # connect_app permission id → monotonic deadline. Timeout fallback only (the
+    # decision endpoint answers directly); reject an undecided request for a clean
+    # decline. A late reject after the user answered is a harmless no-op.
+    pending_connect_app_deadlines: dict[str, float] = Field(default_factory=dict)
+    connect_app_request_ids: set[str] = Field(default_factory=set)
+    # Set from BOTH message.updated and hydration — text deltas race ahead of message.updated.
+    summary_message_ids: set[str] = Field(default_factory=set)
 
 
 # ---------------------------------------------------------------------------
 # Tool-name mapping. Mirrors the frontend's NAME_MAP / TOOL_KIND_MAP in
 # ``web/src/app/craft/utils/parsePacket.ts`` so the translator emits the
-# same {kind, title} the existing ACP code path emits today.
+# same {kind, title} the existing translator emits today.
 # ---------------------------------------------------------------------------
 
 
@@ -138,6 +200,8 @@ _TOOL_KIND: dict[str, str] = {
     "write": "edit",
     "edit": "edit",
     "patch": "edit",
+    "apply_patch": "edit",
+    "applypatch": "edit",
     "glob": "search",
     "grep": "search",
     "list": "search",
@@ -146,6 +210,12 @@ _TOOL_KIND: dict[str, str] = {
     "todo_write": "other",
     "webfetch": "fetch",
     "websearch": "search",
+    "web_search": "search",
+    # opencode 1.15.x additions:
+    "lsp": "other",
+    "skill": "other",
+    "question": "other",
+    "invalid": "other",
 }
 
 _TOOL_TITLE: dict[str, str] = {
@@ -154,6 +224,8 @@ _TOOL_TITLE: dict[str, str] = {
     "write": "Writing",
     "edit": "Editing",
     "patch": "Editing",
+    "apply_patch": "Applying patch",
+    "applypatch": "Applying patch",
     "glob": "Searching files",
     "grep": "Searching content",
     "list": "Listing",
@@ -162,6 +234,12 @@ _TOOL_TITLE: dict[str, str] = {
     "todo_write": "Updating todos",
     "webfetch": "Fetching web content",
     "websearch": "Searching web",
+    "web_search": "Searching web",
+    # opencode 1.15.x additions:
+    "lsp": "Checking code",
+    "skill": "Running skill",
+    "question": "Asking",
+    "invalid": "Validating",
 }
 
 
@@ -173,9 +251,9 @@ def _tool_title(tool: str) -> str:
     return _TOOL_TITLE.get(tool, "Running tool")
 
 
-# opencode's tool status values → ACP's ToolCallStatus literal.
-# ACP: "pending" | "in_progress" | "completed" | "failed"
-# opencode emits: "pending", "running", "completed". "running" → "in_progress".
+# opencode's tool status values → ToolCallStatus literal.
+# Onyx schema: "pending" | "in_progress" | "completed" | "failed"
+# opencode emits: "pending", "running", "completed", "error". "running" → "in_progress".
 _TOOL_STATUS_MAP: dict[str, str] = {
     "pending": "pending",
     "running": "in_progress",
@@ -250,10 +328,17 @@ def _wrap_raw_output(state: dict[str, Any]) -> dict[str, Any] | None:
 
     Tools where ``state.output`` is already a dict (none observed in Phase 0
     but possible) get passed through unchanged.
+
+    Error-state tool parts carry their message in ``state.error`` instead of
+    ``state.output``.
     """
     out = state.get("output")
     if out is None:
-        return None
+        err = state.get("error")
+        if isinstance(err, str) and err:
+            out = err
+        else:
+            return None
     if isinstance(out, str):
         wrapped: dict[str, Any] = {"output": out}
         metadata = state.get("metadata")
@@ -295,6 +380,8 @@ def _hydrate_message(
     )
     if role == "assistant":
         state.assistant_message_ids.add(msg_id)
+        if info.get("summary") is True:
+            state.summary_message_ids.add(msg_id)
     elif role == "user":
         state.user_message_ids.add(msg_id)
     else:
@@ -327,6 +414,61 @@ def _is_assistant_message(
     return _hydrate_message(state, msg_id, fetch_message) == "assistant"
 
 
+def _emit_text_delta(
+    props: dict[str, Any],
+    state: _TurnState,
+    fetch_message: Callable[[str], dict[str, Any] | None] | None,
+) -> Iterable[SandboxEvent]:
+    field_name = props.get("field")
+    delta = props.get("delta")
+    part_id = props.get("partID")
+    msg_id = props.get("messageID")
+    if not isinstance(delta, str) or not isinstance(part_id, str):
+        return
+    if not delta:
+        return
+    # Assistant-only filter. Deltas race ~300ms ahead of message.updated;
+    # _is_assistant_message hydrates via REST when the role is unknown.
+    if not _is_assistant_message(state, msg_id, fetch_message):
+        return
+    if isinstance(msg_id, str) and msg_id in state.summary_message_ids:
+        return
+    if field_name != "text":
+        # Non-text fields (e.g. tool input streaming, future extensions)
+        # have no sandbox-event mapping yet. Drop silently.
+        return
+    # Route by the PART'S TYPE (not the delta's ``field``, which is
+    # always "text" because that's the part attribute being updated).
+    # opencode emits reasoning content on parts with ``type=reasoning``
+    # and visible text on parts with ``type=text``. The part type is
+    # recorded from prior ``message.part.updated`` events.
+    part_type = state.part_types.get(part_id, "text")
+    if part_type == "reasoning":
+        # Track reasoning accumulator the same way as text so the
+        # post-delta ``message.part.updated`` reconciliation doesn't
+        # double-emit. partID is unique across types, so they share
+        # ``state.local_text`` without collision.
+        state.local_text[part_id] = state.local_text.get(part_id, "") + delta
+        yield AgentThoughtChunk.model_validate(
+            {
+                "sessionUpdate": "agent_thought_chunk",
+                "content": {"type": "text", "text": delta},
+                "_meta": TextPartMetadata(partId=part_id),
+            }
+        )
+    elif part_type == "text":
+        state.local_text[part_id] = state.local_text.get(part_id, "") + delta
+        yield AgentMessageChunk.model_validate(
+            {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": delta},
+                "_meta": TextPartMetadata(partId=part_id),
+            }
+        )
+    # Other part types (step-start, step-finish, tool, ...) don't carry
+    # user-visible text — ignore.
+
+
 # ---------------------------------------------------------------------------
 # translate_opencode_event — translation has no I/O of its own. Hydration of
 # unknown messageIDs (the delta-before-message.updated race) is delegated to
@@ -334,19 +476,110 @@ def _is_assistant_message(
 # ---------------------------------------------------------------------------
 
 
+def _is_descendant_of(
+    sess_id: str,
+    ancestor_id: str,
+    parent_resolver: Callable[[str], str | None] | None,
+) -> bool:
+    """True if ``sess_id`` is a descendant of ``ancestor_id`` via the
+    child→parent chain. Guards against cycles and missing resolver."""
+    if parent_resolver is None:
+        return False
+    seen: set[str] = {sess_id}
+    parent = parent_resolver(sess_id)
+    while parent is not None and parent not in seen:
+        if parent == ancestor_id:
+            return True
+        seen.add(parent)
+        parent = parent_resolver(parent)
+    return False
+
+
+def _state_for_session(state: _TurnState, session_id: str) -> _TurnState:
+    if session_id == state.session_id:
+        return state
+    child_state = state.child_states.get(session_id)
+    if child_state is None:
+        child_state = _TurnState(
+            session_id=session_id, emit_part_snapshots=state.emit_part_snapshots
+        )
+        state.child_states[session_id] = child_state
+    return child_state
+
+
+def _is_summary_message(state: _TurnState, msg_id: Any) -> bool:
+    return isinstance(msg_id, str) and msg_id in state.summary_message_ids
+
+
+def _context_usage_from_info(info: dict[str, Any]) -> ContextUsagePacket | None:
+    if info.get("summary") is True:
+        return None
+    tokens = info.get("tokens")
+    if not isinstance(tokens, dict):
+        return None
+    cache = tokens.get("cache")
+    cache = cache if isinstance(cache, dict) else {}
+
+    def _n(value: Any) -> int:
+        return int(value) if isinstance(value, (int, float)) else 0
+
+    used = (
+        _n(tokens.get("input"))
+        + _n(tokens.get("output"))
+        + _n(tokens.get("reasoning"))
+        + _n(cache.get("read"))
+        + _n(cache.get("write"))
+    )
+    if used <= 0:
+        return None
+    cost = info.get("cost")
+    return ContextUsagePacket(
+        used_tokens=used,
+        cost=float(cost) if isinstance(cost, (int, float)) else None,
+    )
+
+
+def _fetch_summary_text(
+    state: _TurnState,
+    fetch_message: Callable[[str], dict[str, Any] | None] | None,
+) -> str | None:
+    if fetch_message is None or not state.summary_message_ids:
+        return None
+    texts: list[str] = []
+    for msg_id in state.summary_message_ids:
+        body = fetch_message(msg_id)
+        if not isinstance(body, dict):
+            continue
+        for part in body.get("parts") or []:
+            if isinstance(part, dict) and part.get("type") == "text":
+                text = part.get("text")
+                if isinstance(text, str) and text:
+                    texts.append(text)
+    return "\n\n".join(texts) or None
+
+
 def translate_opencode_event(
     raw: dict[str, Any],
     state: _TurnState,
     fetch_message: Callable[[str], dict[str, Any] | None] | None = None,
-) -> Iterable[ACPEvent]:
-    """Convert one opencode ``/event`` payload into zero-or-more ACPEvents.
+    parent_resolver: Callable[[str], str | None] | None = None,
+    children_resolver: Callable[[str], list[str]] | None = None,
+    fetch_message_by_session: Callable[[str, str], dict[str, Any] | None] | None = None,
+) -> Iterable[SandboxEvent]:
+    """Convert one opencode ``/event`` payload into zero-or-more SandboxEvents.
 
     Pure function: read-only over ``raw`` (but mutates ``state``). Called from
     the reader thread; all field access defensive against unexpected shapes.
 
-    Returns an iterable so single opencode events that imply multiple ACP
-    events (e.g. final ``message.updated`` → flush + ``PromptResponse``) can
-    yield more than one.
+    Returns an iterable so single opencode events that imply multiple
+    sandbox events (e.g. final ``message.updated`` → flush +
+    ``PromptResponse``) can yield more than one.
+
+    ``parent_resolver`` (child→parent) lets the translator recognize events
+    from descendant subagent sessions; their tool events are forwarded and
+    tagged with routing metadata instead of dropped. ``children_resolver``
+    (parent→children) lets the parent's ``task`` tool event be tagged with the
+    subagent session it spawned.
     """
     etype = raw.get("type")
     if not isinstance(etype, str):
@@ -364,53 +597,93 @@ def translate_opencode_event(
         info = props.get("info") or {}
         if isinstance(info, dict):
             sess_id = info.get("sessionID")
-    if sess_id is not None and sess_id != state.session_id:
-        return  # event for another session (e.g. subagent child)
+
+    if etype == "session.created":
+        info = props.get("info") or {}
+        if not isinstance(info, dict):
+            return
+        child_id = info.get("id")
+        parent_id = info.get("parentID")
+        if (
+            isinstance(child_id, str)
+            and isinstance(parent_id, str)
+            and parent_id == state.session_id
+        ):
+            yield SubagentStartedPacket(
+                subagent_session_id=child_id,
+                parent_session_id=parent_id,
+            )
+        return
+
+    if isinstance(sess_id, str) and sess_id != state.session_id:
+        # Event from another session. Forward descendant text/thought/tool
+        # events tagged so the frontend can route them to the live subagent.
+        if not _is_descendant_of(sess_id, state.session_id, parent_resolver):
+            return  # unrelated session — drop as before
+
+        child_meta = {"sessionId": sess_id, "parentSessionId": state.session_id}
+        child_state = _state_for_session(state, sess_id)
+
+        if etype == "message.updated":
+            info = props.get("info") or {}
+            if not isinstance(info, dict):
+                return
+            if info.get("role") != "assistant":
+                return
+            msg_id = info.get("id")
+            if isinstance(msg_id, str):
+                child_state.assistant_message_ids.add(msg_id)
+            return
+
+        child_fetch_message = (
+            (lambda mid: fetch_message_by_session(sess_id, mid))
+            if fetch_message_by_session is not None
+            else None
+        )
+
+        if etype == "message.part.delta":
+            for event in _emit_text_delta(props, child_state, child_fetch_message):
+                _merge_field_meta(event, child_meta)
+                yield event
+            return
+
+        if etype != "message.part.updated":
+            return
+
+        part = props.get("part") or {}
+        if not isinstance(part, dict):
+            return
+
+        part_type = part.get("type")
+        part_id_for_state = part.get("id")
+        if isinstance(part_id_for_state, str) and isinstance(part_type, str):
+            child_state.part_types[part_id_for_state] = part_type
+
+        if part_type == "reasoning":
+            if not _is_assistant_message(
+                child_state, part.get("messageID"), child_fetch_message
+            ):
+                return
+            events = _reconcile_reasoning_part(part, child_state)
+        elif part_type == "text":
+            if not _is_assistant_message(
+                child_state, part.get("messageID"), child_fetch_message
+            ):
+                return
+            events = _reconcile_text_part(part, child_state)
+        elif part_type == "tool":
+            events = _emit_tool_events(part, child_state)
+        else:
+            return
+
+        for event in events:
+            _merge_field_meta(event, child_meta)
+            yield event
+        return
 
     # ── streaming text deltas ────────────────────────────────────────
     if etype == "message.part.delta":
-        field_name = props.get("field")
-        delta = props.get("delta")
-        part_id = props.get("partID")
-        msg_id = props.get("messageID")
-        if not isinstance(delta, str) or not isinstance(part_id, str):
-            return
-        # Assistant-only filter. Deltas race ~300ms ahead of message.updated;
-        # _is_assistant_message hydrates via REST when the role is unknown.
-        if not _is_assistant_message(state, msg_id, fetch_message):
-            return
-        if field_name != "text":
-            # Non-text fields (e.g. tool input streaming, future extensions)
-            # have no ACP-event mapping yet. Drop silently.
-            return
-        # Route by the PART'S TYPE (not the delta's ``field``, which is
-        # always "text" because that's the part attribute being updated).
-        # opencode emits reasoning content on parts with ``type=reasoning``
-        # and visible text on parts with ``type=text``. The part type is
-        # recorded from prior ``message.part.updated`` events.
-        part_type = state.part_types.get(part_id, "text")
-        if part_type == "reasoning":
-            # Track reasoning accumulator the same way as text so the
-            # post-delta ``message.part.updated`` reconciliation doesn't
-            # double-emit. partID is unique across types, so they share
-            # ``state.local_text`` without collision.
-            state.local_text[part_id] = state.local_text.get(part_id, "") + delta
-            yield AgentThoughtChunk.model_validate(
-                {
-                    "sessionUpdate": "agent_thought_chunk",
-                    "content": {"type": "text", "text": delta},
-                }
-            )
-        elif part_type == "text":
-            state.local_text[part_id] = state.local_text.get(part_id, "") + delta
-            yield AgentMessageChunk.model_validate(
-                {
-                    "sessionUpdate": "agent_message_chunk",
-                    "content": {"type": "text", "text": delta},
-                }
-            )
-        # Other part types (step-start, step-finish, tool, ...) don't
-        # carry user-visible text — ignore.
+        yield from _emit_text_delta(props, state, fetch_message)
         return
 
     # ── part lifecycle (tool calls + gap-fill anchors for text parts) ──
@@ -421,7 +694,7 @@ def translate_opencode_event(
         part_type = part.get("type")
 
         # Record the part's type so later ``message.part.delta`` events
-        # can route to the right ACP event class (text → message chunk,
+        # can route to the right sandbox event class (text → message chunk,
         # reasoning → thought chunk). Deltas alone don't carry the part
         # type, only the part id.
         part_id_for_state = part.get("id")
@@ -431,17 +704,43 @@ def translate_opencode_event(
         if part_type == "reasoning":
             if not _is_assistant_message(state, part.get("messageID"), fetch_message):
                 return
+            if _is_summary_message(state, part.get("messageID")):
+                return
             yield from _reconcile_reasoning_part(part, state)
             return
 
         if part_type == "text":
             if not _is_assistant_message(state, part.get("messageID"), fetch_message):
                 return
+            if _is_summary_message(state, part.get("messageID")):
+                return
             yield from _reconcile_text_part(part, state)
             return
 
         if part_type == "tool":
-            yield from _emit_tool_events(part, state)
+            # Tag the parent's ``task`` tool event with the subagent session it
+            # spawned so the frontend can link the call to its child stream.
+            subagent_sid: str | None = None
+            if part.get("tool") == "task" and children_resolver is not None:
+                # Each task callID claims the most-recent not-yet-claimed child.
+                call_id = part.get("callID")
+                if call_id is not None and call_id in state.task_child_by_call:
+                    subagent_sid = state.task_child_by_call[call_id]
+                else:
+                    claimed = set(state.task_child_by_call.values())
+                    unclaimed = [
+                        c
+                        for c in children_resolver(state.session_id)
+                        if c not in claimed
+                    ]
+                    if unclaimed:
+                        subagent_sid = unclaimed[-1]
+                        if call_id is not None:
+                            state.task_child_by_call[call_id] = subagent_sid
+            for event in _emit_tool_events(part, state):
+                if subagent_sid is not None:
+                    _merge_field_meta(event, {"subagentSessionId": subagent_sid})
+                yield event
             return
 
         # Reasoning parts: streams come via message.part.delta with
@@ -461,9 +760,14 @@ def translate_opencode_event(
         msg_id = info.get("id")
         if isinstance(msg_id, str):
             state.assistant_message_ids.add(msg_id)
+            if info.get("summary") is True:
+                state.summary_message_ids.add(msg_id)
         finish = info.get("finish")
         if isinstance(finish, str):
             state.last_finish = finish
+        usage = _context_usage_from_info(info)
+        if usage is not None:
+            yield usage
         # A message error DOES kill the turn — surface it.
         err = info.get("error")
         if err and isinstance(err, dict):
@@ -490,13 +794,19 @@ def translate_opencode_event(
             yield from _emit_terminator(state, error=err)
         return
 
+    if etype == "session.compacted":
+        yield CompactionPacket(summary=_fetch_summary_text(state, fetch_message))
+        return
+
     # Everything else (server.heartbeat, session.created, session.diff,
     # session.next.{agent,model}.switched, session.updated, etc.) is
     # informational — ignored.
     return
 
 
-def _reconcile_text_part(part: dict[str, Any], state: _TurnState) -> Iterable[ACPEvent]:
+def _reconcile_text_part(
+    part: dict[str, Any], state: _TurnState
+) -> Iterable[SandboxEvent]:
     """Gap-fill reconciliation for visible-text parts. See module
     docstring + the ``message.part.delta`` handler for the full
     invariants. Emits a synthesized AgentMessageChunk for any text in
@@ -511,7 +821,7 @@ def _reconcile_text_part(part: dict[str, Any], state: _TurnState) -> Iterable[AC
 
 def _reconcile_reasoning_part(
     part: dict[str, Any], state: _TurnState
-) -> Iterable[ACPEvent]:
+) -> Iterable[SandboxEvent]:
     """Same gap-fill as :func:`_reconcile_text_part` but for ``type=reasoning``
     parts — yields AgentThoughtChunk instead of AgentMessageChunk."""
     yield from _reconcile_part_text(
@@ -528,7 +838,7 @@ def _reconcile_part_text(
     *,
     emit_class: type[AgentMessageChunk] | type[AgentThoughtChunk],
     session_update: str,
-) -> Iterable[ACPEvent]:
+) -> Iterable[SandboxEvent]:
     """Shared gap-fill logic for any part type whose ``text`` field
     accumulates over deltas. ``state.local_text`` is keyed by partID so
     text-part and reasoning-part accumulators don't collide."""
@@ -539,14 +849,18 @@ def _reconcile_part_text(
     if not isinstance(expected, str):
         return
     local = state.local_text.get(part_id, "")
-    if len(expected) > len(local):
+    if len(expected) >= len(local):
         tail = expected[len(local) :]
         state.local_text[part_id] = expected
-        if tail:
+        if tail or (state.emit_part_snapshots and expected):
+            metadata = TextPartMetadata(partId=part_id)
+            if state.emit_part_snapshots:
+                metadata["snapshotText"] = expected
             yield emit_class.model_validate(
                 {
                     "sessionUpdate": session_update,
                     "content": {"type": "text", "text": tail},
+                    "_meta": metadata,
                 }
             )
     elif len(expected) < len(local):
@@ -562,7 +876,47 @@ def _reconcile_part_text(
         )
 
 
-def _emit_tool_events(part: dict[str, Any], state: _TurnState) -> Iterable[ACPEvent]:
+def _merge_field_meta(event: SandboxEvent, extra: dict[str, Any]) -> None:
+    """Merge routing metadata into an event's ACP ``_meta`` field in place.
+
+    ``field_meta`` (aliased ``_meta``) already carries ``toolName`` for tool
+    events; merge rather than overwrite so both survive ``model_dump``."""
+    existing = getattr(event, "field_meta", None)  # ods: ignore[getattr]
+    merged: dict[str, Any] = dict(existing) if isinstance(existing, dict) else {}
+    for key, value in extra.items():
+        # ``onyx`` is a namespace: merge its keys so neither side's are lost.
+        current = merged.get(key)
+        if key == "onyx" and isinstance(current, dict) and isinstance(value, dict):
+            merged[key] = {**current, **value}
+        else:
+            merged[key] = value
+    setattr(event, "field_meta", merged)  # noqa: B010
+
+
+def _onyx_search_meta(tool: str, part_state: dict[str, Any]) -> OnyxSearchMeta | None:
+    """The ``web_search`` plugin's queries and results, from its ``metadata``.
+
+    The plugin (``opencode-plugins/web-search.ts``) returns them as
+    ``metadata.onyxSearch``. Anything malformed is dropped, not raised: the
+    text output still reaches the model and the frontend."""
+    if tool != "web_search":
+        return None
+    metadata = part_state.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    search = metadata.get("onyxSearch")
+    if not isinstance(search, dict):
+        return None
+    try:
+        return OnyxSearchMeta.model_validate(search)
+    except ValidationError:
+        logger.warning("opencode-serve: web_search metadata did not validate")
+        return None
+
+
+def _emit_tool_events(
+    part: dict[str, Any], state: _TurnState
+) -> Iterable[SandboxEvent]:
     """Emit ToolCallStart (first sighting) and/or ToolCallProgress for a
     tool part update."""
     call_id = part.get("callID")
@@ -576,6 +930,12 @@ def _emit_tool_events(part: dict[str, Any], state: _TurnState) -> Iterable[ACPEv
 
     raw_status = part_state.get("status", "pending")
     status = _tool_status(raw_status)
+    metadata = part_state.get("metadata")
+    exit_code = metadata.get("exit") if isinstance(metadata, dict) else None
+    if not isinstance(exit_code, int):
+        exit_code = None
+    if status == "completed" and exit_code is not None and exit_code != 0:
+        status = "failed"
     raw_input = part_state.get("input") or None
     raw_output = _wrap_raw_output(part_state)
     content = _synthesize_tool_content(tool, part_state)
@@ -585,6 +945,19 @@ def _emit_tool_events(part: dict[str, Any], state: _TurnState) -> Iterable[ACPEv
         "title": _tool_title(tool),
         "kind": _tool_kind(tool),
         "status": status,
+        # _meta is an ACP-reserved extensibility field. We use it to carry
+        # the raw opencode tool name so the frontend can resolve a precise
+        # title (otherwise tools with kind="other" — todowrite, task, lsp,
+        # skill, … — all fall through to "Running tool"). ``onyx`` holds the
+        # Onyx data ACP has no field for (see ``OnyxToolMeta``).
+        "_meta": {
+            "toolName": tool,
+            "onyx": OnyxToolMeta(
+                cancelled=True if raw_status == "cancelled" else None,
+                search=_onyx_search_meta(tool, part_state),
+                exitCode=exit_code if tool == "bash" else None,
+            ).to_meta(),
+        },
     }
     if raw_input is not None:
         common["rawInput"] = raw_input
@@ -614,7 +987,7 @@ def _emit_terminator(
     *,
     error: dict[str, Any] | None = None,
     finish: Any = None,
-) -> Iterable[ACPEvent]:
+) -> Iterable[SandboxEvent]:
     """Yield ``PromptResponse`` (or ``Error``) exactly once per turn.
 
     Subsequent calls within the same turn are no-ops — opencode emits
@@ -626,13 +999,19 @@ def _emit_terminator(
     state.terminator_yielded = True
 
     if error:
+        # An aborted message is a cancellation (the user interrupted), not a
+        # turn failure — emit the normal cancelled terminal so consumers don't
+        # treat an interrupt as an error.
+        if error.get("name") == "MessageAbortedError":
+            yield PromptResponse.model_validate({"stopReason": "cancelled"})
+            return
         msg = ""
         data = error.get("data")
         if isinstance(data, dict):
             msg = str(data.get("message") or "")
         if not msg:
             msg = str(error.get("name") or "session error")
-        yield Error.model_validate({"code": -1, "message": msg})
+        yield Error.model_validate({"code": TURN_ERROR_CODE_SESSION, "message": msg})
         return
 
     stop_reason = "end_turn"
@@ -645,7 +1024,7 @@ def _emit_terminator(
     ):
         stop_reason = finish
     elif finish == "stop":
-        # opencode uses "stop" where ACP uses "end_turn".
+        # opencode uses "stop" where the schema uses "end_turn".
         stop_reason = "end_turn"
 
     yield PromptResponse.model_validate({"stopReason": stop_reason})
@@ -663,8 +1042,7 @@ class OpencodeServeClient:
     sourcing the per-pod password, resolving the pod IP, and choosing the
     LLM model live in the sandbox manager. This client just speaks HTTP.
 
-    See ``docs/craft/features/opencode-serve-client.md`` for the full
-    design.
+    See the module docstring for the event-stream rules.
     """
 
     def __init__(
@@ -676,10 +1054,15 @@ class OpencodeServeClient:
         client_info: dict[str, Any] | None = None,
         timeouts: ClientTimeouts | None = None,
         transport: httpx.BaseTransport | None = None,
+        reload_password: Callable[[], str | None] | None = None,
     ) -> None:
         """``event_bus`` is required for :meth:`send_message`; unary
         methods (ensure_session, list_messages, abort) work without one
-        — tests can omit it when exercising the unary surface only."""
+        — tests can omit it when exercising the unary surface only.
+
+        ``reload_password`` re-fetches the password from its source of truth,
+        invoked on a 401 to self-heal a peer-pod password rotation. ``None``
+        disables the self-heal (e.g. health probes)."""
         self._base_url = base_url.rstrip("/")
         self._password = password
         self._client_info = client_info or {
@@ -687,16 +1070,25 @@ class OpencodeServeClient:
             "version": "1.0.0",
         }
         self._timeouts = timeouts or ClientTimeouts()
-        self._auth: httpx.BasicAuth | None = (
-            httpx.BasicAuth(OPENCODE_SERVER_USERNAME, password) if password else None
-        )
+        self._reload_password = reload_password
         self._event_bus = event_bus
-        # transport is for tests (httpx.MockTransport). Unary only —
-        # SSE subscription is owned by the bus.
-        self._http = httpx.Client(
+        # transport is for tests (httpx.MockTransport); stored so
+        # _apply_password can rebuild the client without losing it.
+        self._transport = transport
+        self._auth = self._basic_auth(password)
+        self._http = self._make_http_client()
+
+    @staticmethod
+    def _basic_auth(password: str | None) -> httpx.BasicAuth | None:
+        return httpx.BasicAuth(OPENCODE_SERVER_USERNAME, password) if password else None
+
+    def _make_http_client(self) -> httpx.Client:
+        """Build a client bound to the current ``self._auth``. Pure — callers
+        set ``self._auth`` first."""
+        return httpx.Client(
             base_url=self._base_url,
             auth=self._auth,
-            transport=transport,
+            transport=self._transport,
             timeout=httpx.Timeout(
                 connect=self._timeouts.connect_timeout,
                 read=self._timeouts.request_timeout,
@@ -705,18 +1097,35 @@ class OpencodeServeClient:
             ),
         )
 
+    def _apply_password(self, password: str | None) -> None:
+        """Rebuild the http client with a fresh password (auth is bound at
+        construction); close the old one to avoid a pool leak."""
+        old = self._http
+        self._password = password
+        self._auth = self._basic_auth(password)
+        self._http = self._make_http_client()
+        old.close()
+
     # ----- session lifecycle ----------------------------------------
 
-    def health_check(self) -> bool:
+    def health_check_status(self) -> int | None:
+        """HTTP status from ``GET /doc``, or ``None`` on transport error — lets
+        the readiness probe tell a 401 (stale password) from a not-yet-listening
+        pod (transport error)."""
         try:
             r = self._http.get("/doc", timeout=self._timeouts.connect_timeout)
-            return r.status_code == 200
+            return r.status_code
         except httpx.HTTPError:
-            return False
+            return None
+
+    def health_check(self) -> bool:
+        return self.health_check_status() == 200
 
     # Cold-pod retry tunables — short window, total worst-case ~1.5s.
     _COLD_POD_RETRIES = 3
     _COLD_POD_BASE_DELAY = 0.25
+    # Each read-timeout retry costs a full read timeout, so allow only one.
+    _READ_TIMEOUT_RETRIES = 1
 
     def _http_with_cold_pod_retry(
         self,
@@ -724,6 +1133,7 @@ class OpencodeServeClient:
         path: str,
         *,
         idempotent: bool = False,
+        retry_read_timeout: bool = False,
         **kwargs: Any,
     ) -> httpx.Response:
         """``self._http.request`` with bounded retries for transient
@@ -741,6 +1151,10 @@ class OpencodeServeClient:
         (e.g. ``POST /session``) can create duplicate state — exactly the
         orphan-session bug this transport was designed to avoid.
 
+        ``ReadTimeout`` is retried once, only when both ``idempotent`` and
+        ``retry_read_timeout`` are set: the server may still complete the
+        first request, and each retry costs a full read timeout.
+
         Never retries HTTP error responses — those are application-level
         signals the caller must handle.
         """
@@ -749,7 +1163,10 @@ class OpencodeServeClient:
             if idempotent
             else (httpx.ConnectError,)
         )
+        if idempotent and retry_read_timeout:
+            retryable = (*retryable, httpx.ReadTimeout)
         last_exc: BaseException | None = None
+        read_timeout_retries = 0
         for attempt in range(self._COLD_POD_RETRIES + 1):
             try:
                 return self._http.request(method, path, **kwargs)
@@ -757,6 +1174,10 @@ class OpencodeServeClient:
                 last_exc = e
                 if attempt == self._COLD_POD_RETRIES:
                     break
+                if isinstance(e, httpx.ReadTimeout):
+                    if read_timeout_retries >= self._READ_TIMEOUT_RETRIES:
+                        break
+                    read_timeout_retries += 1
                 delay = self._COLD_POD_BASE_DELAY * (attempt + 1)
                 logger.info(
                     "[SESSION-LIFECYCLE] cold-pod retry %d/%d for %s %s after %s: %s",
@@ -768,8 +1189,50 @@ class OpencodeServeClient:
                     e,
                 )
                 time.sleep(delay)
-        assert last_exc is not None
+        if last_exc is None:
+            raise RuntimeError("Cold-pod retry loop ended without an error.")
         raise last_exc
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        idempotent: bool = False,
+        retry_read_timeout: bool = False,
+        **kwargs: Any,
+    ) -> httpx.Response:
+        """Unary request with cold-pod retry plus a one-shot password reload
+        on 401 (a peer pod rotated the password, staling our cache). Retrying
+        is safe even for a non-idempotent POST: a 401 is rejected before
+        processing, so the server never saw the body. An unchanged reload is a
+        genuine auth failure — return it for the caller to surface."""
+        r = self._http_with_cold_pod_retry(
+            method,
+            path,
+            idempotent=idempotent,
+            retry_read_timeout=retry_read_timeout,
+            **kwargs,
+        )
+        if r.status_code != 401 or self._reload_password is None:
+            return r
+        new_password = self._reload_password()
+        if new_password == self._password:
+            return r
+        logger.info(
+            "[SESSION-LIFECYCLE] 401 on %s %s; reloaded opencode password and "
+            "retrying (peer pod likely rotated it)",
+            method,
+            path,
+        )
+        self._apply_password(new_password)
+        return self._http_with_cold_pod_retry(
+            method,
+            path,
+            idempotent=idempotent,
+            retry_read_timeout=retry_read_timeout,
+            **kwargs,
+        )
 
     def ensure_session(
         self,
@@ -779,6 +1242,11 @@ class OpencodeServeClient:
         title: str | None = None,
     ) -> str:
         """Return a valid opencode session id. Idempotent across replicas.
+
+        A missing caller-supplied id is treated optimistically: the restored
+        history snapshot may not contain that opencode session yet, so we mint a
+        replacement id and let the caller persist it. Non-404 lookup failures
+        still raise instead of masking runtime outages.
 
         ``directory`` anchors the opencode Instance for this session.
         Opencode-serve scopes its session store per-directory via the
@@ -795,13 +1263,20 @@ class OpencodeServeClient:
         response") are retried with short backoff before bubbling up.
         """
         directory_params = {"directory": directory}
+        # Both lookup and creation can initialize a cold directory-scoped Instance.
+        initialization_timeout = httpx.Timeout(
+            self._timeouts.session_init_timeout,
+            connect=self._timeouts.connect_timeout,
+            pool=self._timeouts.connect_timeout,
+        )
         if opencode_session_id:
             # GET is idempotent — safe to retry on either ConnectError or
             # RemoteProtocolError.
-            r = self._http_with_cold_pod_retry(
+            r = self._request(
                 "GET",
                 f"/session/{opencode_session_id}",
                 params=directory_params,
+                timeout=initialization_timeout,
                 idempotent=True,
             )
             if r.status_code == 200:
@@ -814,7 +1289,7 @@ class OpencodeServeClient:
             if r.status_code == 404:
                 logger.warning(
                     "[SESSION-LIFECYCLE] ensure_session: GET /session/%s -> 404 "
-                    "(persisted id stale; will create new)",
+                    "(persisted id missing from opencode store; will create new)",
                     opencode_session_id,
                 )
             else:
@@ -833,10 +1308,11 @@ class OpencodeServeClient:
         # = server never saw it) keeps the call safe; a
         # RemoteProtocolError after a half-handled POST could leak an
         # orphan opencode session.
-        r = self._http_with_cold_pod_retry(
+        r = self._request(
             "POST",
             "/session",
             params=directory_params,
+            timeout=initialization_timeout,
             json=body,
             idempotent=False,
         )
@@ -852,24 +1328,46 @@ class OpencodeServeClient:
         )
         return new_id
 
-    def delete_session(self, opencode_session_id: str, *, directory: str) -> None:
+    def delete_session(self, opencode_session_id: str, *, directory: str) -> bool:
+        """Best-effort delete of an opencode session from the live serve process.
+
+        Product deletion is owned by Onyx's BuildSession row. This cleanup is
+        opportunistic: failure should not block deleting the Onyx session.
+        """
         try:
-            r = self._http.delete(
+            r = self._request(
+                "DELETE",
                 f"/session/{opencode_session_id}",
                 params={"directory": directory},
+                idempotent=True,
             )
-            if r.status_code not in (200, 204, 404):
-                logger.warning(
-                    "opencode-serve: delete_session(%s) → HTTP %s",
-                    opencode_session_id,
-                    r.status_code,
-                )
         except httpx.HTTPError as e:
             logger.warning(
                 "opencode-serve: delete_session(%s) failed: %s",
                 opencode_session_id,
                 e,
             )
+            return False
+
+        if r.status_code in (200, 204, 404):
+            return True
+        logger.warning(
+            "opencode-serve: delete_session(%s) -> HTTP %s",
+            opencode_session_id,
+            r.status_code,
+        )
+        return False
+
+    def dispose_instance(self, *, directory: str) -> None:
+        """Dispose the directory-scoped runtime so OpenCode reloads managed files."""
+        r = self._request(
+            "POST",
+            "/instance/dispose",
+            params={"directory": directory},
+            idempotent=True,
+            retry_read_timeout=True,
+        )
+        _raise_for_status(r, "instance dispose")
 
     def list_messages(
         self, opencode_session_id: str, *, directory: str
@@ -881,9 +1379,11 @@ class OpencodeServeClient:
         streaming and only populated post-terminator. Use this only for
         the post-terminator fallback in the reconnect path.
         """
-        r = self._http.get(
+        r = self._request(
+            "GET",
             f"/session/{opencode_session_id}/message",
             params={"directory": directory},
+            idempotent=True,
         )
         _raise_for_status(r, "session messages")
         data = r.json()
@@ -897,6 +1397,7 @@ class OpencodeServeClient:
                 f"/session/{opencode_session_id}/abort",
                 params={"directory": directory},
                 json={},
+                timeout=OPENCODE_SERVE_ABORT_TIMEOUT,
             )
         except httpx.HTTPError as e:
             logger.warning(
@@ -910,7 +1411,7 @@ class OpencodeServeClient:
     ) -> dict[str, Any] | None:
         """GET /session/{id}/message/{id}. None on any failure (never raises)."""
         try:
-            r = self._http_with_cold_pod_retry(
+            r = self._request(
                 "GET",
                 f"/session/{opencode_session_id}/message/{message_id}",
                 params={"directory": directory},
@@ -947,9 +1448,12 @@ class OpencodeServeClient:
         directory: str,
         model_provider: str | None = None,
         model_id: str | None = None,
-        timeout: float = ACP_MESSAGE_TIMEOUT,
-    ) -> Generator[ACPEvent, None, None]:
-        """Stream one turn of ACPEvents via the shared per-pod bus.
+        attachments: list[PromptAttachment] | None = None,
+        timeout: float = OPENCODE_PROMPT_INACTIVITY_TIMEOUT_SECONDS,
+        absolute_timeout: float | None = None,
+        should_interrupt: Callable[[], bool] | None = None,
+    ) -> Generator[SandboxEvent, None, None]:
+        """Stream one turn of SandboxEvents via the shared per-pod bus.
 
         ``directory`` must match the one passed to :meth:`ensure_session`
         — opencode-serve scopes its Instance (and therefore the session
@@ -957,7 +1461,9 @@ class OpencodeServeClient:
         directory will 404 the session.
 
         ``GeneratorExit`` (browser disconnect) → POST ``/abort``.
-        Wall-clock timeout → POST ``/abort`` and yield :class:`Error`.
+        ``timeout`` is renewed by scoped turn activity. ``absolute_timeout``,
+        when supplied, remains a fixed wall-clock budget. Either timeout posts
+        ``/abort`` and yields :class:`Error`.
         """
         if self._event_bus is None:
             raise RuntimeError(
@@ -966,23 +1472,31 @@ class OpencodeServeClient:
             )
 
         state = _TurnState(session_id=opencode_session_id)
+        turn_started_at = time.monotonic()
+        prompt_posted = False
 
         def fetch_message(mid: str) -> dict[str, Any] | None:
             return self.get_message(opencode_session_id, mid, directory=directory)
 
         sub = self._event_bus.subscribe(opencode_session_id)
         try:
-            # Block until the bus reader has the stream open, else we'd
-            # POST prompt_async and miss the first events of the turn.
-            if not self._event_bus.stream_ready.wait(
-                timeout=self._timeouts.connect_timeout
-            ):
-                yield Error.model_validate(
-                    {
-                        "code": -3,
-                        "message": "opencode /event stream did not become ready",
-                    }
-                )
+            # Wait until the bus reader has the /event stream open, else we'd
+            # POST prompt_async and miss the first events of the turn. The bus
+            # may be in a reconnect window after a transient disconnect, so do
+            # not fail on the short HTTP connect timeout; wait within the turn's
+            # wall-clock budget while emitting keepalives.
+            readiness_timeout = (
+                min(timeout, absolute_timeout)
+                if absolute_timeout is not None
+                else timeout
+            )
+            ready = yield from self._wait_for_event_stream_ready(
+                sub,
+                readiness_timeout,
+                turn_started_at,
+                should_interrupt=should_interrupt,
+            )
+            if not ready:
                 return
 
             try:
@@ -991,8 +1505,10 @@ class OpencodeServeClient:
                     message,
                     model_provider,
                     model_id,
+                    attachments=attachments,
                     directory=directory,
                 )
+                prompt_posted = True
             except httpx.HTTPStatusError as e:
                 yield Error.model_validate(
                     {
@@ -1003,7 +1519,10 @@ class OpencodeServeClient:
                 return
             except httpx.HTTPError as e:
                 yield Error.model_validate(
-                    {"code": -3, "message": f"prompt_async failed: {e}"}
+                    {
+                        "code": TURN_ERROR_CODE_TRANSPORT,
+                        "message": f"prompt_async failed: {e}",
+                    }
                 )
                 return
 
@@ -1014,13 +1533,110 @@ class OpencodeServeClient:
                 state,
                 fetch_message,
                 directory=directory,
+                absolute_deadline=(
+                    turn_started_at + absolute_timeout
+                    if absolute_timeout is not None
+                    else None
+                ),
+                parent_resolver=self._event_bus.parent_of,
+                children_resolver=self._event_bus.list_children,
+                should_interrupt=should_interrupt,
             )
 
         except GeneratorExit:
-            self.abort(opencode_session_id, directory=directory)
+            if prompt_posted:
+                self.abort(opencode_session_id, directory=directory)
             raise
         finally:
             self._event_bus.unsubscribe(sub)
+            if state.connect_app_request_ids:
+                try:
+                    cache = get_cache_backend(tenant_id=get_current_tenant_id())
+                    for request_id in state.connect_app_request_ids:
+                        connect_app.clear_pending(request_id, cache)
+                except Exception:
+                    logger.exception("connect_app cleanup failed for ended turn")
+
+    def _wait_for_event_stream_ready(
+        self,
+        sub: _Subscription,
+        timeout: float,
+        turn_started_at: float,
+        *,
+        should_interrupt: Callable[[], bool] | None = None,
+    ) -> Generator[SandboxEvent, None, bool]:
+        """Wait for the shared /event reader to be connected before prompting.
+
+        This absorbs short reconnect windows without dropping the turn. It still
+        respects the caller's turn budget and exits promptly if the bus gives up
+        and self-closes.
+        """
+        last_keepalive = time.monotonic()
+        last_interrupt_check = last_keepalive
+
+        while True:
+            if self._event_bus is None:
+                yield Error.model_validate(
+                    {
+                        "code": TURN_ERROR_CODE_TRANSPORT,
+                        "message": "opencode /event bus is unavailable",
+                    }
+                )
+                return False
+
+            if self._event_bus.closed:
+                yield Error.model_validate(
+                    {
+                        "code": TURN_ERROR_CODE_TRANSPORT,
+                        "message": "event bus closed before /event stream became ready",
+                    }
+                )
+                return False
+
+            if self._event_bus.stream_ready.is_set():
+                return True
+
+            now = time.monotonic()
+            if should_interrupt is not None and now - last_interrupt_check >= 1.0:
+                last_interrupt_check = now
+                if should_interrupt():
+                    yield PromptResponse.model_validate({"stopReason": "cancelled"})
+                    return False
+
+            remaining = timeout - (now - turn_started_at)
+            if remaining <= 0:
+                yield Error.model_validate(
+                    {
+                        "code": TURN_ERROR_CODE_TRANSPORT,
+                        "message": "opencode /event stream did not become ready",
+                    }
+                )
+                return False
+
+            wait_for = min(remaining, 1.0)
+            if self._event_bus.stream_ready.wait(timeout=wait_for):
+                return True
+
+            try:
+                raw = sub.queue.get_nowait()
+            except queue.Empty:
+                if time.monotonic() - last_keepalive >= SSE_KEEPALIVE_INTERVAL:
+                    yield SSEKeepalive()
+                    last_keepalive = time.monotonic()
+                continue
+
+            if raw is BUS_CLOSED_SENTINEL:
+                yield Error.model_validate(
+                    {
+                        "code": TURN_ERROR_CODE_TRANSPORT,
+                        "message": "event bus closed before /event stream became ready",
+                    }
+                )
+                return False
+
+            # Do not translate pre-prompt events; they belong to prior activity
+            # on this opencode session. Loop back to re-check stream readiness,
+            # timeout, and bus closure.
 
     def _consume_from_bus(
         self,
@@ -1031,37 +1647,72 @@ class OpencodeServeClient:
         fetch_message: Callable[[str], dict[str, Any] | None],
         *,
         directory: str,
-    ) -> Generator[ACPEvent, None, None]:
+        absolute_deadline: float | None = None,
+        parent_resolver: Callable[[str], str | None] | None = None,
+        children_resolver: Callable[[str], list[str]] | None = None,
+        should_interrupt: Callable[[], bool] | None = None,
+    ) -> Generator[SandboxEvent, None, None]:
         """Drain the bus queue, translate, yield until a
-        :class:`PromptResponse` is emitted. permission.asked → auto-allow."""
+        :class:`PromptResponse` is emitted. permission.asked → auto-allow.
+
+        ``should_interrupt`` (polled ~1/s) lets the caller end the turn
+        deterministically: we abort opencode and emit our own terminating
+        ``PromptResponse`` rather than waiting on a ``session.idle`` that may
+        never arrive after an abort — otherwise an interrupted, event-less turn
+        would pin its slot until ``timeout``. Scoped parent and descendant
+        packets renew ``timeout``; synthetic SSE keepalives do not."""
         terminated_locally = False
-        start = time.monotonic()
-        last_event = start
+        started_at = time.monotonic()
+        last_activity_at = started_at
+        last_keepalive_at = started_at
+        last_interrupt_check = started_at
         while True:
-            remaining = timeout - (time.monotonic() - start)
+            now = time.monotonic()
+            if should_interrupt is not None and now - last_interrupt_check >= 1.0:
+                last_interrupt_check = now
+                if should_interrupt():
+                    self.abort(opencode_session_id, directory=directory)
+                    yield PromptResponse.model_validate({"stopReason": "cancelled"})
+                    return
+
+            self._reject_expired_connect_app_permissions(
+                state, now, directory=directory
+            )
+
+            inactivity_remaining = timeout - (now - last_activity_at)
+            absolute_remaining = (
+                absolute_deadline - now
+                if absolute_deadline is not None
+                else float("inf")
+            )
+            remaining = min(inactivity_remaining, absolute_remaining)
             if remaining <= 0:
                 self.abort(opencode_session_id, directory=directory)
-                yield Error.model_validate(
-                    {"code": -1, "message": "Timeout waiting for response"}
-                )
+                if absolute_remaining <= 0:
+                    yield Error.model_validate(
+                        {
+                            "code": TURN_ERROR_CODE_TIMEOUT,
+                            "message": "Turn exceeded maximum duration",
+                        }
+                    )
+                else:
+                    yield ActivityTimeoutError(message="Timeout waiting for activity")
                 return
 
             try:
                 raw = sub.queue.get(timeout=min(remaining, 1.0))
             except queue.Empty:
-                idle = time.monotonic() - last_event
-                if idle >= SSE_KEEPALIVE_INTERVAL:
+                now = time.monotonic()
+                if now - last_keepalive_at >= SSE_KEEPALIVE_INTERVAL:
                     yield SSEKeepalive()
-                    last_event = time.monotonic()
+                    last_keepalive_at = now
                 continue
-
-            last_event = time.monotonic()
 
             if raw is BUS_CLOSED_SENTINEL:
                 if not terminated_locally:
                     yield Error.model_validate(
                         {
-                            "code": -3,
+                            "code": TURN_ERROR_CODE_TRANSPORT,
                             "message": "event bus closed before terminator",
                         }
                     )
@@ -1071,13 +1722,24 @@ class OpencodeServeClient:
             if raw.get("type") == "server.connected":
                 continue
 
-            for acp_event in translate_opencode_event(raw, state, fetch_message):
-                if isinstance(acp_event, PromptResponse):
+            last_activity_at = time.monotonic()
+
+            for sandbox_event in translate_opencode_event(
+                raw,
+                state,
+                fetch_message,
+                parent_resolver=parent_resolver,
+                children_resolver=children_resolver,
+                fetch_message_by_session=lambda session_id, message_id: (
+                    self.get_message(session_id, message_id, directory=directory)
+                ),
+            ):
+                if isinstance(sandbox_event, (Error, PromptResponse)):
                     terminated_locally = True
-                yield acp_event
+                yield sandbox_event
 
             if raw.get("type") == "permission.asked":
-                self._handle_permission_ask(raw, state.session_id, directory=directory)
+                self._handle_permission_ask(raw, state, directory=directory)
 
             if terminated_locally:
                 return
@@ -1091,6 +1753,7 @@ class OpencodeServeClient:
         model_provider: str | None,
         model_id: str | None,
         *,
+        attachments: list[PromptAttachment] | None = None,
         directory: str,
     ) -> None:
         """POST /session/.../prompt_async.
@@ -1100,25 +1763,36 @@ class OpencodeServeClient:
         ``model`` and opencode falls back to the session's default
         (written by ``setup_session_workspace`` into ``opencode.json``).
         """
-        body: dict[str, Any] = {"parts": [{"type": "text", "text": message}]}
+        parts: list[dict[str, str]] = [{"type": "text", "text": message}]
+        parts.extend(
+            {
+                "type": "file",
+                "mime": attachment.mime_type,
+                "filename": attachment.name,
+                "url": (PurePosixPath(directory) / attachment.path).as_uri(),  # ty: ignore[deprecated]
+            }
+            for attachment in attachments or []
+        )
+        body: dict[str, Any] = {"parts": parts}
         if model_provider and model_id:
             body["model"] = {"providerID": model_provider, "modelID": model_id}
-        r = self._http.post(
+        # idempotent=False: only the 401 reload retries this POST.
+        r = self._request(
+            "POST",
             f"/session/{opencode_session_id}/prompt_async",
             params={"directory": directory},
             json=body,
+            idempotent=False,
         )
         _raise_for_status(r, "prompt_async")
 
     def _handle_permission_ask(
-        self, evt: dict[str, Any], session_id: str, *, directory: str
+        self, evt: dict[str, Any], state: _TurnState, *, directory: str
     ) -> None:
-        """Auto-allow + telemetry per §Decisions #1.
-
-        Production ``opencode.json`` should already cover every permission
-        category we use. Reaching this path means opencode added a new
-        category we haven't configured — auto-allow keeps the turn moving
-        and the WARN log lets us notice.
+        """Answer opencode's ``permission.asked``. ``connect_app`` defers to the
+        connect-card flow; every other category is auto-allowed (production
+        ``opencode.json`` covers them — an unexpected one is a config gap, so
+        WARN + allow).
         """
         props = evt.get("properties") or {}
         perm_id = props.get("id")
@@ -1129,25 +1803,157 @@ class OpencodeServeClient:
                 "opencode-serve: permission.asked without id; cannot respond"
             )
             return
+
+        if perm_type == _CONNECT_APP_PERMISSION:
+            self._handle_connect_app_permission(
+                evt, state, perm_id, directory=directory
+            )
+            return
+
         logger.warning(
             "opencode-serve: auto-allowing unexpected permission.asked "
             "(type=%s patterns=%s session=%s id=%s) — update opencode.json",
             perm_type,
             patterns,
-            session_id,
+            state.session_id,
             perm_id,
         )
+        self.answer_permission(
+            state.session_id, perm_id, allow=True, directory=directory
+        )
+
+    def answer_permission(
+        self, session_id: str, perm_id: str, *, allow: bool, directory: str
+    ) -> bool:
+        """Resolve a pending opencode permission: ``allow`` (``once``) runs the
+        tool, deny (``reject``) surfaces the rejection to the agent. Returns
+        whether opencode accepted the answer; answering an already-resolved
+        permission is a no-op on opencode's side."""
+        response = "once" if allow else "reject"
         try:
-            self._http.post(
+            r = self._http.post(
                 f"/session/{session_id}/permissions/{perm_id}",
                 params={"directory": directory},
-                json={"response": "once"},
+                json={"response": response},
             )
         except httpx.HTTPError as e:
             logger.warning(
-                "opencode-serve: permission auto-allow failed for %s: %s",
+                "opencode-serve: permission %s (%s) failed for %s: %s",
+                "allow" if allow else "deny",
+                response,
                 perm_id,
                 e,
+            )
+            return False
+        if not r.is_success:
+            logger.warning(
+                "opencode-serve: permission %s (%s) for %s -> HTTP %s",
+                "allow" if allow else "deny",
+                response,
+                perm_id,
+                r.status_code,
+            )
+            return False
+        return True
+
+    def _handle_connect_app_permission(
+        self, evt: dict[str, Any], state: _TurnState, perm_id: str, *, directory: str
+    ) -> None:
+        """Announce the card and stash the answer context, then return — the
+        decision endpoint answers opencode out-of-band (see :mod:`connect_app`).
+        Doesn't block; the consume loop's timeout fallback rejects if the user
+        never decides. The app ID comes from the tool's ``context.ask`` metadata.
+        """
+        props = evt.get("properties") or {}
+        meta_raw = props.get("metadata")
+        meta = meta_raw if isinstance(meta_raw, dict) else {}
+        raw_external_app_id = meta.get("external_app_id")
+        if raw_external_app_id is None:
+            logger.warning(
+                "connect_app permission is missing app metadata "
+                "(meta=%s perm_id=%s); denying",
+                meta,
+                perm_id,
+            )
+            self.answer_permission(
+                state.session_id, perm_id, allow=False, directory=directory
+            )
+            return
+
+        try:
+            external_app_id = int(raw_external_app_id)
+        except (TypeError, ValueError):
+            logger.warning(
+                "connect_app permission has invalid app metadata "
+                "(meta=%s perm_id=%s); "
+                "denying",
+                meta,
+                perm_id,
+            )
+            self.answer_permission(
+                state.session_id, perm_id, allow=False, directory=directory
+            )
+            return
+
+        build_session_id = directory.rstrip("/").rsplit("/", 1)[-1]
+        request_id = str(uuid4())
+        deadline = time.monotonic() + SANDBOX_APPROVAL_WAIT_TIMEOUT_SECONDS
+        cache: CacheBackend | None = None
+        try:
+            request = connect_app.ConnectAppRequest(
+                request_id=request_id,
+                external_app_id=external_app_id,
+                reason=meta.get("reason") or None,
+            )
+            cache = get_cache_backend(tenant_id=get_current_tenant_id())
+            connect_app.stash_pending(
+                request_id,
+                connect_app.ConnectAppPending(
+                    build_session_id=build_session_id,
+                    opencode_session_id=state.session_id,
+                    perm_id=perm_id,
+                    directory=directory,
+                    request=request,
+                    expires_at=time.time() + SANDBOX_APPROVAL_WAIT_TIMEOUT_SECONDS,
+                ),
+                cache,
+            )
+            state.connect_app_request_ids.add(request_id)
+            connect_app.announce_request(
+                build_session_id,
+                request,
+                cache,
+            )
+        except Exception:
+            logger.exception(
+                "connect_app announce failed for app=%s; denying", external_app_id
+            )
+            if cache is not None:
+                try:
+                    connect_app.clear_pending(request_id, cache)
+                except Exception:
+                    logger.exception("connect_app cleanup failed for %s", request_id)
+            self.answer_permission(
+                state.session_id, perm_id, allow=False, directory=directory
+            )
+            return
+
+        state.pending_connect_app_deadlines[perm_id] = deadline
+
+    def _reject_expired_connect_app_permissions(
+        self, state: _TurnState, now: float, *, directory: str
+    ) -> None:
+        """Timeout fallback: reject connect_app permissions the user never
+        answered, so the agent gets a clean decline instead of a hung turn."""
+        expired = [
+            perm_id
+            for perm_id, deadline in state.pending_connect_app_deadlines.items()
+            if deadline <= now
+        ]
+        for perm_id in expired:
+            del state.pending_connect_app_deadlines[perm_id]
+            self.answer_permission(
+                state.session_id, perm_id, allow=False, directory=directory
             )
 
 

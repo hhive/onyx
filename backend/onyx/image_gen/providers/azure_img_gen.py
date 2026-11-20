@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from typing import Any
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
-from onyx.image_gen.interfaces import ImageGenerationProvider
-from onyx.image_gen.interfaces import ImageGenerationProviderCredentials
-from onyx.image_gen.interfaces import ReferenceImage
+from onyx.image_gen.exceptions import ImageProviderCredentialsError
+from onyx.image_gen.interfaces import (
+    ImageGenerationProvider,
+    ImageGenerationProviderCredentials,
+    ReferenceImage,
+)
 from onyx.tracing.flows import LLMFlow
 from onyx.tracing.llm_utils import traced_llm_call
 
@@ -47,9 +49,18 @@ class AzureImageGenerationProvider(ImageGenerationProvider):
         cls,
         credentials: ImageGenerationProviderCredentials,
     ) -> AzureImageGenerationProvider:
-        assert credentials.api_key
-        assert credentials.api_base
-        assert credentials.api_version
+        if not credentials.api_key:
+            raise ImageProviderCredentialsError(
+                "Azure image generation needs an API key"
+            )
+        if not credentials.api_base:
+            raise ImageProviderCredentialsError(
+                "Azure image generation needs an API base"
+            )
+        if not credentials.api_version:
+            raise ImageProviderCredentialsError(
+                "Azure image generation needs an API version"
+            )
 
         return cls(
             api_key=credentials.api_key,
@@ -111,6 +122,7 @@ class AzureImageGenerationProvider(ImageGenerationProvider):
                 flow=LLMFlow.IMAGE_EDIT,
                 model=deployment,
                 provider="azure",
+                image_count=n,
                 input_messages=[{"role": "user", "content": prompt}],
             ):
                 return image_edit(
@@ -132,6 +144,7 @@ class AzureImageGenerationProvider(ImageGenerationProvider):
             flow=LLMFlow.IMAGE_GENERATION,
             model=deployment,
             provider="azure",
+            image_count=n,
             input_messages=[{"role": "user", "content": prompt}],
         ):
             return image_generation(

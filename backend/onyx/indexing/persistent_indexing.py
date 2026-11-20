@@ -10,10 +10,12 @@ ConnectorFailure objects with proper context for known error conditions.
 import sentry_sdk
 
 from onyx.configs.constants import DocumentSource
-from onyx.connectors.models import ConnectorFailure
-from onyx.connectors.models import Document
-from onyx.connectors.models import DocumentFailure
-from onyx.connectors.models import EntityFailure
+from onyx.connectors.models import (
+    ConnectorFailure,
+    Document,
+    DocumentFailure,
+    EntityFailure,
+)
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.index_attempt import create_index_attempt_error
 from onyx.utils.logger import setup_logger
@@ -52,7 +54,8 @@ def build_generic_connector_failure(
             exception=exc if isinstance(exc, Exception) else None,
         )
 
-    assert entity_id is not None  # linter
+    if entity_id is None:
+        raise RuntimeError("entity_id is missing.")
     return ConnectorFailure(
         failed_entity=EntityFailure(entity_id=entity_id),
         failure_message=str(exc),

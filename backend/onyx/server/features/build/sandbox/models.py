@@ -1,26 +1,75 @@
 """Pydantic models for sandbox module communication."""
 
 from datetime import datetime
-from typing import TypeAlias
+from enum import Enum
+from typing import Literal, TypeAlias
 from uuid import UUID
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from onyx.db.enums import SandboxStatus
+from onyx.server.features.build.sandbox.image.sandbox_daemon.models import (
+    FilesystemEntry,
+)
+from onyx.server.gateway.models import GatewayModelDescriptor
 
 FileSet: TypeAlias = dict[str, bytes]
 
 
-class LLMProviderConfig(BaseModel):
-    """LLM provider configuration for sandbox provisioning.
+class SandboxResourceKind(str, Enum):
+    POD = "pod"
+    SERVICE = "service"
+    SECRET = "secret"
+    CONTAINER = "container"
+    VOLUME = "volume"
 
-    Passed to SandboxManager.provision() to configure the LLM.
-    """
 
+class SandboxResource(BaseModel):
+    """Observed resource identity. Never derive a deletion target from a UUID prefix."""
+
+    model_config = ConfigDict(frozen=True)
+
+    kind: SandboxResourceKind
+    name: str
+    instance_id: str
+    sandbox_id: UUID
+    tenant_id: str
+    created_at: datetime
+    provisioning_attempt_number: int | None = None
+    legacy_ownership: bool = False
+
+
+class PromptAttachment(BaseModel):
+    """A session-relative file to include in an OpenCode prompt."""
+
+    model_config = ConfigDict(frozen=True)
+
+    name: str
+    path: str
+    mime_type: str
+
+
+class CraftLLMProviderConfig(BaseModel):
     provider: str
     model_name: str
     api_key: str | None
     api_base: str | None
+    display_name: str | None = None
+    models: list[GatewayModelDescriptor] | None = None
+
+
+class CraftMCPServerConfig(BaseModel):
+    """An MCP integration resolved for opencode `mcp` emission (URL only; the
+    proxy injects credentials). ``key`` is the opencode server id.
+
+    ``integration_id`` is not emitted into ``opencode.json``; it feeds the
+    per-session runtime hash so a hot reload fires when the server set or tools
+    change."""
+
+    key: str
+    url: str
+    disabled_tools: tuple[str, ...] = ()
+    integration_id: int
 
 
 class SandboxInfo(BaseModel):
@@ -46,31 +95,17 @@ class SnapshotResult(BaseModel):
     size_bytes: int
 
 
-class SnapshotInfo(BaseModel):
-    """Full information about a sandbox snapshot (including DB info).
+class SandboxCleanupCheckpoint(BaseModel):
+    model_config = ConfigDict(frozen=True)
 
-    Used when returning snapshot information to API callers.
-    """
-
-    id: str
-    sandbox_id: str
-    storage_path: str
-    created_at: datetime
-    size_bytes: int
+    provisioning_attempt_number: int
+    storage_identity: str
+    last_heartbeat: datetime | None
 
 
-class FilesystemEntry(BaseModel):
-    """Represents a file or directory entry in the sandbox filesystem.
-
-    Used for directory listing operations. This is the canonical model used
-    by both sandbox managers and the API layer.
-    """
-
-    name: str
-    path: str
-    is_directory: bool
-    size: int | None = None  # File size in bytes (None for directories)
-    mime_type: str | None = None  # MIME type (None for directories)
+class DirectoryListing(BaseModel):
+    path: str  # Current directory path
+    entries: list[FilesystemEntry]  # Contents
 
 
 class PushFailure(BaseModel):
@@ -91,3 +126,92 @@ class RetriableWriteError(Exception):
 
 class FatalWriteError(Exception):
     """Permanent failure in write_files_to_sandbox (validation, auth)."""
+
+
+class SandboxProvisionContentionError(Exception):
+    """Another provisioner holds this sandbox's provisioning lock. Retryable:
+    the lifecycle layer records the attempt FAILED and the caller re-reserves."""
+
+
+# Harness sandboxes (harness_base.HarnessSandbox).
+
+
+class HarnessSandboxRef(BaseModel):
+    """The sandbox of one user, seen from one chat session."""
+
+    model_config = ConfigDict(frozen=True)
+
+    tenant_id: str
+    sandbox_id: UUID
+    session_id: UUID
+
+
+SandboxFileType = Literal["file", "directory", "other"]
+
+
+# Why a path names nothing, other than a missing file.
+SandboxPathFault = Literal["escapes", "loop", "other"]
+
+
+class SandboxPathInfo(BaseModel):
+    """What the guest kernel reports for a session path: the entry itself,
+    and what it names through the links inside the session directory."""
+
+    model_config = ConfigDict(frozen=True)
+
+    # The entry itself exists, a broken link included.
+    exists: bool
+    is_link: bool
+    # A link's stored target, as text.
+    link_target: str | None
+    # What the path names through its links; None when it names nothing
+    # (missing or a broken link) or with `error`.
+    type: SandboxFileType | None
+    # Permission bits (mode & 0o777) of what the path names.
+    mode: int | None
+    # Equal for two paths that name one file.
+    identity: tuple[int, int] | None
+    # Why the path names nothing, other than a missing file: a link leads
+    # out of the session directory, the links loop, or another error.
+    error: SandboxPathFault | None
+
+
+class ExecOutputDelta(BaseModel):
+    """New output of a command (stdout and stderr in arrival order)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    text: str
+
+
+# How a command ended.
+ExecCompletionName = Literal["exited", "signaled", "canceled", "deadline_exceeded"]
+
+
+class ExecCommandResult(BaseModel):
+    """The last event of `exec_command` and `write_stdin`."""
+
+    model_config = ConfigDict(frozen=True)
+
+    # Output of this call, cut to max_output_tokens (head and tail).
+    output: str
+    # Set while the command runs: pass it to write_stdin.
+    session_id: str | None
+    # Set when the command exited. None while it runs, or when a signal,
+    # an interrupt or its deadline ended it.
+    exit_code: int | None
+    # Set after the end. None while the command runs, or when the daemon
+    # reported no kind of end.
+    completion: ExecCompletionName | None
+    wall_time_seconds: float
+    # Estimated tokens of the output before the token cut.
+    original_token_count: int
+    # True when the byte or token cap removed output.
+    truncated: bool
+
+    @property
+    def running(self) -> bool:
+        return self.session_id is not None
+
+
+ExecEvent: TypeAlias = ExecOutputDelta | ExecCommandResult

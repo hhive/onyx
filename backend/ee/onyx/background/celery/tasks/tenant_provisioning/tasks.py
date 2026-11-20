@@ -6,25 +6,28 @@ import asyncio
 import datetime
 import uuid
 
-from celery import shared_task
-from celery import Task
+from celery import Task, shared_task
 from redis.lock import Lock as RedisLock
 
-from ee.onyx.server.tenants.provisioning import setup_tenant
-from ee.onyx.server.tenants.schema_management import create_schema_if_not_exists
-from ee.onyx.server.tenants.schema_management import get_current_alembic_version
-from ee.onyx.server.tenants.schema_management import run_alembic_migrations
+from ee.onyx.db.tenant_provisioning import (
+    count_available_tenants,
+    create_available_tenant__no_commit,
+    get_available_tenant_by_id,
+    get_available_tenants,
+)
 from onyx.background.celery.apps.app_base import task_logger
 from onyx.configs.app_configs import TARGET_AVAILABLE_TENANTS
-from onyx.configs.constants import ONYX_CLOUD_TENANT_ID
-from onyx.configs.constants import OnyxCeleryQueues
-from onyx.configs.constants import OnyxCeleryTask
-from onyx.configs.constants import OnyxRedisLocks
+from onyx.configs.constants import (
+    ONYX_CLOUD_TENANT_ID,
+    OnyxCeleryQueues,
+    OnyxCeleryTask,
+    OnyxRedisLocks,
+)
+from onyx.db.engine.shard_routing import get_shard_for_new_tenant
 from onyx.db.engine.sql_engine import get_session_with_shared_schema
-from onyx.db.models import AvailableTenant
+from onyx.db.tenant_shard import record_tenant_placement
 from onyx.redis.redis_pool import get_redis_client
-from shared_configs.configs import MULTI_TENANT
-from shared_configs.configs import TENANT_ID_PREFIX
+from shared_configs.configs import MULTI_TENANT, TENANT_ID_PREFIX
 
 # Maximum tenants to provision in a single task run.
 # Each tenant takes ~80s (alembic migrations), so 15 tenants ≈ 20 minutes.
@@ -36,7 +39,7 @@ _TENANT_PROVISIONING_SOFT_TIME_LIMIT = 60 * 40  # 40 minutes
 _TENANT_PROVISIONING_TIME_LIMIT = 60 * 45  # 45 minutes
 
 
-@shared_task(
+@shared_task(  # ty: ignore[invalid-argument-type]
     name=OnyxCeleryTask.CLOUD_CHECK_AVAILABLE_TENANTS,
     queue=OnyxCeleryQueues.MONITORING,
     ignore_result=True,
@@ -73,7 +76,7 @@ def check_available_tenants(self: Task) -> None:  # noqa: ARG001
     try:
         # Get the current count of available tenants
         with get_session_with_shared_schema() as db_session:
-            num_available_tenants = db_session.query(AvailableTenant).count()
+            num_available_tenants = count_available_tenants(db_session)
 
         # Get the target number of available tenants
         num_minimum_available_tenants = TARGET_AVAILABLE_TENANTS
@@ -131,8 +134,13 @@ def _migrate_stale_pool_tenants() -> None:
     tenants are always current so that signup doesn't hit schema mismatches
     (e.g. missing columns added after the tenant was pre-provisioned).
     """
+    from ee.onyx.server.tenants.schema_management import (
+        get_current_alembic_version,
+        run_alembic_migrations,
+    )
+
     with get_session_with_shared_schema() as db_session:
-        pool_tenants = db_session.query(AvailableTenant).all()
+        pool_tenants = get_available_tenants(db_session)
         tenant_ids = [t.tenant_id for t in pool_tenants]
 
     if not tenant_ids:
@@ -147,11 +155,7 @@ def _migrate_stale_pool_tenants() -> None:
             run_alembic_migrations(tenant_id)
             new_version = get_current_alembic_version(tenant_id)
             with get_session_with_shared_schema() as db_session:
-                tenant = (
-                    db_session.query(AvailableTenant)
-                    .filter_by(tenant_id=tenant_id)
-                    .first()
-                )
+                tenant = get_available_tenant_by_id(db_session, tenant_id)
                 if tenant and tenant.alembic_version != new_version:
                     task_logger.info(
                         f"Migrated pool tenant {tenant_id}: {tenant.alembic_version} -> {new_version}"
@@ -174,6 +178,13 @@ def pre_provision_tenant() -> bool:
     """
     # The MULTI_TENANT check is now done at the caller level (check_available_tenants)
     # rather than inside this function
+    # Imported here: provisioning reaches every tool implementation (~75 MB) and
+    # only multi-tenant deployments run this.
+    from ee.onyx.server.tenants.provisioning import setup_tenant
+    from ee.onyx.server.tenants.schema_management import (
+        create_schema_if_not_exists,
+        get_current_alembic_version,
+    )
 
     r = get_redis_client(tenant_id=ONYX_CLOUD_TENANT_ID)
     lock_provision: RedisLock = r.lock(
@@ -192,7 +203,11 @@ def pre_provision_tenant() -> bool:
     try:
         # Generate a new tenant ID
         tenant_id = TENANT_ID_PREFIX + str(uuid.uuid4())
-        task_logger.info(f"Pre-provisioning tenant: {tenant_id}")
+        shard_name = get_shard_for_new_tenant()
+        task_logger.info(f"Pre-provisioning tenant {tenant_id} on shard {shard_name}")
+
+        # Before schema creation: every step below routes via the catalog.
+        record_tenant_placement(tenant_id, shard_name)
 
         # Create the schema for the new tenant
         schema_created = create_schema_if_not_exists(tenant_id)
@@ -218,12 +233,13 @@ def pre_provision_tenant() -> bool:
             # Use a transaction to ensure atomicity
             db_session.begin()
             try:
-                new_tenant = AvailableTenant(
+                create_available_tenant__no_commit(
+                    db_session,
                     tenant_id=tenant_id,
                     alembic_version=alembic_version,
                     date_created=datetime.datetime.now(),
+                    shard_name=shard_name,
                 )
-                db_session.add(new_tenant)
                 db_session.commit()
                 task_logger.info(f"Successfully pre-provisioned tenant: {tenant_id}")
                 return True

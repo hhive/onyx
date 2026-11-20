@@ -1,21 +1,16 @@
 import time
-from datetime import datetime
-from datetime import timedelta
+from datetime import datetime, timedelta
 from urllib.parse import urlencode
 
 from onyx.background.indexing.models import IndexAttemptErrorPydantic
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.enums import IndexModelStatus
-from onyx.db.models import IndexAttempt
-from onyx.db.models import IndexingStatus
+from onyx.db.models import IndexAttempt, IndexingStatus
 from onyx.db.search_settings import get_current_search_settings
-from onyx.server.documents.models import IndexAttemptSnapshot
-from onyx.server.documents.models import PaginatedReturn
-from tests.integration.common_utils.constants import API_SERVER_URL
-from tests.integration.common_utils.constants import MAX_DELAY
+from onyx.server.documents.models import IndexAttemptSnapshot, PaginatedReturn
+from tests.integration.common_utils.constants import API_SERVER_URL, MAX_DELAY
 from tests.integration.common_utils.http_client import client
-from tests.integration.common_utils.test_models import DATestIndexAttempt
-from tests.integration.common_utils.test_models import DATestUser
+from tests.integration.common_utils.test_models import DATestIndexAttempt, DATestUser
 
 
 class IndexAttemptManager:
@@ -209,6 +204,62 @@ class IndexAttemptManager:
                 f"Waiting for IndexAttempt {index_attempt_id} to complete. elapsed={elapsed:.2f} timeout={timeout}"
             )
             time.sleep(5)
+
+    @staticmethod
+    def get_all_index_attempts(
+        cc_pair_id: int,
+        user_performing_action: DATestUser,
+    ) -> list[IndexAttemptSnapshot]:
+        attempts: list[IndexAttemptSnapshot] = []
+        page: int = 0
+        while True:
+            result = IndexAttemptManager.get_index_attempt_page(
+                cc_pair_id=cc_pair_id,
+                page=page,
+                page_size=1000,
+                user_performing_action=user_performing_action,
+            )
+            attempts.extend(result.items)
+            if not result.items or len(attempts) >= result.total_items:
+                return attempts
+            page += 1
+
+    @staticmethod
+    def wait_for_no_unfinished_attempts(
+        cc_pair_id: int,
+        user_performing_action: DATestUser,
+        timeout: float = MAX_DELAY,
+    ) -> list[IndexAttemptSnapshot]:
+        """Wait until every IndexAttempt of the cc_pair is terminal. Run-once
+        skips a cc_pair with an unfinished attempt, so call this first.
+        Returns all attempts of the cc_pair.
+
+        After a pause commits, no attempt is created for the cc_pair: the
+        pause and attempt creation both take the cc_pair row lock."""
+        start = time.monotonic()
+        while True:
+            attempts = IndexAttemptManager.get_all_index_attempts(
+                cc_pair_id=cc_pair_id,
+                user_performing_action=user_performing_action,
+            )
+            unfinished: list[int] = [
+                attempt.id
+                for attempt in attempts
+                if not (attempt.status and attempt.status.is_terminal())
+            ]
+            if not unfinished:
+                return attempts
+
+            elapsed = time.monotonic() - start
+            if elapsed > timeout:
+                raise TimeoutError(
+                    f"IndexAttempts {unfinished} for CC Pair {cc_pair_id} did not finish within {timeout} seconds"
+                )
+
+            print(
+                f"Waiting for IndexAttempts {unfinished} to finish. elapsed={elapsed:.2f} timeout={timeout}"
+            )
+            time.sleep(2)
 
     @staticmethod
     def get_index_attempt_errors_for_cc_pair(

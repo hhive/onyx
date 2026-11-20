@@ -1,19 +1,19 @@
 "use client";
 
+import { Section } from "@opal/layouts";
+import { IconLoader } from "@opal/loaders";
 import React, { useRef, useState, useEffect, useMemo } from "react";
-import InputTypeIn from "@/refresh-components/inputs/InputTypeIn";
-import { ProjectFile } from "@/providers/ProjectsContext";
-import { formatRelativeTime } from "@/app/app/components/projects/project_utils";
-import Text from "@/refresh-components/texts/Text";
+import { InputTypeIn } from "@opal/components";
+import { ProjectFile } from "@/lib/projects/providers";
 import type { IconProps } from "@opal/types";
 import { getFileExtension, isImageExtension } from "@/lib/utils";
-import { UserFileStatus } from "@/app/app/projects/projectsService";
-import SimpleLoader from "@/refresh-components/loaders/SimpleLoader";
-import AttachmentButton from "@/refresh-components/buttons/AttachmentButton";
-import Modal from "@/refresh-components/Modal";
-import { useModal } from "@/refresh-components/contexts/ModalContext";
+import { UserFileStatus } from "@/lib/projects/types";
+import { isFilePending } from "@/lib/projects/utils";
+import { Modal } from "@opal/components";
+import { useModal } from "@opal/components";
 import TextSeparator from "@/refresh-components/TextSeparator";
 import {
+  SvgExternalLink,
   SvgEye,
   SvgFiles,
   SvgFileText,
@@ -22,27 +22,39 @@ import {
   SvgTrash,
   SvgXCircle,
 } from "@opal/icons";
-import { Section } from "@/layouts/general-layouts";
+import { Hoverable } from "@opal/core";
+import { AttachmentItemButton, Text } from "@opal/components";
 import useFilter from "@/hooks/useFilter";
 import { Button } from "@opal/components";
 import ScrollIndicatorDiv from "@/refresh-components/ScrollIndicatorDiv";
+import { timeAgo } from "@opal/time";
+import { useLocale, useTranslations } from "next-intl";
 
 function getIcon(
   file: ProjectFile,
   isProcessing: boolean
 ): React.FunctionComponent<IconProps> {
-  if (isProcessing) return SimpleLoader;
+  if (isProcessing) return IconLoader;
   const ext = getFileExtension(file.name).toLowerCase();
   if (isImageExtension(ext)) return SvgImage;
   return SvgFileText;
 }
 
-function getDescription(file: ProjectFile): string {
+// Translated labels for the in-progress statuses; the rest fall back to the
+// file's own extension or raw status, which are data rather than copy.
+interface FileStatusLabels {
+  processing: string;
+  uploading: string;
+  deleting: string;
+}
+
+function getDescription(file: ProjectFile, labels: FileStatusLabels): string {
   const s = String(file.status || "");
   const typeLabel = getFileExtension(file.name);
-  if (s === UserFileStatus.PROCESSING) return "处理中...";
-  if (s === UserFileStatus.UPLOADING) return "上传中...";
-  if (s === UserFileStatus.DELETING) return "删除中...";
+  if (s === UserFileStatus.PROCESSING || s === UserFileStatus.INDEXING)
+    return labels.processing;
+  if (s === UserFileStatus.UPLOADING) return labels.uploading;
+  if (s === UserFileStatus.DELETING) return labels.deleting;
   if (s === UserFileStatus.COMPLETED) return typeLabel;
   return file.status ?? typeLabel;
 }
@@ -62,31 +74,65 @@ function FileAttachment({
   onView,
   onDelete,
 }: FileAttachmentProps) {
+  const t = useTranslations("chat.modals.userFiles");
+  const locale = useLocale();
   const isProcessing =
-    String(file.status) === UserFileStatus.PROCESSING ||
-    String(file.status) === UserFileStatus.UPLOADING ||
-    String(file.status) === UserFileStatus.DELETING;
+    isFilePending(file.status) || file.status === UserFileStatus.DELETING;
 
   const Icon = getIcon(file, isProcessing);
-  const description = getDescription(file);
+  const description = getDescription(file, {
+    processing: t("fileStatus.processing.label"),
+    uploading: t("fileStatus.uploading.label"),
+    deleting: t("fileStatus.deleting.label"),
+  });
   const rightText = file.last_accessed_at
-    ? formatRelativeTime(file.last_accessed_at)
+    ? (timeAgo(file.last_accessed_at, locale) ?? "")
     : "";
 
   return (
-    <AttachmentButton
-      onClick={onClick}
-      icon={Icon}
-      description={description}
-      rightText={rightText}
-      selected={isSelected}
-      processing={isProcessing}
-      onView={onView}
-      actionIcon={SvgTrash}
-      onAction={onDelete}
-    >
-      {file.name}
-    </AttachmentButton>
+    <Hoverable.Root group="user-file-row">
+      <AttachmentItemButton
+        prominence="primary"
+        onClick={onClick}
+        icon={Icon}
+        title={file.name}
+        description={description}
+        state={isSelected ? "selected" : undefined}
+        centerChildren={
+          rightText ? (
+            <Section alignItems="end">
+              <Text font="secondary-body" color="text-03" maxLines={1}>
+                {rightText}
+              </Text>
+            </Section>
+          ) : undefined
+        }
+        rightChildren={
+          <Hoverable.Item group="user-file-row">
+            <Section flexDirection="row" gap={0} padding={1.5}>
+              {onView && (
+                <Button
+                  icon={SvgExternalLink}
+                  onClick={onView}
+                  prominence="internal"
+                  size="sm"
+                  tooltip={t("fileRow.viewButton.ariaLabel")}
+                />
+              )}
+              {onDelete && (
+                <Button
+                  icon={SvgTrash}
+                  onClick={onDelete}
+                  prominence="internal"
+                  size="sm"
+                  tooltip={t("fileRow.deleteButton.ariaLabel")}
+                />
+              )}
+            </Section>
+          </Hoverable.Item>
+        }
+      />
+    </Hoverable.Root>
   );
 }
 
@@ -117,6 +163,7 @@ export default function UserFilesModal({
   onPickRecent,
   onUnpickRecent,
 }: UserFilesModalProps) {
+  const t = useTranslations("chat.modals.userFiles");
   const { isOpen, toggle } = useModal();
   const [selectedIds, setSelectedIds] = useState<Set<string>>(
     () => new Set(selectedFileIds || [])
@@ -178,13 +225,13 @@ export default function UserFilesModal({
         >
           <Modal.Header icon={SvgFiles} title={title} description={description}>
             {/* Search bar section */}
-            <Section flexDirection="row" gap={0.5}>
+            <Section flexDirection="row" gap={2}>
               <InputTypeIn
                 ref={searchInputRef}
-                placeholder="搜索文件..."
+                placeholder={t("searchInput.placeholder")}
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
-                leftSearchIcon
+                icon="search"
                 autoComplete="off"
                 tabIndex={0}
                 onFocus={(e) => {
@@ -197,22 +244,22 @@ export default function UserFilesModal({
                   prominence="internal"
                   onClick={triggerUploadPicker}
                 >
-                  添加文件
+                  {t("addFilesButton.label")}
                 </Button>
               )}
             </Section>
           </Modal.Header>
 
           <Modal.Body
-            padding={filtered.length === 0 ? 0.5 : 0}
-            gap={0.5}
+            padding={filtered.length === 0 ? 2 : 0}
+            gap={2}
             alignItems="center"
           >
             {/* File display section */}
             {filtered.length === 0 ? (
-              <Text text03>未找到文件</Text>
+              <Text color="text-03">{t("emptyState.description")}</Text>
             ) : (
-              <ScrollIndicatorDiv className="p-2 gap-2 max-h-[70vh]">
+              <ScrollIndicatorDiv className="p-1 gap-1 max-h-[70vh]">
                 {filtered.map((projectFle) => {
                   const isSelected = selectedIds.has(projectFle.id);
                   return (
@@ -252,8 +299,7 @@ export default function UserFilesModal({
                 {/* File count divider - only show when not searching or filtering */}
                 {!query.trim() && !showOnlySelected && (
                   <TextSeparator
-                    count={recentFiles.length}
-                    text="文件"
+                    text={t("fileCount.label", { count: recentFiles.length })}
                   />
                 )}
               </ScrollIndicatorDiv>
@@ -263,9 +309,9 @@ export default function UserFilesModal({
           <Modal.Footer>
             {/* Left side: file count and controls */}
             {onPickRecent && (
-              <Section flexDirection="row" justifyContent="start" gap={0.5}>
-                <Text as="p" text03>
-                  已选择 {selectedCount} 个文件
+              <Section flexDirection="row" justifyContent="start" gap={2}>
+                <Text as="p" color="text-03">
+                  {t("selectedCount.label", { count: selectedCount })}
                 </Text>
                 <Button
                   icon={SvgEye}
@@ -286,7 +332,7 @@ export default function UserFilesModal({
 
             {/* Right side: Done button */}
             <Button prominence="secondary" onClick={() => toggle(false)}>
-              完成
+              {t("doneButton.label")}
             </Button>
           </Modal.Footer>
         </Modal.Content>

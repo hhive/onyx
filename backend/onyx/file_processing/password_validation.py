@@ -1,8 +1,6 @@
-from collections.abc import Callable
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
-from typing import Any
-from typing import IO
+from typing import IO, Any
 
 from onyx.file_processing.extract_file_text import get_file_ext
 from onyx.utils.logger import setup_logger
@@ -49,18 +47,6 @@ def is_pdf_protected(file: IO[Any]) -> bool:
             return True
 
 
-def is_docx_protected(file: IO[Any]) -> bool:
-    return is_office_file_protected(file)
-
-
-def is_pptx_protected(file: IO[Any]) -> bool:
-    return is_office_file_protected(file)
-
-
-def is_xlsx_protected(file: IO[Any]) -> bool:
-    return is_office_file_protected(file)
-
-
 def is_office_file_protected(file: IO[Any]) -> bool:
     import msoffcrypto
 
@@ -77,9 +63,9 @@ def is_file_password_protected(
 ) -> bool:
     extension_to_function: dict[str, Callable[[IO[Any]], bool]] = {
         ".pdf": is_pdf_protected,
-        ".docx": is_docx_protected,
-        ".pptx": is_pptx_protected,
-        ".xlsx": is_xlsx_protected,
+        ".docx": is_office_file_protected,
+        ".pptx": is_office_file_protected,
+        ".xlsx": is_office_file_protected,
     }
 
     if not extension:

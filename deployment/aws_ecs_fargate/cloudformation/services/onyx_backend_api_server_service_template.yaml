@@ -8,7 +8,7 @@ Parameters:
     Description: "Comma-delimited list of at least two subnet IDs in different Availability Zones"
   VpcID:
     Type: String
-    Default: vpc-098cfa79d637dabff
+    Description: "The ID of the VPC to deploy into"
   ServiceName:
     Type: String
     Default: onyx-backend-api-server
@@ -149,11 +149,6 @@ Resources:
             - Name: MODEL_SERVER_HOST
               Value: !Sub 
                 - "${Environment}-onyx-model-server-inference-service.${ImportedNamespace}"
-                - ImportedNamespace: !ImportValue
-                    Fn::Sub: "${Environment}-onyx-cluster-OnyxNamespaceName"
-            - Name: VESPA_HOST
-              Value: !Sub 
-                - "${Environment}-onyx-vespaengine-service.${ImportedNamespace}"
                 - ImportedNamespace: !ImportValue
                     Fn::Sub: "${Environment}-onyx-cluster-OnyxNamespaceName"
             - Name: POSTGRES_HOST

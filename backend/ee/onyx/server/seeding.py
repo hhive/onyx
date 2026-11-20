@@ -1,28 +1,31 @@
 import json
 import os
 from copy import deepcopy
-from typing import List
-from typing import Optional
+from typing import List, Optional
 
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from ee.onyx.db.standard_answer import create_initial_default_standard_answer_category
-from ee.onyx.server.enterprise_settings.models import AnalyticsScriptUpload
-from ee.onyx.server.enterprise_settings.models import EnterpriseSettings
-from ee.onyx.server.enterprise_settings.models import NavigationItem
-from ee.onyx.server.enterprise_settings.store import store_analytics_script
+from ee.onyx.server.enterprise_settings.models import (
+    AnalyticsScriptUpload,
+    EnterpriseSettings,
+    NavigationItem,
+)
+from ee.onyx.server.enterprise_settings.store import store_analytics_script, upload_logo
 from ee.onyx.server.enterprise_settings.store import store_settings as store_ee_settings
-from ee.onyx.server.enterprise_settings.store import upload_logo
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
-from onyx.db.llm import fetch_existing_llm_provider_by_name_and_type
-from onyx.db.llm import update_default_provider
-from onyx.db.llm import upsert_llm_provider
+from onyx.db.enums import LLMModelFlowType
+from onyx.db.llm import (
+    fetch_existing_llm_provider_by_name_and_type,
+    update_default_model,
+    upsert_llm_provider,
+)
 from onyx.db.models import Tool
 from onyx.db.persona import upsert_persona
+from onyx.db.tools import add_tool__no_commit
 from onyx.server.features.persona.models import PersonaUpsertRequest
-from onyx.server.manage.llm.models import LLMProviderUpsertRequest
-from onyx.server.manage.llm.models import LLMProviderView
+from onyx.server.manage.llm.models import LLMProviderUpsertRequest, LLMProviderView
 from onyx.server.settings.models import Settings
 from onyx.server.settings.store import store_settings as store_base_settings
 from onyx.utils.logger import setup_logger
@@ -95,7 +98,7 @@ def _seed_custom_tools(db_session: Session, tools: List[CustomToolSeed]) -> None
                     in_code_tool_id=tool.in_code_tool_id,
                     user_id=tool.user_id,
                 )
-                db_session.add(db_tool)
+                add_tool__no_commit(db_tool, db_session)
                 logger.debug("Successfully added tool: %s", tool.name)
             except FileNotFoundError:
                 logger.error(
@@ -157,10 +160,11 @@ def _seed_llms(
         if visible_configs
         else default_provider.model_configurations[0]
     )
-    update_default_provider(
+    update_default_model(
         provider_id=default_provider.id,
-        model_name=default_config.name,
+        model=default_config.name,
         db_session=db_session,
+        flow_type=LLMModelFlowType.CHAT,
     )
 
 

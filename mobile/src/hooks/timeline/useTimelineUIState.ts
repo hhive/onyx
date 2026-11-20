@@ -1,0 +1,163 @@
+// Timeline UI state machine + derived show/style booleans. Pure port of web's useTimelineUIState.
+
+import { useMemo } from "react";
+
+import { TransformedStep, TurnGroup } from "@/chat/timeline/transformers";
+
+export enum TimelineUIState {
+  EMPTY = "EMPTY",
+  DISPLAY_CONTENT_ONLY = "DISPLAY_CONTENT_ONLY",
+  STREAMING_SEQUENTIAL = "STREAMING_SEQUENTIAL",
+  STREAMING_PARALLEL = "STREAMING_PARALLEL",
+  STOPPED = "STOPPED",
+  COMPLETED_COLLAPSED = "COMPLETED_COLLAPSED",
+  COMPLETED_EXPANDED = "COMPLETED_EXPANDED",
+}
+
+export interface TimelineUIStateInput {
+  stopPacketSeen: boolean;
+  hasPackets: boolean;
+  hasDisplayContent: boolean;
+  userStopped: boolean;
+  isExpanded: boolean;
+  lastTurnGroup: TurnGroup | undefined;
+  lastStep: TransformedStep | undefined;
+  lastStepSupportsCollapsedStreaming: boolean;
+  lastStepHasCollapsedContent: boolean;
+  lastStepIsResearchAgent: boolean;
+  parallelActiveStepSupportsCollapsedStreaming: boolean;
+  parallelActiveStepHasCollapsedContent: boolean;
+  finalAnswerComing: boolean;
+  // A code mode program runs between tool calls; it is the current activity even when the last
+  // turn group is parallel.
+  codeModeWorking: boolean;
+  // A tool call waits for the user's decision or answers. The wait is the current activity, so a
+  // parallel turn shows the normal header with the waiting text.
+  awaitingUser: boolean;
+}
+
+export interface TimelineUIStateResult {
+  uiState: TimelineUIState;
+  isStreaming: boolean;
+  isCompleted: boolean;
+  isActivelyExecuting: boolean;
+  showCollapsedCompact: boolean;
+  showCollapsedParallel: boolean;
+  showParallelTabs: boolean;
+  showDoneStep: boolean;
+  showStoppedStep: boolean;
+  hasDoneIndicator: boolean;
+  showTintedBackground: boolean;
+  showRoundedBottom: boolean;
+}
+
+export function useTimelineUIState(
+  input: TimelineUIStateInput,
+): TimelineUIStateResult {
+  return useMemo(() => {
+    const {
+      stopPacketSeen,
+      hasPackets,
+      hasDisplayContent,
+      userStopped,
+      isExpanded,
+      lastTurnGroup,
+      lastStep,
+      lastStepSupportsCollapsedStreaming,
+      lastStepHasCollapsedContent,
+      lastStepIsResearchAgent,
+      parallelActiveStepSupportsCollapsedStreaming,
+      parallelActiveStepHasCollapsedContent,
+      finalAnswerComing,
+      codeModeWorking,
+      awaitingUser,
+    } = input;
+
+    // A wait for the user stays the current activity after display content.
+    // A question has no step, so its wait shows as a header alone.
+    const isActivelyExecuting =
+      !stopPacketSeen && (!hasDisplayContent || awaitingUser);
+    let uiState: TimelineUIState;
+    if (
+      !hasPackets &&
+      (!hasDisplayContent || awaitingUser) &&
+      !stopPacketSeen
+    ) {
+      uiState = TimelineUIState.EMPTY;
+    } else if (hasDisplayContent && !hasPackets) {
+      uiState = TimelineUIState.DISPLAY_CONTENT_ONLY;
+    } else if (isActivelyExecuting) {
+      uiState =
+        lastTurnGroup?.isParallel && !codeModeWorking && !awaitingUser
+          ? TimelineUIState.STREAMING_PARALLEL
+          : TimelineUIState.STREAMING_SEQUENTIAL;
+    } else if (userStopped) {
+      uiState = TimelineUIState.STOPPED;
+    } else if (isExpanded) {
+      uiState = TimelineUIState.COMPLETED_EXPANDED;
+    } else {
+      uiState = TimelineUIState.COMPLETED_COLLAPSED;
+    }
+
+    const isStreaming =
+      uiState === TimelineUIState.STREAMING_SEQUENTIAL ||
+      uiState === TimelineUIState.STREAMING_PARALLEL;
+    const isCompleted =
+      uiState === TimelineUIState.COMPLETED_COLLAPSED ||
+      uiState === TimelineUIState.COMPLETED_EXPANDED ||
+      uiState === TimelineUIState.STOPPED;
+
+    const showParallelTabs =
+      uiState === TimelineUIState.STREAMING_PARALLEL &&
+      !isExpanded &&
+      !!lastTurnGroup?.isParallel &&
+      (lastTurnGroup?.steps.length ?? 0) > 0;
+
+    const showCollapsedCompact =
+      uiState === TimelineUIState.STREAMING_SEQUENTIAL &&
+      !isExpanded &&
+      !!lastStep &&
+      !lastTurnGroup?.isParallel &&
+      lastStepSupportsCollapsedStreaming &&
+      lastStepHasCollapsedContent;
+
+    const showCollapsedParallel =
+      showParallelTabs &&
+      !isExpanded &&
+      parallelActiveStepSupportsCollapsedStreaming &&
+      parallelActiveStepHasCollapsedContent;
+
+    const showDoneStep =
+      (stopPacketSeen || finalAnswerComing) &&
+      isExpanded &&
+      (!userStopped || hasDisplayContent);
+
+    const showStoppedStep =
+      stopPacketSeen && isExpanded && userStopped && !hasDisplayContent;
+
+    const hasDoneIndicator =
+      (stopPacketSeen || finalAnswerComing) &&
+      isExpanded &&
+      !userStopped &&
+      !lastStepIsResearchAgent;
+
+    const showTintedBackground = isActivelyExecuting || isExpanded;
+    const showRoundedBottom =
+      !isExpanded && !showCollapsedCompact && !showCollapsedParallel;
+
+    return {
+      uiState,
+      isStreaming,
+      isCompleted,
+      isActivelyExecuting,
+      showCollapsedCompact,
+      showCollapsedParallel,
+      showParallelTabs,
+      showDoneStep,
+      showStoppedStep,
+      hasDoneIndicator,
+      showTintedBackground,
+      showRoundedBottom,
+    };
+  }, [input]);
+}

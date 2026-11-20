@@ -1,8 +1,12 @@
 from typing import Any
+from urllib.parse import urlparse, urlunparse
 
-from onyx.configs.app_configs import ENCRYPTION_KEY_SECRET
-from onyx.configs.constants import MASK_CREDENTIAL_CHAR
-from onyx.configs.constants import MASK_CREDENTIAL_LONG_RE
+from onyx.configs.app_configs import (
+    ENCRYPTION_KEY_SECRET,
+    ENCRYPTION_KEYS_JSON,
+    ENCRYPTION_WRITE_KEY_ID,
+)
+from onyx.configs.constants import MASK_CREDENTIAL_LONG_RE, MASK_CREDENTIAL_SHORT
 from onyx.connectors.google_utils.shared_constants import (
     DB_CREDENTIALS_AUTHENTICATION_METHOD,
 )
@@ -12,22 +16,33 @@ from onyx.utils.variable_functionality import fetch_versioned_implementation
 logger = setup_logger()
 
 
+# The MIT edition stores secrets as plain text and ignores every key setting.
+_ENCRYPTION_CONFIGURED = bool(
+    ENCRYPTION_KEY_SECRET or ENCRYPTION_KEYS_JSON or ENCRYPTION_WRITE_KEY_ID
+)
+
+
 # IMPORTANT DO NOT DELETE, THIS IS USED BY fetch_versioned_implementation
-def _encrypt_string(input_str: str, key: str | None = None) -> bytes:
-    if ENCRYPTION_KEY_SECRET:
+def _encrypt_string(input_str: str) -> bytes:
+    if _ENCRYPTION_CONFIGURED:
         logger.warning("MIT version of Onyx does not support encryption of secrets.")
-    elif key is not None:
-        logger.debug("MIT encrypt called with explicit key — key ignored.")
     return input_str.encode()
 
 
 # IMPORTANT DO NOT DELETE, THIS IS USED BY fetch_versioned_implementation
-def _decrypt_bytes(input_bytes: bytes, key: str | None = None) -> str:
-    if ENCRYPTION_KEY_SECRET:
+def _decrypt_bytes(input_bytes: bytes) -> str:
+    if _ENCRYPTION_CONFIGURED:
         logger.warning("MIT version of Onyx does not support decryption of secrets.")
-    elif key is not None:
-        logger.debug("MIT decrypt called with explicit key — key ignored.")
     return input_bytes.decode()
+
+
+# IMPORTANT DO NOT DELETE, THIS IS USED BY fetch_versioned_implementation
+def _validate_encryption_configuration() -> None:
+    if _ENCRYPTION_CONFIGURED:
+        logger.warning(
+            "ENCRYPTION_KEY_SECRET, ENCRYPTION_KEYS or ENCRYPTION_WRITE_KEY_ID is set, "
+            "but the MIT version of Onyx stores secrets as plain text."
+        )
 
 
 def mask_string(sensitive_str: str) -> str:
@@ -39,9 +54,65 @@ def mask_string(sensitive_str: str) -> str:
     min_masked_chars = 6
 
     if len(sensitive_str) < visible_start + visible_end + min_masked_chars:
-        return "••••••••••••"
+        return MASK_CREDENTIAL_SHORT
 
     return f"{sensitive_str[:visible_start]}...{sensitive_str[-visible_end:]}"
+
+
+# Exact env-var keys whose values are non-sensitive and worth seeing in logs
+_UNMASKED_ENV_KEYS = {
+    "AWS_REGION",
+    "AWS_REGION_NAME",
+    "VERTEX_LOCATION",
+}
+
+# Key suffixes for provider base URLs (e.g. ANTHROPIC_BASE_URL, OLLAMA_API_BASE).
+# Every provider tends to have its own <PROVIDER>_API_BASE / <PROVIDER>_BASE_URL,
+# so match by suffix rather than enumerating each one.
+_UNMASKED_ENV_KEY_SUFFIXES = (
+    "_API_BASE",
+    "_BASE_URL",
+)
+
+
+def _is_unmasked_env_key(key: str) -> bool:
+    upper = key.upper()
+    return upper in _UNMASKED_ENV_KEYS or upper.endswith(_UNMASKED_ENV_KEY_SUFFIXES)
+
+
+def _sanitize_url_for_logging(value: str) -> str:
+    """Return a URL with any embedded userinfo (user:pass@) stripped.
+
+    Falls back to fully masking if credentials are present, so they never reach
+    the logs even when the host itself is safe to show.
+    """
+    parsed = urlparse(value)
+    if parsed.username or parsed.password:
+        return mask_string(value)
+    netloc = parsed.hostname or ""
+    try:
+        port: int | None = parsed.port
+    except ValueError:
+        return mask_string(value)
+    if port is not None:
+        netloc = f"{netloc}:{port}"
+    return urlunparse((parsed.scheme, netloc, parsed.path, parsed.params, "", ""))
+
+
+def mask_env_value_for_logging(key: str, value: str) -> str:
+    """Mask env values, leaving only explicitly-allowlisted keys readable.
+
+    Allowlisted keys (provider base URLs via the _API_BASE / _BASE_URL suffixes,
+    plus a few exact keys like AWS_REGION) are logged so overrides like
+    ANTHROPIC_BASE_URL or OLLAMA_API_BASE are visible; if such a value is a URL we
+    still strip any embedded userinfo defensively. Every other key is masked,
+    regardless of what its value looks like.
+    """
+    if not _is_unmasked_env_key(key):
+        return mask_string(value)
+    if value.lower().startswith(("http://", "https://")):
+        return _sanitize_url_for_logging(value)
+    return value
 
 
 def is_masked_credential(value: str) -> bool:
@@ -51,7 +122,8 @@ def is_masked_credential(value: str) -> bool:
     - Short strings (< 14 chars): "••••••••••••" (U+2022 BULLET)
     - Long strings (>= 14 chars): "abcd...wxyz" (first4 + "..." + last4)
     """
-    return MASK_CREDENTIAL_CHAR in value or bool(MASK_CREDENTIAL_LONG_RE.match(value))
+    # The whole placeholder, not any bullet: a real secret may contain one.
+    return value == MASK_CREDENTIAL_SHORT or bool(MASK_CREDENTIAL_LONG_RE.match(value))
 
 
 def reject_masked_credentials(credentials: dict[str, Any]) -> None:
@@ -95,19 +167,35 @@ MASK_CREDENTIALS_WHITELIST = {
     "wiki_base",
     "cloud_name",
     "cloud_id",
+    # Where an account works (its realm): not secrets, and the add-connector
+    # form compares them with the realm typed above the saved accounts.
+    "github_base_url",
+    "gitlab_url",
+    "bookstack_base_url",
+    "outline_base_url",
+    "gong_base_url",
+    "loopio_subdomain",
+    "zendesk_subdomain",
+    "base_url",
+    "freshdesk_domain",
+    "domain",
+    "highspot_url",
+    "testrail_base_url",
+    # OAuth scope lists are public identifiers, not secrets, and masked list
+    # items cannot round-trip through a chip editor.
+    "scopes",
 }
 
 
 def mask_credential_dict(credential_dict: dict[str, Any]) -> dict[str, Any]:
     masked_creds: dict[str, Any] = {}
     for key, val in credential_dict.items():
-        if isinstance(val, str):
-            # we want to pass the authentication_method field through so the frontend
-            # can disambiguate credentials created by different methods
-            if key in MASK_CREDENTIALS_WHITELIST:
-                masked_creds[key] = val
-            else:
-                masked_creds[key] = mask_string(val)
+        # Whitelisted keys pass through whole (e.g. authentication_method so
+        # the frontend can disambiguate credential kinds) whatever their type.
+        if key in MASK_CREDENTIALS_WHITELIST:
+            masked_creds[key] = val
+        elif isinstance(val, str):
+            masked_creds[key] = mask_string(val)
         elif isinstance(val, dict):
             masked_creds[key] = mask_credential_dict(val)
         elif isinstance(val, list):
@@ -138,15 +226,79 @@ def _mask_list(items: list[Any]) -> list[Any]:
     return masked
 
 
-def encrypt_string_to_bytes(intput_str: str, key: str | None = None) -> bytes:
+def _restore_masked_value(incoming: Any, stored: Any, masked_stored: Any) -> Any:
+    if (
+        isinstance(incoming, dict)
+        and isinstance(stored, dict)
+        and isinstance(masked_stored, dict)
+    ):
+        restored = dict(incoming)
+        for key, value in incoming.items():
+            if key not in stored or key not in masked_stored:
+                continue
+            restored[key] = _restore_masked_value(
+                value, stored[key], masked_stored[key]
+            )
+        return restored
+
+    if (
+        isinstance(incoming, list)
+        and isinstance(stored, list)
+        and isinstance(masked_stored, list)
+    ):
+        restored_list = list(incoming)
+        for index, value in enumerate(incoming):
+            if index >= len(stored) or index >= len(masked_stored):
+                continue
+            restored_list[index] = _restore_masked_value(
+                value,
+                stored[index],
+                masked_stored[index],
+            )
+        return restored_list
+
+    if incoming == masked_stored:
+        return stored
+
+    return incoming
+
+
+def restore_masked_credentials(
+    incoming: dict[str, Any], stored: dict[str, Any]
+) -> dict[str, Any]:
+    """Inverse of ``mask_credential_dict`` for edit round-trips: any incoming
+    value that equals the masked form of the stored value is replaced with the
+    stored value, recursing through nested dicts and lists. Values the caller
+    changed pass through untouched.
+    """
+    restored = _restore_masked_value(
+        incoming,
+        stored,
+        mask_credential_dict(stored),
+    )
+    if not isinstance(restored, dict):
+        return incoming
+    return restored
+
+
+def encrypt_string_to_bytes(input_str: str) -> bytes:
     versioned_encryption_fn = fetch_versioned_implementation(
         "onyx.utils.encryption", "_encrypt_string"
     )
-    return versioned_encryption_fn(intput_str, key=key)
+    return versioned_encryption_fn(input_str)
 
 
-def decrypt_bytes_to_string(intput_bytes: bytes, key: str | None = None) -> str:
+def decrypt_bytes_to_string(input_bytes: bytes) -> str:
     versioned_decryption_fn = fetch_versioned_implementation(
         "onyx.utils.encryption", "_decrypt_bytes"
     )
-    return versioned_decryption_fn(intput_bytes, key=key)
+    return versioned_decryption_fn(input_bytes)
+
+
+def validate_encryption_configuration() -> None:
+    """Called once by every process at startup, after the edition is set, so a
+    process with unusable encryption settings stops before it serves anything."""
+    versioned_validate_fn = fetch_versioned_implementation(
+        "onyx.utils.encryption", "_validate_encryption_configuration"
+    )
+    versioned_validate_fn()

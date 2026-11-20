@@ -1,12 +1,22 @@
-from typing import Any
+from __future__ import annotations
 
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
+
+from sentry_sdk.scrubber import DEFAULT_DENYLIST, EventScrubber
 from sentry_sdk.types import Event
 
 from onyx.utils.logger import setup_logger
 
+if TYPE_CHECKING:
+    from sentry_sdk.integrations import Integration
+
 logger = setup_logger()
 
 _instance_id_resolved = False
+# Set by `init_sentry`. This module ships in the model server image, which has
+# no KV store, so the entry point passes the lookup in.
+_instance_id_resolver: Callable[[], str] | None = None
 
 
 def _add_instance_tags(
@@ -15,8 +25,10 @@ def _add_instance_tags(
 ) -> Event | None:
     """Sentry before_send hook that lazily attaches instance identification tags.
 
-    On the first event, resolves the instance UUID from the KV store (requires DB)
-    and sets it as a global Sentry tag. Subsequent events pick it up automatically.
+    On the first event, resolves the instance UUID with the resolver the entry
+    point gave `init_sentry` (the KV store, which requires DB) and sets it as a
+    global Sentry tag. Subsequent events pick it up automatically. Without a
+    resolver, a single-tenant event gets no tag.
     """
     global _instance_id_resolved
 
@@ -30,10 +42,10 @@ def _add_instance_tags(
 
         if MULTI_TENANT:
             instance_id = "multi-tenant-cloud"
+        elif _instance_id_resolver is not None:
+            instance_id = _instance_id_resolver()
         else:
-            from onyx.utils.telemetry import get_or_generate_uuid
-
-            instance_id = get_or_generate_uuid()
+            return event
 
         sentry_sdk.set_tag("instance_id", instance_id)
 
@@ -46,3 +58,65 @@ def _add_instance_tags(
         logger.debug("Failed to resolve instance_id for Sentry tagging")
 
     return event
+
+
+# Provider API keys ride in litellm's outbound request `headers` dict, which
+# Sentry can capture. Its default denylist only has the underscore `x_api_key`,
+# so the real hyphenated header names slip through — add them here.
+_EXTRA_CREDENTIAL_DENYLIST = [
+    "x-api-key",
+    "api-key",
+    "x-goog-api-key",
+    "proxy-authorization",
+    "anthropic-api-key",
+]
+
+
+def build_event_scrubber() -> EventScrubber:
+    """Recursive credential scrubber shared by every Sentry init.
+
+    ``recursive=True`` so a sensitive key nested under a non-sensitive parent
+    (e.g. ``headers.x-api-key``) is redacted — the default scrubber only
+    inspects top-level keys.
+    """
+    return EventScrubber(
+        denylist=DEFAULT_DENYLIST + _EXTRA_CREDENTIAL_DENYLIST,
+        recursive=True,
+    )
+
+
+def init_sentry(
+    *,
+    traces_sample_rate: float,
+    integrations: list[Integration] | None = None,
+    instance_id_resolver: Callable[[], str] | None = None,
+) -> None:
+    """Initialize Sentry with credential-safe defaults for every entrypoint.
+
+    Routing all inits through here keeps the hardening correct-by-construction:
+    no entrypoint can reintroduce the credential leak. Callers guard on
+    SENTRY_DSN and pass only what differs (sample rate, integrations, and the
+    instance id lookup for a process that has the KV store).
+    """
+    global _instance_id_resolver
+    _instance_id_resolver = instance_id_resolver
+
+    import sentry_sdk
+
+    from onyx import __version__
+    from shared_configs.configs import SENTRY_DSN
+
+    sentry_sdk.init(
+        dsn=SENTRY_DSN,
+        integrations=integrations or [],
+        traces_sample_rate=traces_sample_rate,
+        release=__version__,
+        before_send=_add_instance_tags,
+        # Never capture stack-frame locals: litellm holds the provider key in
+        # the outbound request `headers` dict Sentry would otherwise store.
+        # Also scrub nested credential keys (incl. the hyphenated x-api-key).
+        include_local_variables=False,
+        send_default_pii=False,
+        event_scrubber=build_event_scrubber(),
+    )
+    logger.info("Sentry initialized")

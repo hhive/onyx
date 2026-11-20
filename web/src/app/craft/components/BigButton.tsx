@@ -2,9 +2,15 @@
 
 import { forwardRef, type ButtonHTMLAttributes } from "react";
 import { cn } from "@opal/utils";
-import Text from "@/refresh-components/texts/Text";
+import { Text } from "@opal/components";
+import type { RichStr } from "@opal/types";
 
-export interface BigButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
+export interface BigButtonProps extends Omit<
+  ButtonHTMLAttributes<HTMLButtonElement>,
+  "children"
+> {
+  children: string | RichStr;
+
   // Subvariants
   primary?: boolean;
   secondary?: boolean;
@@ -91,13 +97,15 @@ const BigButton = forwardRef<HTMLButtonElement, BigButtonProps>(
         type="button"
         {...props}
       >
-        <Text
-          mainContentEmphasis
-          className={cn("whitespace-nowrap", getTextOverride())}
-          as="span"
-        >
-          {children}
-        </Text>
+        <span className={getTextOverride()}>
+          <Text
+            font="main-content-emphasis"
+            color="inherit"
+            wordWrap="whitespace-nowrap"
+          >
+            {children}
+          </Text>
+        </span>
       </button>
     );
   }

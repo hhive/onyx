@@ -3,10 +3,12 @@ from uuid import uuid4
 
 from google.oauth2.service_account import Credentials
 
-from onyx.connectors.google_utils.resources import get_drive_service
-from onyx.connectors.google_utils.resources import get_google_docs_service
-from onyx.connectors.google_utils.resources import GoogleDocsService
-from onyx.connectors.google_utils.resources import GoogleDriveService
+from onyx.connectors.google_utils.resources import (
+    GoogleDocsService,
+    GoogleDriveService,
+    GoogleService,
+    get_google_service,
+)
 
 GOOGLE_SCOPES = {
     "google_drive": [
@@ -18,7 +20,8 @@ GOOGLE_SCOPES = {
 
 
 def _create_doc_service(drive_service: GoogleDriveService) -> GoogleDocsService:
-    docs_service = get_google_docs_service(
+    docs_service = get_google_service(
+        GoogleService.DOCS,
         creds=drive_service._http.credentials,
         user_email=drive_service._http.credentials._subject,
     )
@@ -37,7 +40,9 @@ class GoogleDriveManager:
             subject=impersonated_user_email,
         )
 
-        service = get_drive_service(credentials, impersonated_user_email)
+        service = get_google_service(
+            GoogleService.DRIVE, credentials, impersonated_user_email
+        )
 
         # Verify impersonation
         about = (

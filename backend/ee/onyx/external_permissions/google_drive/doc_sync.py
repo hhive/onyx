@@ -1,25 +1,38 @@
-from collections.abc import Generator
-from datetime import datetime
-from datetime import timezone
+from collections.abc import Callable, Generator
+from datetime import datetime, timezone
 
-from ee.onyx.external_permissions.google_drive.models import GoogleDrivePermission
-from ee.onyx.external_permissions.google_drive.models import PermissionType
+from ee.onyx.external_permissions.google_drive.models import (
+    GoogleDrivePermission,
+    PermissionType,
+)
 from ee.onyx.external_permissions.google_drive.permission_retrieval import (
     get_permissions_by_ids,
 )
-from ee.onyx.external_permissions.perm_sync_types import FetchAllDocumentsFunction
-from ee.onyx.external_permissions.perm_sync_types import FetchAllDocumentsIdsFunction
-from onyx.access.models import DocExternalAccess
-from onyx.access.models import ElementExternalAccess
-from onyx.access.models import ExternalAccess
-from onyx.access.models import NodeExternalAccess
-from onyx.access.utils import build_ext_group_name_for_onyx
+from ee.onyx.external_permissions.perm_sync_types import (
+    DocSyncCheckpointer,
+    FetchAllDocumentsFunction,
+    FetchAllDocumentsIdsFunction,
+)
+from ee.onyx.external_permissions.utils import credential_json
+from onyx.access.models import (
+    DocExternalAccess,
+    ElementExternalAccess,
+    ExternalAccess,
+    NodeExternalAccess,
+)
+from onyx.access.utils import build_domain_group_id
 from onyx.configs.constants import DocumentSource
+from onyx.configs.llm_configs import get_image_extraction_and_analysis_enabled
+from onyx.connectors.factory import build_connector_kwargs
 from onyx.connectors.google_drive.connector import GoogleDriveConnector
-from onyx.connectors.google_drive.models import GoogleDriveFileType
-from onyx.connectors.google_utils.resources import GoogleDriveService
+from onyx.connectors.google_drive.source_operations import (
+    GoogleDriveRefreshError,
+    GoogleDriveSourceOperations,
+)
+from onyx.connectors.google_utils.shared_constants import GoogleDriveFileType
 from onyx.connectors.interfaces import GenerateSlimDocumentOutput
 from onyx.connectors.models import HierarchyNode
+from onyx.connectors.source_api_limiter import build_source_api_limiter
 from onyx.db.models import ConnectorCredentialPair
 from onyx.indexing.indexing_heartbeat import IndexingHeartbeatInterface
 from onyx.utils.logger import setup_logger
@@ -27,22 +40,65 @@ from onyx.utils.logger import setup_logger
 logger = setup_logger()
 
 
+def _domain_group_for_permission(
+    permission: GoogleDrivePermission,
+    own_domain: str | None,
+    entity_desc: str,
+) -> str | None:
+    """Map an "everyone at <domain>" permission to its domain group, or None when
+    the share grants searchable access to no one. Link-only shares
+    (allow_file_discovery=False) grant nothing: Google exposes them only to
+    domain users who already hold the link, not to domain-wide search. The Drive
+    group sync populates the domain group with that domain's real Workspace
+    members."""
+    if not permission.domain:
+        logger.warning(
+            "Domain permission without a domain for %s\n %s", entity_desc, permission
+        )
+        return None
+    if permission.allow_file_discovery is False:
+        return None
+    if permission.domain != own_domain:
+        # Cross-workspace share (e.g. shared to a partner company's whole domain).
+        logger.debug(
+            "Domain permission for %s scoped to external domain %s",
+            entity_desc,
+            permission.domain,
+        )
+    return build_domain_group_id(permission.domain)
+
+
 def _get_slim_doc_generator(
     cc_pair: ConnectorCredentialPair,
     google_drive_connector: GoogleDriveConnector,
-    callback: IndexingHeartbeatInterface | None = None,
+    checkpointer: DocSyncCheckpointer,
+    callback: IndexingHeartbeatInterface | None,
 ) -> GenerateSlimDocumentOutput:
-    current_time = datetime.now(timezone.utc)
-    start_time = (
-        cc_pair.last_time_perm_sync.replace(tzinfo=timezone.utc).timestamp()
-        if cc_pair.last_time_perm_sync
-        else 0.0
-    )
+    resume = checkpointer.resume
+    if resume is not None:
+        # Keep the stopped attempt's window so its checkpoint stays valid
+        range_start = resume.poll_range_start
+        range_end = resume.poll_range_end
+        checkpoint = google_drive_connector.validate_checkpoint_json(
+            resume.checkpoint_json
+        )
+    else:
+        range_start = (
+            cc_pair.last_time_perm_sync.replace(tzinfo=timezone.utc)
+            if cc_pair.last_time_perm_sync
+            else None
+        )
+        range_end = datetime.now(timezone.utc)
+        checkpoint = None
 
     return google_drive_connector.retrieve_all_slim_docs_perm_sync(
-        start=start_time,
-        end=current_time.timestamp(),
+        start=range_start.timestamp() if range_start else 0.0,
+        end=range_end.timestamp(),
         callback=callback,
+        checkpoint=checkpoint,
+        on_checkpoint=lambda drive_checkpoint: checkpointer.save(
+            drive_checkpoint, range_start, range_end
+        ),
     )
 
 
@@ -66,20 +122,19 @@ def _merge_permissions_lists(
 def get_external_access_for_raw_gdrive_file(
     file: GoogleDriveFileType,
     company_domain: str,
-    retriever_drive_service: GoogleDriveService | None,
-    admin_drive_service: GoogleDriveService,
+    ops: GoogleDriveSourceOperations,
+    retriever_email: str | None,
+    admin_email: str,
     fallback_user_email: str,
-    add_prefix: bool = False,
+    fallback_retriever_email: str | None = None,
 ) -> ExternalAccess:
     """
     Get the external access for a raw Google Drive file.
 
-    Assumes the file we retrieved has EITHER `permissions` or `permission_ids`
+    Assumes the file we retrieved has EITHER `permissions` or `permission_ids`.
+    Permissions listed by id are read as `retriever_email`, then as
+    `fallback_retriever_email`, then as `admin_email`, until all are found.
 
-    add_prefix: When this method is called during the initial indexing via the connector,
-                set add_prefix to True so group IDs are prefixed with the source type.
-                When invoked from doc_sync (permission sync), use the default (False)
-                since upsert_document_external_perms handles prefixing.
     fallback_user_email: When we cannot retrieve any permission info for a file
                 (e.g. externally-owned files where the API returns no permissions
                 and permissions.list returns 403), fall back to granting access
@@ -101,26 +156,41 @@ def get_external_access_for_raw_gdrive_file(
         ]
     elif permission_ids:
 
-        def _get_permissions(
-            drive_service: GoogleDriveService,
-        ) -> list[GoogleDrivePermission]:
+        def _get_permissions(user_email: str) -> list[GoogleDrivePermission]:
             return get_permissions_by_ids(
-                drive_service=drive_service,
+                ops=ops,
+                user_email=user_email,
                 doc_id=doc_id,
                 permission_ids=permission_ids,
             )
 
-        permissions_list = _get_permissions(
-            retriever_drive_service or admin_drive_service
-        )
-        if len(permissions_list) != len(permission_ids) and retriever_drive_service:
-            logger.warning(
-                "Failed to get all permissions for file %s with retriever service, trying admin service",
-                doc_id,
-            )
-            backup_permissions_list = _get_permissions(admin_drive_service)
+        def _get_non_admin_permissions(
+            user_email: str,
+        ) -> list[GoogleDrivePermission]:
+            try:
+                return _get_permissions(user_email)
+            except GoogleDriveRefreshError as error:
+                logger.warning(
+                    "Could not impersonate non-admin user for document %s: %s",
+                    doc_id,
+                    error,
+                )
+                return []
+
+        if retriever_email:
+            permissions_list = _get_non_admin_permissions(retriever_email)
+
+        if len(permissions_list) != len(permission_ids) and fallback_retriever_email:
             permissions_list = _merge_permissions_lists(
-                [permissions_list, backup_permissions_list]
+                [
+                    permissions_list,
+                    _get_non_admin_permissions(fallback_retriever_email),
+                ]
+            )
+
+        if len(permissions_list) != len(permission_ids):
+            permissions_list = _merge_permissions_lists(
+                [permissions_list, _get_permissions(admin_email)]
             )
 
     # For externally-owned files, the Drive API may return no permissions
@@ -148,6 +218,7 @@ def get_external_access_for_raw_gdrive_file(
     folder_ids_to_inherit_permissions_from: set[str] = set()
     user_emails: set[str] = set()
     group_emails: set[str] = set()
+    domain_groups: set[str] = set()
     public = False
 
     for permission in permissions_list:
@@ -187,29 +258,21 @@ def get_external_access_for_raw_gdrive_file(
                     doc_id,
                     permission,
                 )
-        elif permission.type == PermissionType.DOMAIN and company_domain:
-            if permission.domain == company_domain:
-                public = True
-            else:
-                logger.warning(
-                    "Permission is type domain but does not match company domain:\n %s",
-                    permission,
-                )
+        elif permission.type == PermissionType.DOMAIN:
+            domain_group = _domain_group_for_permission(
+                permission, company_domain, f"document {doc_id}"
+            )
+            if domain_group:
+                domain_groups.add(domain_group)
         elif permission.type == PermissionType.ANYONE:
             public = True
 
     group_ids = (
         group_emails
+        | domain_groups
         | folder_ids_to_inherit_permissions_from
         | ({drive_id} if drive_id is not None else set())
     )
-
-    # Prefix group IDs with source type if requested (for indexing path)
-    if add_prefix:
-        group_ids = {
-            build_ext_group_name_for_onyx(group_id, DocumentSource.GOOGLE_DRIVE)
-            for group_id in group_ids
-        }
 
     return ExternalAccess(
         external_user_emails=user_emails,
@@ -221,8 +284,8 @@ def get_external_access_for_raw_gdrive_file(
 def get_external_access_for_folder(
     folder: GoogleDriveFileType,
     google_domain: str,
-    drive_service: GoogleDriveService,
-    add_prefix: bool = False,
+    ops: GoogleDriveSourceOperations,
+    user_email: str,
 ) -> ExternalAccess:
     """
     Extract ExternalAccess from a folder's permissions.
@@ -233,9 +296,8 @@ def get_external_access_for_folder(
     Args:
         folder: The folder metadata from Google Drive API (must include permissionIds field)
         google_domain: The company's Google Workspace domain (e.g., "company.com")
-        drive_service: Google Drive service for fetching permission details
-        add_prefix: When True, prefix group IDs with source type (for indexing path).
-                   When False (default), leave unprefixed (for permission sync path).
+        ops: The gateway that fetches the permission details
+        user_email: The user to read the permissions as
 
     Returns:
         ExternalAccess with extracted permission info
@@ -261,13 +323,15 @@ def get_external_access_for_folder(
 
     # Fetch full permission objects using the permission IDs
     permissions_list = get_permissions_by_ids(
-        drive_service=drive_service,
+        ops=ops,
+        user_email=user_email,
         doc_id=folder_id,
         permission_ids=permission_ids,
     )
 
     user_emails: set[str] = set()
     group_emails: set[str] = set()
+    domain_groups: set[str] = set()
     is_public = False
 
     for permission in permissions_list:
@@ -285,31 +349,17 @@ def get_external_access_for_folder(
                     "Group permission without email for folder %s", folder_id
                 )
         elif permission.type == PermissionType.DOMAIN:
-            # Domain permission - check if it matches company domain
-            if permission.domain == google_domain:
-                # Only public if discoverable (allowFileDiscovery is not False)
-                # If allowFileDiscovery is False, it's "link only" access
-                is_public = permission.allow_file_discovery is not False
-            else:
-                logger.debug(
-                    "Domain permission for %s does not match "
-                    "company domain %s for folder %s",
-                    permission.domain,
-                    google_domain,
-                    folder_id,
-                )
+            domain_group = _domain_group_for_permission(
+                permission, google_domain, f"folder {folder_id}"
+            )
+            if domain_group:
+                domain_groups.add(domain_group)
         elif permission.type == PermissionType.ANYONE:
             # Only public if discoverable (allowFileDiscovery is not False)
             # If allowFileDiscovery is False, it's "link only" access
             is_public = permission.allow_file_discovery is not False
 
-    # Prefix group IDs with source type if requested (for indexing path)
-    group_ids: set[str] = group_emails
-    if add_prefix:
-        group_ids = {
-            build_ext_group_name_for_onyx(group_id, DocumentSource.GOOGLE_DRIVE)
-            for group_id in group_emails
-        }
+    group_ids: set[str] = group_emails | domain_groups
 
     return ExternalAccess(
         external_user_emails=user_emails,
@@ -318,29 +368,47 @@ def get_external_access_for_folder(
     )
 
 
+def build_perm_sync_connector(
+    cc_pair: ConnectorCredentialPair,
+    should_stop: Callable[[], bool] | None = None,
+) -> GoogleDriveConnector:
+    """``should_stop`` ends a wait for the shared API budget."""
+    connector = GoogleDriveConnector(
+        **build_connector_kwargs(
+            cc_pair.connector.source, cc_pair.connector.connector_specific_config
+        )
+    )
+    # The slim listing must admit the image files that indexing admitted.
+    connector.set_allow_images(get_image_extraction_and_analysis_enabled())
+    # Permission sync spends the indexing budget of the credential.
+    limiter = build_source_api_limiter(
+        DocumentSource.GOOGLE_DRIVE, cc_pair.credential_id, should_stop
+    )
+    if limiter is not None:
+        connector.set_source_api_limiter(limiter)
+    connector.load_credentials(credential_json(cc_pair))
+    return connector
+
+
 def gdrive_doc_sync(
     cc_pair: ConnectorCredentialPair,
     fetch_all_existing_docs_fn: FetchAllDocumentsFunction,  # noqa: ARG001
     fetch_all_existing_docs_ids_fn: FetchAllDocumentsIdsFunction,  # noqa: ARG001
     callback: IndexingHeartbeatInterface | None,
+    checkpointer: DocSyncCheckpointer,
 ) -> Generator[ElementExternalAccess, None, None]:
     """
     Adds the external permissions to the documents and hierarchy nodes in postgres.
     If the document doesn't already exist in postgres, we create
     it in postgres so that when it gets created later, the permissions are
-    already populated.
+    already populated. The crawl resumes where a stopped attempt left off.
     """
-    google_drive_connector = GoogleDriveConnector(
-        **cc_pair.connector.connector_specific_config
+    google_drive_connector = build_perm_sync_connector(
+        cc_pair, callback.should_stop if callback is not None else None
     )
-    credential_json = (
-        cc_pair.credential.credential_json.get_value(apply_mask=False)
-        if cc_pair.credential.credential_json
-        else {}
+    slim_doc_generator = _get_slim_doc_generator(
+        cc_pair, google_drive_connector, checkpointer, callback
     )
-    google_drive_connector.load_credentials(credential_json)
-
-    slim_doc_generator = _get_slim_doc_generator(cc_pair, google_drive_connector)
 
     total_processed = 0
     for slim_doc_batch in slim_doc_generator:

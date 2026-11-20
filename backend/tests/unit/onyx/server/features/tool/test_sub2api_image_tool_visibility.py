@@ -36,6 +36,7 @@ def test_list_tools_includes_image_generation_with_user_sub2api_credential(
 ) -> None:
     user = SimpleNamespace(id=uuid4())
     credential = SimpleNamespace(
+        api_key_id=7,
         api_key=_Secret("sk-user"),
         api_base_url="https://sub2api.example.com/v1",
         image_model_name="gpt-image-2",
@@ -48,6 +49,9 @@ def test_list_tools_includes_image_generation_with_user_sub2api_credential(
         def is_available(cls, _db_session) -> bool:
             return False
 
+    monkeypatch.setattr(tool_api, "list_openapi_tools_with_integration", lambda _: [])
+    monkeypatch.setattr(tool_api, "list_mcp_tools_with_integration", lambda _: [])
+    monkeypatch.setattr(tool_api, "load_user_integration_states", lambda *_: [])
     monkeypatch.setattr(tool_api, "get_tools", lambda *_args, **_kwargs: [_tool()])
     monkeypatch.setattr(
         tool_api,
@@ -78,6 +82,9 @@ def test_list_tools_hides_image_generation_without_config_or_user_credential(
         def is_available(cls, _db_session) -> bool:
             return False
 
+    monkeypatch.setattr(tool_api, "list_openapi_tools_with_integration", lambda _: [])
+    monkeypatch.setattr(tool_api, "list_mcp_tools_with_integration", lambda _: [])
+    monkeypatch.setattr(tool_api, "load_user_integration_states", lambda *_: [])
     monkeypatch.setattr(tool_api, "get_tools", lambda *_args, **_kwargs: [_tool()])
     monkeypatch.setattr(
         tool_api,

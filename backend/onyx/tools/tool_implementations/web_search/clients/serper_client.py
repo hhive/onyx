@@ -6,10 +6,16 @@ import requests
 from fastapi import HTTPException
 
 from onyx.connectors.cross_connector_utils.miscellaneous_utils import time_str_to_utc
-from onyx.tools.tool_implementations.open_url.models import WebContent
-from onyx.tools.tool_implementations.open_url.models import WebContentProvider
-from onyx.tools.tool_implementations.web_search.models import WebSearchProvider
-from onyx.tools.tool_implementations.web_search.models import WebSearchResult
+from onyx.error_handling.error_codes import OnyxErrorCode
+from onyx.error_handling.exceptions import OnyxError
+from onyx.tools.tool_implementations.open_url.models import (
+    WebContent,
+    WebContentProvider,
+)
+from onyx.tools.tool_implementations.web_search.models import (
+    WebSearchProvider,
+    WebSearchResult,
+)
 from onyx.utils.logger import setup_logger
 from onyx.utils.retry_wrapper import retry_builder
 
@@ -74,11 +80,11 @@ class SerperClient(WebSearchProvider, WebContentProvider):
         try:
             test_results = self.search("test")
             if not test_results or not any(result.link for result in test_results):
-                raise HTTPException(
-                    status_code=400,
-                    detail="API key validation failed: search returned no results.",
+                raise OnyxError(
+                    OnyxErrorCode.BAD_REQUEST,
+                    "API key validation failed: search returned no results.",
                 )
-        except HTTPException:
+        except (HTTPException, OnyxError):
             raise
         except Exception as e:
             error_msg = str(e)
@@ -87,13 +93,12 @@ class SerperClient(WebSearchProvider, WebContentProvider):
                 or "key" in error_msg.lower()
                 or "auth" in error_msg.lower()
             ):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Invalid Serper API key: {error_msg}",
+                raise OnyxError(
+                    OnyxErrorCode.BAD_REQUEST, f"Invalid Serper API key: {error_msg}"
                 ) from e
-            raise HTTPException(
-                status_code=400,
-                detail=f"Serper API key validation failed: {error_msg}",
+            raise OnyxError(
+                OnyxErrorCode.BAD_REQUEST,
+                f"Serper API key validation failed: {error_msg}",
             ) from e
 
         logger.info("Web search provider test succeeded for Serper.")

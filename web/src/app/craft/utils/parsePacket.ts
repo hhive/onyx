@@ -1,12 +1,19 @@
 /**
  * Parse Packet
  *
- * Single entry point for converting raw ACP packets into strongly-typed
+ * Single entry point for converting raw sandbox-event packets into strongly-typed
  * ParsedPacket values. All field resolution, tool detection, and path
  * sanitization happen here. Consumers never touch Record<string, unknown>.
  */
 
-import { stripSessionPrefix, sanitizePathsInText } from "./pathSanitizer";
+// Every `unknown` parameter in this file is the decode boundary itself: no
+// caller can hand these functions an already-parsed type.
+/* oxlint-disable anti-slop/no-unknown-parameters */
+
+import {
+  stripSessionPrefix,
+  sanitizePathsInText,
+} from "@/app/craft/utils/pathSanitizer";
 import {
   getRawInput,
   getRawOutput,
@@ -17,24 +24,41 @@ import {
   type ParsedToolCallProgress,
   type ParsedArtifact,
   type ToolName,
-  type ToolKind,
-  type ToolStatus,
-} from "./packetTypes";
-import type { TodoItem, TodoStatus } from "../types/displayTypes";
+  type TextPartUpdate,
+} from "@/app/craft/utils/packetTypes";
+import type {
+  TodoItem,
+  TodoStatus,
+  ToolCallKind,
+  ToolCallStatus,
+} from "@/app/craft/types/displayTypes";
 
 export function parsePacket(raw: unknown): ParsedPacket {
   if (!raw || typeof raw !== "object") return { type: "unknown" };
   const p = raw as Record<string, unknown>;
-  const packetType = p.type as string | undefined;
+  const packetType =
+    (p.type as string | undefined) ??
+    (p.sessionUpdate as string | undefined) ??
+    (p.session_update as string | undefined);
 
   switch (packetType) {
     case "agent_message_chunk": // Live SSE
     case "agent_message": // DB-stored format
-      return { type: "text_chunk", text: extractText(p.content) };
+      return {
+        type: "text_chunk",
+        text: extractText(p.content),
+        ...extractRoutingMeta(p),
+        ...extractTextPart(p),
+      };
 
     case "agent_thought_chunk": // Live SSE
     case "agent_thought": // DB-stored format
-      return { type: "thinking_chunk", text: extractText(p.content) };
+      return {
+        type: "thinking_chunk",
+        text: extractText(p.content),
+        ...extractRoutingMeta(p),
+        ...extractTextPart(p),
+      };
 
     case "tool_call_start":
       return parseToolCallStart(p);
@@ -44,6 +68,30 @@ export function parsePacket(raw: unknown): ParsedPacket {
 
     case "prompt_response":
       return { type: "prompt_response" };
+
+    case "turn_completed": {
+      const { session_id, turn_id, turn_index, status, error_detail } = p;
+      if (
+        typeof session_id !== "string" ||
+        !session_id ||
+        typeof turn_id !== "string" ||
+        !turn_id ||
+        typeof turn_index !== "number" ||
+        !Number.isSafeInteger(turn_index) ||
+        turn_index < 0 ||
+        (status !== "SUCCEEDED" &&
+          status !== "FAILED" &&
+          status !== "CANCELLED") ||
+        (error_detail !== undefined &&
+          error_detail !== null &&
+          typeof error_detail !== "string")
+      )
+        return { type: "unknown" };
+      return {
+        type: "turn_completed",
+        turn: { session_id, turn_id, turn_index, status, error_detail },
+      };
+    }
 
     case "artifact_created":
       return parseArtifact(p);
@@ -55,12 +103,108 @@ export function parsePacket(raw: unknown): ParsedPacket {
         sessionId: (p.session_id ?? "") as string,
       };
 
+    case "subagent_started":
+      return {
+        type: "subagent_started",
+        subagentSessionId: (p.subagent_session_id ??
+          p.subagentSessionId ??
+          "") as string,
+        parentSessionId: (p.parent_session_id ?? p.parentSessionId ?? null) as
+          | string
+          | null,
+      };
+
+    case "connect_app_request": {
+      const externalAppId = p.external_app_id;
+      if (
+        typeof externalAppId !== "number" ||
+        !Number.isSafeInteger(externalAppId) ||
+        externalAppId <= 0
+      ) {
+        return { type: "unknown" };
+      }
+      return {
+        type: "connect_app_request",
+        requestId: (p.request_id ?? "") as string,
+        externalAppId,
+        reason: (p.reason ?? null) as string | null,
+      };
+    }
+
+    case "context_usage":
+      return {
+        type: "context_usage",
+        usedTokens: Number(p.used_tokens ?? p.usedTokens ?? 0),
+      };
+
+    case "compaction":
+      return {
+        type: "compaction",
+        summary: (p.summary ?? null) as string | null,
+      };
+
     case "error":
       return { type: "error", message: (p.message ?? "") as string };
 
     default:
       return { type: "unknown" };
   }
+}
+
+function extractRoutingMeta(p: Record<string, unknown>): {
+  sessionId: string | null;
+  parentSessionId: string | null;
+} {
+  const meta = (p._meta as Record<string, unknown> | undefined) ?? {};
+  return {
+    sessionId: (meta.sessionId as string | undefined) ?? null,
+    parentSessionId: (meta.parentSessionId as string | undefined) ?? null,
+  };
+}
+
+// ─── Skill Detection ──────────────────────────────────────────────
+
+/**
+ * Detect skill-namespaced tool invocations. Opencode emits skill calls with
+ * raw names like "skills.brainstorming" or "superpowers:test-driven-development".
+ * Returns the skill's leaf name (everything after the last separator) or null.
+ */
+function detectSkillName(
+  p: Record<string, unknown>,
+  toolName: ToolName
+): string | null {
+  if (toolName !== "unknown") return null;
+  const rawName = getToolNameRaw(p);
+  if (!rawName) return null;
+  // Match "namespace:skill" or "namespace.skill" patterns
+  const match = rawName.match(/^(skills?|superpowers)[.:]([\w-]+)$/);
+  return match?.[2] ?? null;
+}
+
+function detectSkillScript(command: string): string | null {
+  const match = command.match(/\.opencode\/skills\/([\w-]+)\//);
+  if (match?.[1]) return match[1];
+  // The github skill invokes the gh CLI directly rather than a bundled script.
+  // Any gh call in the sandbox authenticates through the github app's proxy
+  // injection, so attributing all of them to the skill is intentional.
+  if (/^gh\s/.test(command)) return "github";
+  return null;
+}
+
+function resolveSkillName(
+  p: Record<string, unknown>,
+  toolName: ToolName,
+  kind: ToolCallKind,
+  ri: Record<string, unknown> | null,
+  command: string
+): string | null {
+  return (
+    detectSkillName(p, toolName) ??
+    (toolName === "skill" && typeof ri?.name === "string"
+      ? (ri.name as string)
+      : null) ??
+    (kind === "execute" ? detectSkillScript(command) : null)
+  );
 }
 
 // ─── Tool Name Resolution ─────────────────────────────────────────
@@ -77,6 +221,17 @@ const NAME_MAP: Record<string, ToolName> = {
   todo_write: "todowrite",
   webfetch: "webfetch",
   websearch: "websearch",
+  // Onyx's web search plugin (opencode-plugins/web-search.ts).
+  web_search: "websearch",
+  // opencode 1.15.x additions:
+  lsp: "lsp",
+  apply_patch: "apply_patch",
+  applypatch: "apply_patch",
+  skill: "skill",
+  list: "list",
+  ls: "list",
+  question: "question",
+  invalid: "invalid",
 };
 
 function resolveToolName(p: Record<string, unknown>): ToolName {
@@ -100,12 +255,13 @@ function resolveToolName(p: Record<string, unknown>): ToolName {
   if (rawKind === "edit" || rawKind === "delete" || rawKind === "move")
     return "edit";
   if (rawKind === "search") return "glob";
+  if (rawKind === "task") return "task";
   if (rawKind === "fetch") return "webfetch";
 
   return "unknown";
 }
 
-const TOOL_KIND_MAP: Record<ToolName, ToolKind> = {
+const TOOL_KIND_MAP: Record<ToolName, ToolCallKind> = {
   glob: "search",
   grep: "search",
   read: "read",
@@ -116,10 +272,17 @@ const TOOL_KIND_MAP: Record<ToolName, ToolKind> = {
   todowrite: "other",
   webfetch: "other",
   websearch: "search",
+  // opencode 1.15.x additions:
+  lsp: "other",
+  apply_patch: "edit",
+  skill: "other",
+  list: "read",
+  question: "other",
+  invalid: "other",
   unknown: "other",
 };
 
-function resolveKind(toolName: ToolName, rawKind: string | null): ToolKind {
+function resolveKind(toolName: ToolName, rawKind: string | null): ToolCallKind {
   const fromName = TOOL_KIND_MAP[toolName];
   if (fromName !== "other") return fromName;
 
@@ -138,7 +301,7 @@ function resolveKind(toolName: ToolName, rawKind: string | null): ToolKind {
 
 // ─── Shared Helpers ───────────────────────────────────────────────
 
-/** Extract text from ACP content structure (string, {type,text}, or array) */
+/** Extract text from sandbox event content (string, {type,text}, or array) */
 function extractText(content: unknown): string {
   if (!content) return "";
   if (typeof content === "string") return content;
@@ -159,7 +322,7 @@ function extractText(content: unknown): string {
   return "";
 }
 
-function normalizeStatus(status: string | null | undefined): ToolStatus {
+function normalizeStatus(status: string | null | undefined): ToolCallStatus {
   if (
     status === "pending" ||
     status === "in_progress" ||
@@ -238,22 +401,33 @@ function extractPatchInfo(
 
 function buildDescription(
   toolName: ToolName,
-  kind: ToolKind,
+  kind: ToolCallKind,
   filePath: string,
   ri: Record<string, unknown> | null,
   rawDescription: string
 ): string {
-  // Task tool: use description from rawInput
+  // Task tool: spawns a subagent. Read as "Spawning subagent: <description>".
   if (toolName === "task") {
-    return rawDescription || "Running subagent";
+    const taskDescription =
+      rawDescription || (typeof ri?.prompt === "string" ? ri.prompt : "");
+    return taskDescription
+      ? `Spawning subagent: ${sanitizePathsInText(taskDescription)}`
+      : "Spawning subagent";
   }
-  // Read/edit: show file path
+  // Read/edit: show file path. For new-file writes, append a line count
+  // so the row reads "Writing  src/app/page.tsx (42 lines)" — useful when
+  // the body is empty/collapsed.
   if (kind === "read" || kind === "edit") {
-    if (filePath) return filePath;
+    if (filePath) {
+      if (toolName === "write" && typeof ri?.content === "string") {
+        const lines = (ri.content as string).split("\n").length;
+        return `${filePath} (${lines} lines)`;
+      }
+      return filePath;
+    }
   }
-  // Execute: use backend description
   if (kind === "execute") {
-    return sanitizePathsInText(rawDescription) || "Running command";
+    return sanitizePathsInText(rawDescription);
   }
   // Search: show pattern
   if (
@@ -263,14 +437,27 @@ function buildDescription(
   ) {
     return ri.pattern as string;
   }
-  return buildTitle(toolName, kind, true);
+  // Webfetch: show URL
+  if (toolName === "webfetch" && ri?.url && typeof ri.url === "string") {
+    return ri.url as string;
+  }
+  // Websearch: show query (Onyx's web_search takes a list of queries)
+  if (toolName === "websearch" && ri?.query && typeof ri.query === "string") {
+    return ri.query as string;
+  }
+  if (toolName === "websearch" && Array.isArray(ri?.queries)) {
+    return ri.queries
+      .filter((query): query is string => typeof query === "string")
+      .join(", ");
+  }
+  return "";
 }
 
 // ─── Title Builder ───────────────────────────────────────────────
 
 function buildTitle(
   toolName: ToolName,
-  kind: ToolKind,
+  kind: ToolCallKind,
   isNewFile: boolean
 ): string {
   // Edit/write: distinguish "Writing" (new file) vs "Editing" (existing)
@@ -287,12 +474,19 @@ function buildTitle(
     todowrite: "Updating todos",
     webfetch: "Fetching web content",
     websearch: "Searching web",
+    // opencode 1.15.x additions:
+    lsp: "Checking code",
+    apply_patch: "Applying patch",
+    skill: "Running skill",
+    list: "Listing files",
+    question: "Asking",
+    invalid: "Validating",
     unknown: "Running tool",
   };
 
   // When toolName is unknown, use kind for a more specific title
   if (toolName === "unknown") {
-    const KIND_TITLES: Partial<Record<ToolKind, string>> = {
+    const KIND_TITLES: Partial<Record<ToolCallKind, string>> = {
       search: "Searching",
       read: "Reading",
       execute: "Running command",
@@ -310,7 +504,7 @@ function buildTitle(
  *  Returns raw unsanitized text — caller applies sanitizePathsInText. */
 function extractRawOutputText(
   toolName: ToolName,
-  kind: ToolKind,
+  kind: ToolCallKind,
   p: Record<string, unknown>,
   ro: Record<string, unknown> | null
 ): string {
@@ -415,6 +609,19 @@ function extractTaskOutput(ro: Record<string, unknown> | null): string | null {
   );
 }
 
+function extractTaskSessionId(
+  ro: Record<string, unknown> | null
+): string | null {
+  if (!ro?.output || typeof ro.output !== "string") return null;
+  const text = ro.output;
+  const taskIdMatch = text.match(/^task_id:\s*([^\s(]+)/m);
+  if (taskIdMatch?.[1]) return taskIdMatch[1];
+  const metadataMatch = text.match(
+    /<task_metadata>[\s\S]*?(?:session_id|task_id):\s*([^\s<]+)[\s\S]*?<\/task_metadata>/i
+  );
+  return metadataMatch?.[1] ?? null;
+}
+
 // ─── Artifact Parsing ─────────────────────────────────────────────
 
 function parseArtifact(p: Record<string, unknown>): ParsedArtifact {
@@ -436,12 +643,35 @@ function parseArtifact(p: Record<string, unknown>): ParsedArtifact {
 function parseToolCallStart(p: Record<string, unknown>): ParsedToolCallStart {
   const toolName = resolveToolName(p);
   const rawKind = p.kind as string | null;
+  const kind = resolveKind(toolName, rawKind);
+  const ri = getRawInput(p);
+  const meta = (p._meta as Record<string, unknown> | undefined) ?? {};
+  const rawCommand = (ri?.command ??
+    (toolName === "task" ? ri?.prompt : undefined) ??
+    "") as string;
+  const rawDescription = (ri?.description ?? "") as string;
+  const rawFilePath = (ri?.file_path ??
+    ri?.filePath ??
+    ri?.path ??
+    "") as string;
+  const filePath = rawFilePath ? stripSessionPrefix(rawFilePath) : "";
+  const command = sanitizePathsInText(rawCommand);
   return {
     type: "tool_call_start",
     toolCallId: getToolCallId(p),
     toolName,
-    kind: resolveKind(toolName, rawKind),
+    kind,
     isTodo: toolName === "todowrite",
+    title: buildTitle(toolName, kind, true),
+    description: buildDescription(toolName, kind, filePath, ri, rawDescription),
+    command,
+    skillName: resolveSkillName(p, toolName, kind, ri, command),
+    subagentType: (ri?.subagent_type ?? ri?.subagentType ?? null) as
+      | string
+      | null,
+    sessionId: (meta.sessionId as string | undefined) ?? null,
+    parentSessionId: (meta.parentSessionId as string | undefined) ?? null,
+    subagentSessionId: (meta.subagentSessionId as string | undefined) ?? null,
   };
 }
 
@@ -460,6 +690,18 @@ function parseToolCallProgress(
     kind === "edit"
       ? extractDiffData(p.content)
       : { oldText: "", newText: "", isNewFile: true };
+
+  // The write tool emits the new file body in rawInput.content (not in a
+  // content[].type==="diff" item) so the diff extractor misses it. Pull it
+  // directly so DiffBody can render the new file's contents.
+  if (
+    toolName === "write" &&
+    !diffData.newText &&
+    typeof ri?.content === "string"
+  ) {
+    diffData.newText = ri.content as string;
+    diffData.isNewFile = true;
+  }
 
   // ── Patch info (opencode agent uses patchText instead of file_path) ──
   const patchInfo =
@@ -482,7 +724,10 @@ function parseToolCallProgress(
   }
 
   // ── Command (freeform → sanitizePathsInText) ──────────────────
-  const rawCommand = (ri?.command ?? "") as string;
+  // The task tool carries its subagent prompt in `prompt`, not `command`.
+  const rawCommand = (ri?.command ??
+    (toolName === "task" ? ri?.prompt : undefined) ??
+    "") as string;
   const command = sanitizePathsInText(rawCommand);
 
   // ── Description ───────────────────────────────────────────────
@@ -512,10 +757,21 @@ function parseToolCallProgress(
   const subagentType = (ri?.subagent_type ?? ri?.subagentType ?? null) as
     | string
     | null;
+
+  // ── Skill detection ───────────────────────────────────────────
+  const skillName = resolveSkillName(p, toolName, kind, ri, command);
   const taskOutput =
     toolName === "task" && status === "completed"
       ? extractTaskOutput(ro)
       : null;
+
+  // ── Subagent routing (from ACP _meta) ─────────────────────────
+  const meta = (p._meta as Record<string, unknown> | undefined) ?? {};
+  const sessionId = (meta.sessionId as string | undefined) ?? null;
+  const parentSessionId = (meta.parentSessionId as string | undefined) ?? null;
+  const subagentSessionId =
+    (meta.subagentSessionId as string | undefined) ??
+    (toolName === "task" ? extractTaskSessionId(ro) : null);
 
   return {
     type: "tool_call_progress",
@@ -530,6 +786,7 @@ function parseToolCallProgress(
     rawOutput,
     filePath,
     subagentType,
+    skillName,
     isNewFile:
       diffData.oldText || diffData.newText
         ? diffData.isNewFile
@@ -538,5 +795,26 @@ function parseToolCallProgress(
     newContent: diffData.newText,
     todos,
     taskOutput,
+    sessionId,
+    parentSessionId,
+    subagentSessionId,
   };
+}
+
+function extractTextPart(p: Record<string, unknown>): {
+  part?: TextPartUpdate;
+} {
+  const meta = p._meta;
+  if (
+    !meta ||
+    typeof meta !== "object" ||
+    !("partId" in meta) ||
+    typeof meta.partId !== "string"
+  )
+    return {};
+  const part: TextPartUpdate = { partId: meta.partId };
+  if ("snapshotText" in meta && typeof meta.snapshotText === "string") {
+    part.snapshotText = meta.snapshotText;
+  }
+  return { part };
 }

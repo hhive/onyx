@@ -1,12 +1,21 @@
 import contextvars
+import threading
 import time
+from concurrent.futures import Future
 
-from onyx.utils.threadpool_concurrency import FunctionCall
-from onyx.utils.threadpool_concurrency import run_functions_in_parallel
-from onyx.utils.threadpool_concurrency import run_functions_tuples_in_parallel
-from onyx.utils.threadpool_concurrency import run_in_background
-from onyx.utils.threadpool_concurrency import run_with_timeout
-from onyx.utils.threadpool_concurrency import wait_on_background
+import pytest
+
+from onyx.utils.threadpool_concurrency import (
+    BoundedParallelRunner,
+    FunctionCall,
+    run_functions_in_parallel,
+    run_functions_tuples_in_parallel,
+    run_in_background,
+    run_with_timeout,
+    start_thread_future,
+    start_thread_with_context,
+    wait_on_background,
+)
 
 # Create a test contextvar
 test_var = contextvars.ContextVar("test_var", default="default")
@@ -43,7 +52,7 @@ def test_run_functions_in_parallel_preserves_contextvar() -> None:
     # Run in parallel and verify all results have the correct value
     results = run_functions_in_parallel(function_calls)
 
-    for result_id, value in results.items():
+    for value in results.values():
         assert value == "parallel_test"
 
 
@@ -167,3 +176,88 @@ def test_run_in_background_preserves_contextvar() -> None:
     finally:
         # Clean up
         test_var.reset(token)
+
+
+def test_start_thread_with_context_preserves_contextvar() -> None:
+    """Test that start_thread_with_context propagates the caller's contextvars
+    into the spawned daemon thread."""
+    seen: list[str] = []
+
+    def capture() -> None:
+        time.sleep(0.1)  # ensure we're really on another thread
+        seen.append(test_var.get())
+
+    token = test_var.set("background_value")
+    try:
+        thread = start_thread_with_context(capture, name="ctx-test", daemon=True)
+        thread.join(timeout=2.0)
+    finally:
+        test_var.reset(token)
+
+    assert seen == ["background_value"]
+
+
+def test_start_thread_with_context_passes_args() -> None:
+    """Test that args/kwargs are forwarded to the target."""
+    seen: list[tuple[str, str]] = []
+
+    def capture(positional: str, *, keyword: str) -> None:
+        seen.append((positional, keyword))
+
+    thread = start_thread_with_context(
+        capture, args=("pos",), kwargs={"keyword": "kw"}, daemon=True
+    )
+    thread.join(timeout=2.0)
+
+    assert seen == [("pos", "kw")]
+
+
+def test_thread_uses_explicit_empty_context() -> None:
+    token: contextvars.Token[str] = test_var.set("caller")
+    observed: list[str] = []
+    try:
+        worker: threading.Thread = start_thread_with_context(
+            lambda: observed.append(test_var.get()), context=contextvars.Context()
+        )
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+        assert observed == ["default"]
+        assert test_var.get() == "caller"
+    finally:
+        test_var.reset(token)
+
+
+@pytest.mark.parametrize("daemon", [False, True])
+def test_thread_future_preserves_context_and_result(daemon: bool) -> None:
+    token: contextvars.Token[str] = test_var.set("future")
+
+    def read_context() -> tuple[str, bool]:
+        return test_var.get(), threading.current_thread().daemon
+
+    try:
+        future = start_thread_future(read_context, name="test-result", daemon=daemon)
+        assert future.result(timeout=2) == ("future", daemon)
+    finally:
+        test_var.reset(token)
+
+
+def test_thread_future_preserves_base_exception() -> None:
+    error: BaseException = BaseException("worker failed")
+
+    def fail() -> None:
+        raise error
+
+    future: Future[None] = start_thread_future(fail, name="test-error")
+    caught: pytest.ExceptionInfo[BaseException]
+    with pytest.raises(BaseException) as caught:
+        future.result(timeout=2)
+    assert caught.value is error
+
+
+def test_bounded_parallel_runner_preserves_contextvar() -> None:
+    test_var.set("runner_value")
+    with BoundedParallelRunner[str](max_workers=2) as runner:
+        results = runner.submit(get_contextvar_value)
+        results += runner.submit(get_contextvar_value)
+        results += list(runner.drain())
+    assert results == ["runner_value", "runner_value"]

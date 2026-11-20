@@ -16,14 +16,12 @@ from __future__ import annotations
 
 import socket
 import struct
-from collections.abc import Generator
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
 
-from docker.errors import APIError
-from docker.errors import NotFound
+from docker.errors import APIError, NotFound
 from docker.models.containers import Container
+from pydantic import BaseModel, ConfigDict
 
 from onyx.utils.logger import setup_logger
 
@@ -39,9 +37,10 @@ _FRAME_STDOUT = 1
 _FRAME_STDERR = 2
 
 
-@dataclass(frozen=True)
-class ExecResult:
+class ExecResult(BaseModel):
     """Result of a one-shot ``run_in_container`` invocation."""
+
+    model_config = ConfigDict(strict=True, frozen=True)
 
     exit_code: int
     stdout: bytes
@@ -140,6 +139,7 @@ def _open_exec_socket(
     stdin: bool,
     user: str | None,
     workdir: str | None,
+    environment: dict[str, str] | None,
 ) -> Iterator[tuple[str, socket.socket]]:
     """Create + start a docker exec and yield ``(exec_id, raw_socket)``.
 
@@ -159,6 +159,7 @@ def _open_exec_socket(
             tty=False,
             user=user or "",
             workdir=workdir,
+            environment=environment,
         )["Id"]
         sock = api.exec_start(exec_id, socket=True, demux=False)
     except (APIError, NotFound) as e:
@@ -202,13 +203,19 @@ def stream_stdin_to_container(
     *,
     user: str | None = None,
     workdir: str | None = None,
+    environment: dict[str, str] | None = None,
 ) -> ExecResult:
     """Run ``command`` inside ``container`` and feed ``payload`` to its stdin.
 
     Used for tar push (skills + user library) and snapshot restore.
     """
     with _open_exec_socket(
-        container, command, stdin=True, user=user, workdir=workdir
+        container,
+        command,
+        stdin=True,
+        user=user,
+        workdir=workdir,
+        environment=environment,
     ) as (exec_id, sock):
         sock.sendall(payload)
         # Half-close so the remote process sees EOF.
@@ -236,6 +243,7 @@ def stream_stdout_from_container(
     *,
     user: str | None = None,
     workdir: str | None = None,
+    environment: dict[str, str] | None = None,
     chunk_size: int = 64 * 1024,
 ) -> Generator[bytes, None, int]:
     """Run ``command`` and yield stdout chunks to the caller.
@@ -246,7 +254,12 @@ def stream_stdout_from_container(
     """
     stderr_buf = bytearray()
     with _open_exec_socket(
-        container, command, stdin=False, user=user, workdir=workdir
+        container,
+        command,
+        stdin=False,
+        user=user,
+        workdir=workdir,
+        environment=environment,
     ) as (exec_id, sock):
         for stream_type, frame in _iter_frames(sock, chunk_size=chunk_size):
             if stream_type == _FRAME_STDOUT and frame:
@@ -259,7 +272,7 @@ def stream_stdout_from_container(
 
 def _unwrap_socket(sock: object) -> socket.socket:
     """Get the raw socket underneath docker SDK's SocketIO wrapper."""
-    raw = getattr(sock, "_sock", None)
+    raw = getattr(sock, "_sock", None)  # ods: ignore[getattr]
     if isinstance(raw, socket.socket):
         return raw
     if isinstance(sock, socket.socket):

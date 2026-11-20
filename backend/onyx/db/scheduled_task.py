@@ -12,30 +12,35 @@ that claimed the task so concurrent beat ticks don't double-fire.
 
 from __future__ import annotations
 
-from datetime import datetime
-from datetime import timedelta
-from datetime import timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import and_
-from sqlalchemy import desc
-from sqlalchemy import literal
-from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy import and_, case, desc, func, literal, select, update
+from sqlalchemy.orm import Session, selectinload
 
-from onyx.db.enums import ScheduledTaskErrorClass
-from onyx.db.enums import ScheduledTaskRunStatus
-from onyx.db.enums import ScheduledTaskSkipReason
-from onyx.db.enums import ScheduledTaskStatus
-from onyx.db.enums import ScheduledTaskTriggerSource
-from onyx.db.models import ScheduledTask
-from onyx.db.models import ScheduledTaskRun
+from onyx.db.enums import (
+    ScheduledTaskErrorClass,
+    ScheduledTaskRunStatus,
+    ScheduledTaskSkipReason,
+    ScheduledTaskStatus,
+    ScheduledTaskTriggerSource,
+    SessionOrigin,
+)
+from onyx.db.models import (
+    BuildSession,
+    ScheduledTask,
+    ScheduledTaskRun,
+    User,
+)
 from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
-from onyx.server.features.build.scheduled_tasks.schedule import compute_next_run_at
-from onyx.server.features.build.scheduled_tasks.schedule import EditorMode
-from onyx.server.features.build.scheduled_tasks.schedule import validate_timezone
+from onyx.integrations.craft import replace_task_integrations__no_commit
+from onyx.server.features.build.scheduled_tasks.schedule import (
+    EditorMode,
+    compute_next_run_at,
+)
+from onyx.tools.models import IntegrationLinkConfiguration
 from onyx.utils.logger import setup_logger
 
 logger = setup_logger()
@@ -53,38 +58,97 @@ def create_scheduled_task(
     name: str,
     prompt: str,
     cron_expression: str,
-    timezone_name: str,
     editor_mode: EditorMode,
     status: ScheduledTaskStatus = ScheduledTaskStatus.ACTIVE,
+    integrations: list[IntegrationLinkConfiguration] | None = None,
     now: datetime | None = None,
 ) -> ScheduledTask:
     """Insert a new ``ScheduledTask``.
 
-    Computes the initial ``next_run_at`` from ``cron_expression`` /
-    ``timezone_name`` if ``status`` is ACTIVE; PAUSED tasks store NULL.
+    Computes the initial ``next_run_at`` from ``cron_expression`` if
+    ``status`` is ACTIVE; PAUSED tasks store NULL.
 
     Raises:
-        OnyxError(INVALID_INPUT): if the cron or timezone is invalid.
+        OnyxError(INVALID_INPUT): if the cron is invalid.
     """
-    validate_timezone(timezone_name)
     now = now or datetime.now(tz=timezone.utc)
     next_run_at: datetime | None = None
     if status == ScheduledTaskStatus.ACTIVE:
-        next_run_at = compute_next_run_at(cron_expression, timezone_name, now)
+        next_run_at = compute_next_run_at(cron_expression, now)
 
     task = ScheduledTask(
         user_id=user_id,
         name=name,
         prompt=prompt,
         cron_expression=cron_expression,
-        timezone=timezone_name,
         editor_mode=editor_mode,
         status=status,
         next_run_at=next_run_at,
     )
     db_session.add(task)
     db_session.flush()
+    user = db_session.get(User, user_id)
+    if user is None:
+        raise OnyxError(OnyxErrorCode.NOT_FOUND, "User not found")
+    if integrations is not None:
+        replace_task_integrations__no_commit(db_session, user, task.id, integrations)
     return task
+
+
+def get_running_task_id(
+    db_session: Session, session_id: UUID, user_id: UUID
+) -> UUID | None:
+    return db_session.scalar(
+        select(ScheduledTaskRun.task_id)
+        .join(BuildSession, BuildSession.id == ScheduledTaskRun.session_id)
+        .where(
+            BuildSession.id == session_id,
+            BuildSession.user_id == user_id,
+            ScheduledTaskRun.status == ScheduledTaskRunStatus.RUNNING,
+        )
+        .limit(1)
+    )
+
+
+def get_scheduled_task_id_for_session(
+    db_session: Session, session_id: UUID
+) -> UUID | None:
+    """The task of the run that made the session; None for another session."""
+    return db_session.scalar(
+        select(ScheduledTaskRun.task_id).where(
+            ScheduledTaskRun.session_id == session_id
+        )
+    )
+
+
+def get_active_scheduled_task_context(
+    db_session: Session, session_id: UUID
+) -> tuple[UUID, UUID] | None:
+    """Return running task authority; reject inactive scheduled sessions.
+
+    Only interactive and Slack sessions can return None and use personal policies.
+    """
+    row = db_session.execute(
+        select(
+            BuildSession.origin,
+            ScheduledTaskRun.id,
+            ScheduledTaskRun.task_id,
+            ScheduledTaskRun.status,
+        )
+        .outerjoin(ScheduledTaskRun, ScheduledTaskRun.session_id == BuildSession.id)
+        .where(BuildSession.id == session_id)
+    ).first()
+    if row is None:
+        raise OnyxError(OnyxErrorCode.NOT_FOUND, "Session no longer exists")
+    origin, run_id, task_id, status = row
+    if run_id is not None and status == ScheduledTaskRunStatus.RUNNING:
+        return run_id, task_id
+    if run_id is not None or origin == SessionOrigin.SCHEDULED:
+        raise OnyxError(
+            OnyxErrorCode.INSUFFICIENT_PERMISSIONS,
+            "Scheduled execution is no longer active",
+        )
+    return None
 
 
 def get_scheduled_task(
@@ -92,6 +156,7 @@ def get_scheduled_task(
     db_session: Session,
     task_id: UUID,
     user_id: UUID,
+    lock: bool = False,
 ) -> ScheduledTask:
     """Fetch a non-deleted task owned by ``user_id``.
 
@@ -99,13 +164,14 @@ def get_scheduled_task(
     or belongs to a different user. Callers should never need to inspect
     ``deleted`` themselves.
     """
-    task = db_session.execute(
-        select(ScheduledTask).where(
-            ScheduledTask.id == task_id,
-            ScheduledTask.user_id == user_id,
-            ScheduledTask.deleted.is_(False),
-        )
-    ).scalar_one_or_none()
+    query = select(ScheduledTask).where(
+        ScheduledTask.id == task_id,
+        ScheduledTask.user_id == user_id,
+        ScheduledTask.deleted.is_(False),
+    )
+    if lock:
+        query = query.with_for_update()
+    task = db_session.scalar(query)
     if task is None:
         raise OnyxError(OnyxErrorCode.NOT_FOUND, "Scheduled task not found")
     return task
@@ -137,25 +203,27 @@ def update_scheduled_task(
     name: str | None = None,
     prompt: str | None = None,
     cron_expression: str | None = None,
-    timezone_name: str | None = None,
     editor_mode: EditorMode | None = None,
     status: ScheduledTaskStatus | None = None,
+    integrations: list[IntegrationLinkConfiguration] | None = None,
     now: datetime | None = None,
 ) -> ScheduledTask:
     """Apply a partial update to a scheduled task.
 
     Recompute rules:
-      - If ``cron_expression`` or ``timezone_name`` changed and the task is
-        (or becomes) ACTIVE, ``next_run_at`` is recomputed from ``now``.
+      - If ``cron_expression`` changed and the task is (or becomes) ACTIVE,
+        ``next_run_at`` is recomputed from ``now``.
       - If ``status`` transitions to PAUSED, ``next_run_at`` is set to NULL.
       - If ``status`` transitions to ACTIVE, ``next_run_at`` is recomputed.
 
     Raises:
         OnyxError(NOT_FOUND): the task does not exist or is not owned by
             the caller.
-        OnyxError(INVALID_INPUT): the new cron/timezone is invalid.
+        OnyxError(INVALID_INPUT): the new cron is invalid.
     """
-    task = get_scheduled_task(db_session=db_session, task_id=task_id, user_id=user_id)
+    task = get_scheduled_task(
+        db_session=db_session, task_id=task_id, user_id=user_id, lock=True
+    )
     now = now or datetime.now(tz=timezone.utc)
 
     schedule_changed = False
@@ -168,10 +236,6 @@ def update_scheduled_task(
     if cron_expression is not None and cron_expression != task.cron_expression:
         task.cron_expression = cron_expression
         schedule_changed = True
-    if timezone_name is not None and timezone_name != task.timezone:
-        validate_timezone(timezone_name)
-        task.timezone = timezone_name
-        schedule_changed = True
 
     if status is not None and status != task.status:
         task.status = status
@@ -179,12 +243,15 @@ def update_scheduled_task(
             task.next_run_at = None
         else:
             # Becoming ACTIVE — recompute from now regardless of schedule change.
-            task.next_run_at = compute_next_run_at(
-                task.cron_expression, task.timezone, now
-            )
+            task.next_run_at = compute_next_run_at(task.cron_expression, now)
     elif schedule_changed and task.status == ScheduledTaskStatus.ACTIVE:
-        task.next_run_at = compute_next_run_at(task.cron_expression, task.timezone, now)
+        task.next_run_at = compute_next_run_at(task.cron_expression, now)
 
+    if integrations is not None:
+        user = db_session.get(User, user_id)
+        if user is None:
+            raise OnyxError(OnyxErrorCode.NOT_FOUND, "User not found")
+        replace_task_integrations__no_commit(db_session, user, task.id, integrations)
     db_session.flush()
     return task
 
@@ -257,6 +324,8 @@ def claim_due_scheduled_tasks(
         return []
     stmt = (
         select(ScheduledTask)
+        # The dispatcher gates each task on its owner's Craft access.
+        .options(selectinload(ScheduledTask.user))
         .where(
             ScheduledTask.status == ScheduledTaskStatus.ACTIVE,
             ScheduledTask.deleted.is_(False),
@@ -280,7 +349,7 @@ def advance_next_run_at(
 
     Returns the new ``next_run_at`` (UTC).
     """
-    next_run_at = compute_next_run_at(task.cron_expression, task.timezone, now)
+    next_run_at = compute_next_run_at(task.cron_expression, now)
     task.next_run_at = next_run_at
     db_session.flush()
     return next_run_at
@@ -361,10 +430,15 @@ def mark_run_status(
     leave it NULL.
     """
     run = db_session.execute(
-        select(ScheduledTaskRun).where(ScheduledTaskRun.id == run_id)
+        select(ScheduledTaskRun)
+        .where(ScheduledTaskRun.id == run_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
     ).scalar_one_or_none()
     if run is None:
         raise OnyxError(OnyxErrorCode.NOT_FOUND, "Scheduled task run not found")
+    if status.is_terminal() and run.status != status:
+        run.version += 1
     run.status = status
     if session_id is not None:
         run.session_id = session_id
@@ -409,6 +483,7 @@ def list_runs_for_task(
     user_id: UUID,
     cursor: datetime | None = None,
     limit: int = 50,
+    unviewed_only: bool = False,
 ) -> list[ScheduledTaskRun]:
     """List runs for a task, newest first, optionally paginated by ``started_at``.
 
@@ -428,6 +503,11 @@ def list_runs_for_task(
     conditions = [ScheduledTaskRun.task_id == task_id]
     if cursor is not None:
         conditions.append(ScheduledTaskRun.started_at < cursor)
+    if unviewed_only:
+        conditions.append(
+            func.coalesce(ScheduledTaskRun.viewed_revision, 0)
+            < ScheduledTaskRun.version
+        )
 
     stmt = (
         select(ScheduledTaskRun)
@@ -436,6 +516,69 @@ def list_runs_for_task(
         .limit(limit)
     )
     return list(db_session.execute(stmt).scalars())
+
+
+def unread_run_counts_for_user(
+    *,
+    db_session: Session,
+    user_id: UUID,
+) -> dict[UUID, int]:
+    """Count runs with unviewed results per non-deleted task of ``user_id``."""
+    rows = db_session.execute(
+        select(ScheduledTaskRun.task_id, func.count())
+        .join(ScheduledTask, ScheduledTaskRun.task_id == ScheduledTask.id)
+        .where(
+            ScheduledTask.user_id == user_id,
+            ScheduledTask.deleted.is_(False),
+            func.coalesce(ScheduledTaskRun.viewed_revision, 0)
+            < ScheduledTaskRun.version,
+        )
+        .group_by(ScheduledTaskRun.task_id)
+    ).tuples()
+    return dict(rows.all())
+
+
+def mark_runs_viewed(
+    *,
+    db_session: Session,
+    task_id: UUID,
+    user_id: UUID,
+    revisions: dict[UUID, int],
+) -> list[ScheduledTaskRun]:
+    """Acknowledge only supplied revisions; newer results stay unread.
+
+    Raises ``OnyxError(NOT_FOUND)`` for a task the user cannot see and
+    ``ValueError`` when a revision is newer than the run's current version.
+    """
+    get_scheduled_task(db_session=db_session, task_id=task_id, user_id=user_id)
+    if not revisions:
+        return []
+    # Lock before validating so the complete request succeeds or fails together.
+    rows = db_session.execute(
+        select(ScheduledTaskRun.id, ScheduledTaskRun.version)
+        .where(
+            ScheduledTaskRun.task_id == task_id,
+            ScheduledTaskRun.id.in_(revisions),
+        )
+        .order_by(ScheduledTaskRun.id)
+        .with_for_update()
+    ).all()
+    if any(revisions[run_id] > version for run_id, version in rows):
+        raise ValueError("Run revision is newer than the current run")
+    if not rows:
+        return []
+    viewed = case(revisions, value=ScheduledTaskRun.id)
+    return list(
+        db_session.scalars(
+            update(ScheduledTaskRun)
+            .where(ScheduledTaskRun.id.in_([run_id for run_id, _ in rows]))
+            .values(
+                viewed_revision=func.greatest(ScheduledTaskRun.viewed_revision, viewed)
+            )
+            .returning(ScheduledTaskRun)
+            .execution_options(populate_existing=True, synchronize_session=False)
+        )
+    )
 
 
 def find_stuck_runs(
@@ -487,7 +630,14 @@ def get_scheduled_run_context(
 
     Result shape::
 
-        {"task_id": UUID, "task_name": str, "started_at": datetime}
+        {
+            "run_id": UUID,
+            "task_id": UUID,
+            "task_name": str,
+            "status": ScheduledTaskRunStatus,
+            "started_at": datetime,
+            "finished_at": datetime | None,
+        }
 
     Returns ``None`` when the session was not produced by a scheduled run,
     or when the owning task is not accessible to ``user_id``.
@@ -505,7 +655,12 @@ def get_scheduled_run_context(
         return None
     run, task = row
     return {
+        "run_id": run.id,
         "task_id": task.id,
         "task_name": task.name,
+        "status": run.status,
         "started_at": run.started_at,
+        "finished_at": run.finished_at,
+        "revision": run.version,
+        "viewed_revision": run.viewed_revision,
     }

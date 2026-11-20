@@ -1,4 +1,21 @@
-import type { OnboardingActions } from "@/interfaces/onboarding";
+import type { OnboardingActions } from "@/lib/onboarding/types";
+import type { LLMProviderConfiguredSource } from "@/lib/analytics/utils";
+import type { FunctionComponent } from "react";
+import type { IconFunctionComponent, IconProps } from "@opal/types";
+
+/**
+ * Per-session reasoning-effort override. Mirrors the backend ReasoningEffort
+ * enum minus "auto", since no override (null) already means auto.
+ */
+export type ReasoningEffortOverride =
+  | "off"
+  | "low"
+  | "medium"
+  | "high"
+  | "xhigh";
+
+/** A model name whose text the frontend owns, because it is translated. */
+export type ModelDisplayNameCode = "openai_decisions";
 
 export interface ModelConfiguration {
   id?: number;
@@ -7,16 +24,52 @@ export interface ModelConfiguration {
   max_input_tokens: number | null;
   supports_image_input: boolean;
   supports_reasoning: boolean;
+  supports_chat?: boolean;
+  supports_decisions?: boolean;
+  /**
+   * Effort levels this model tells apart, ascending, as resolved by the
+   * backend that builds the request. Absent from an older backend, in which
+   * case the picker falls back to the levels every reasoning model supports.
+   */
+  supported_reasoning_efforts?: ReasoningEffortOverride[];
+  /** What the admin permits or defaults, distinct from
+   *  supported_reasoning_efforts (what the model can do). Null means unset. */
+  reasoning_effort_max?: ReasoningEffortOverride | null;
+  reasoning_effort_default?: ReasoningEffortOverride | null;
+  temperature_default?: number | null;
+  /** Display-only metadata surfaced in the model picker (Nebius TokenFactory). */
+  quantization?: string | null;
+  country_code?: string | null;
+  requests_per_minute?: number | null;
+  supported_features?: string[];
+  /** True when this is the provider's recommended default model. */
+  is_recommended_default?: boolean;
+  /** Virtual entry that delegates model selection to a routing layer
+   *  (openrouter/auto, a Portkey config) rather than naming a model. */
+  is_router?: boolean;
   display_name?: string;
   /** Admin-set override that takes precedence over display_name everywhere in the UI. */
-  custom_display_name?: string;
+  custom_display_name?: string | null;
+  /** Set by the API for a model with a translated name, such as the OpenAI
+   *  decision model. Wins over display_name, not over custom_display_name. */
+  display_name_code?: ModelDisplayNameCode | null;
   provider_display_name?: string;
   vendor?: string;
   version?: string;
   region?: string;
+  /**
+   * Frontend-derived. Always populated by the SWR hooks before data reaches
+   * any consumer. Resolution order: custom_display_name → display_name_code
+   * label → display_name → name (`resolveModelDisplayName`).
+   * Use this field everywhere a model name is rendered — never read
+   * custom_display_name / display_name / name directly for display purposes.
+   */
+  effectiveDisplayName: string;
 }
 
 export enum LLMProviderName {
+  TYPESAFE = "typesafe",
+  ZOOM_AI = "zoom_ai",
   OPENAI = "openai",
   ANTHROPIC = "anthropic",
   OLLAMA_CHAT = "ollama_chat",
@@ -29,8 +82,15 @@ export enum LLMProviderName {
   LITELLM_PROXY = "litellm_proxy",
   BIFROST = "bifrost",
   OPENAI_COMPATIBLE = "openai_compatible",
+  NEBIUS_TOKENFACTORY = "nebius_tokenfactory",
+  PORTKEY = "portkey",
+  VERCEL_AI_GATEWAY = "vercel_ai_gateway",
   CUSTOM = "custom",
 }
+
+export type PortkeyApiMode = "chat_completions" | "responses" | "messages";
+
+export type BifrostApiMode = "chat_completions" | "responses";
 
 export interface SimpleKnownModel {
   name: string;
@@ -51,6 +111,7 @@ export interface LLMModelDescriptor {
 
 export interface LLMProviderView {
   id: number;
+  zoom_voice_provider_id?: number | null;
   name: string | null;
   provider: string;
   api_key: string | null;
@@ -63,6 +124,9 @@ export interface LLMProviderView {
   personas: number[];
   deployment_name: string | null;
   model_configurations: ModelConfiguration[];
+  /** Set when the listing was asked to page models: the first unloaded
+   *  offset, or null when every model is included. */
+  next_model_configuration_offset?: number | null;
 }
 
 export interface VisionProvider extends LLMProviderView {
@@ -75,6 +139,36 @@ export interface LLMProviderDescriptor {
   provider: string;
   provider_display_name: string;
   model_configurations: ModelConfiguration[];
+  /** First stored model the listing left out, for `ModelPaging` to continue
+   *  from. Null when every model is loaded, absent from an older backend. */
+  next_model_configuration_offset?: number | null;
+}
+
+/** One page of a provider's models past what the listing returned. */
+export interface ModelConfigurationPage {
+  model_configurations: ModelConfiguration[];
+  /** Null at the end of the list, or of the matches for a name search. */
+  next_offset: number | null;
+}
+
+/** Pulls in the models the listing left out: a provider past the server's
+ *  page size arrives truncated, so the picker loads the next page on scroll
+ *  and searches the unloaded rest on the server, into the shared list. */
+export interface ModelPaging {
+  hasMore: boolean;
+  isLoading: boolean;
+  /** Loads the next page of the first listed provider that still has
+   *  unloaded models, in the order given (any provider when omitted).
+   *  Resolves false when no listed provider has unloaded models. */
+  loadMore: (providerIds?: number[]) => Promise<boolean>;
+  /** Fetches the first window of server matches for every provider with
+   *  unloaded models. Resolves false when a page load was in flight and the
+   *  search was skipped, so the caller can retry once that load settles. */
+  search: (query: string) => Promise<boolean>;
+  /** The last search left matches on the server. */
+  searchHasMore: boolean;
+  /** Fetches the next window of the last search's matches. */
+  loadMoreSearch: () => Promise<void>;
 }
 
 export interface OllamaModelResponse {
@@ -85,10 +179,13 @@ export interface OllamaModelResponse {
 }
 
 export interface OpenRouterModelResponse {
+  supports_chat?: boolean;
+  supports_decisions?: boolean;
   name: string;
   display_name: string;
   max_input_tokens: number | null;
   supports_image_input: boolean;
+  is_router: boolean;
 }
 
 export interface BedrockModelResponse {
@@ -115,6 +212,9 @@ export interface LLMProviderResponse<T> {
   providers: T[];
   default_text: DefaultModel | null;
   default_vision: DefaultModel | null;
+  default_search_selection: DefaultModel | null;
+  default_chat_naming: DefaultModel | null;
+  default_craft: DefaultModel | null;
 }
 
 export type LLMModalVariant = "onboarding" | "llm-configuration";
@@ -126,6 +226,8 @@ export interface LLMProviderFormProps {
   onOpenChange?: (open: boolean) => void;
   /** Called after successful provider creation/update. */
   onSuccess?: () => void | Promise<void>;
+  /** Overrides the analytics source derived from the variant. */
+  analyticsSource?: LLMProviderConfiguredSource;
 
   // Onboarding-specific (only when variant === "onboarding")
   onboardingActions?: OnboardingActions;
@@ -136,25 +238,27 @@ export interface BedrockFetchParams {
   aws_access_key_id?: string;
   aws_secret_access_key?: string;
   aws_bearer_token_bedrock?: string;
-  provider_name?: string;
+  aws_role_name?: string;
+  aws_external_id?: string;
+  provider_id?: number;
 }
 
 export interface OllamaFetchParams {
   api_base?: string;
-  provider_name?: string;
+  provider_id?: number;
   signal?: AbortSignal;
 }
 
 export interface OpenRouterFetchParams {
   api_base?: string;
   api_key?: string;
-  provider_name?: string;
+  provider_id?: number;
 }
 
 export interface LiteLLMProxyFetchParams {
   api_base?: string;
   api_key?: string;
-  provider_name?: string;
+  provider_id?: number;
   signal?: AbortSignal;
 }
 
@@ -170,7 +274,7 @@ export interface LiteLLMProxyModelResponse {
 export interface BifrostFetchParams {
   api_base?: string;
   api_key?: string;
-  provider_name?: string;
+  provider_id?: number;
   signal?: AbortSignal;
 }
 
@@ -185,11 +289,62 @@ export interface BifrostModelResponse {
 export interface OpenAICompatibleFetchParams {
   api_base?: string;
   api_key?: string;
-  provider_name?: string;
+  provider_id?: number;
   signal?: AbortSignal;
 }
 
 export interface OpenAICompatibleModelResponse {
+  name: string;
+  display_name: string;
+  max_input_tokens: number | null;
+  supports_image_input: boolean;
+  supports_reasoning: boolean;
+}
+
+export interface NebiusTokenfactoryFetchParams {
+  api_base?: string;
+  api_key?: string;
+  provider_id?: number;
+  signal?: AbortSignal;
+}
+
+export interface NebiusTokenfactoryModelResponse {
+  name: string;
+  display_name: string;
+  max_input_tokens: number | null;
+  supports_image_input: boolean;
+  supports_reasoning: boolean;
+  quantization: string | null;
+  country_code: string | null;
+  requests_per_minute: number | null;
+  supported_features: string[];
+}
+
+export interface PortkeyFetchParams {
+  api_base?: string;
+  api_key?: string;
+  provider_id?: number;
+  signal?: AbortSignal;
+}
+
+export interface PortkeyModelResponse {
+  name: string;
+  display_name: string;
+  max_input_tokens: number | null;
+  supports_image_input: boolean;
+  supports_reasoning: boolean;
+}
+
+export interface VercelAIGatewayFetchParams {
+  api_base?: string;
+  api_key?: string;
+  provider_id?: number;
+  signal?: AbortSignal;
+}
+
+export interface VercelAIGatewayModelResponse {
+  supports_chat?: boolean;
+  supports_decisions?: boolean;
   name: string;
   display_name: string;
   max_input_tokens: number | null;
@@ -205,7 +360,7 @@ export interface LMStudioFetchParams {
   api_base?: string;
   api_key?: string;
   api_key_changed?: boolean;
-  provider_name?: string;
+  provider_id?: number;
   signal?: AbortSignal;
 }
 
@@ -218,3 +373,147 @@ export type FetchModelsParams =
   | OpenAICompatibleFetchParams
   | VertexAIFetchParams
   | LMStudioFetchParams;
+
+// ---------------------------------------------------------------------------
+// Option, hook and registry shapes
+// ---------------------------------------------------------------------------
+
+export type ModelOptionProvider = Pick<
+  LLMProviderDescriptor,
+  "id" | "name" | "provider" | "model_configurations"
+>;
+
+export interface LLMOption {
+  name: string;
+  provider: string;
+  /** Owning provider row, for paging that provider's remaining models. */
+  providerId?: number;
+  providerDisplayName: string;
+  modelName: string;
+  modelConfigurationId?: number | null;
+  displayName: string;
+  description?: string;
+  vendor: string | null;
+  maxInputTokens?: number | null;
+  region?: string | null;
+  version?: string | null;
+  supportsReasoning?: boolean;
+  /** See ModelConfiguration.supported_reasoning_efforts. */
+  supportedReasoningEfforts?: ReasoningEffortOverride[];
+  /** See ModelConfiguration.reasoning_effort_max. */
+  reasoningEffortMax?: ReasoningEffortOverride | null;
+  reasoningEffortDefault?: ReasoningEffortOverride | null;
+  temperatureDefault?: number | null;
+  supportsImageInput?: boolean;
+  /** See ModelConfiguration.is_router. */
+  isRouter?: boolean;
+  /** Synthesized picker item for model routing; selects the backing router. */
+  isAuto?: boolean;
+}
+
+export interface LLMOptionGroup {
+  key: string;
+  displayName: string;
+  options: LLMOption[];
+  Icon: FunctionComponent<IconProps>;
+}
+
+export interface FilterModelConfigurationsOptions {
+  includeDecisionOnly?: boolean;
+  /** Keep only models that accept image input. */
+  imageInput?: boolean;
+  /** A configuration id kept regardless: the current value stays listed. */
+  keep?: number | null;
+}
+
+export interface CustomProviderOption {
+  value: string;
+  label: string;
+}
+
+export interface DefaultLlmReference {
+  /**
+   * The provider row this default belongs to. `llm_provider.name` carries no
+   * unique constraint and is nullable, so it can neither identify a provider
+   * nor be relied on to exist. Always key off this.
+   */
+  providerId: number;
+  modelName: string;
+}
+
+export interface LlmDefaults {
+  /** Raw provider list, passed through from `useLanguageModels`. */
+  llmProviders: LLMProviderDescriptor[] | undefined;
+  /** True iff any provider exposes at least one visible model. */
+  hasAnyLlm: boolean;
+  /** True iff any provider exposes a visible model with `supports_image_input`. */
+  hasAnyVisionLlm: boolean;
+  /**
+   * The admin-configured default text model as `{ providerId, modelName }`.
+   * The backend stores `default_text` as `{ provider_id, model_name }`; this
+   * hook only confirms the provider is still in the list.
+   */
+  defaultLlm: DefaultLlmReference | null;
+  /**
+   * The admin-configured default *vision* model, in the same shape as
+   * `defaultLlm`. Used by indexing-time captioning and any other vision-only
+   * feature.
+   */
+  defaultVision: DefaultLlmReference | null;
+  isLoading: boolean;
+}
+
+/**
+ * Admin-set negotiated rate for one model configuration, overriding the
+ * built-in price book. Rates are USD per MILLION tokens.
+ */
+export interface CostOverride {
+  model_configuration_id: number;
+  /** The model's API name. */
+  model_name: string;
+  /** The name to show (custom, then display, then API name). */
+  model_display_name: string;
+  llm_provider_id: number;
+  /** The provider's own name; null when unnamed. */
+  llm_provider_name: string | null;
+  /** Provider type, e.g. "openai". */
+  provider: string;
+  input_cost_per_mtok: number;
+  output_cost_per_mtok: number;
+  cache_read_cost_per_mtok: number | null; // null = bill cache at the input rate
+  updated_at: string | null;
+}
+
+/** PUT body: an override's rates. */
+export interface CostOverrideRates {
+  input_cost_per_mtok: number;
+  output_cost_per_mtok: number;
+  cache_read_cost_per_mtok: number | null;
+}
+
+/** POST body: a new override for a model configuration that has none. */
+export interface CostOverrideCreate extends CostOverrideRates {
+  model_configuration_id: number;
+}
+
+/** PUT body: new rates, and optionally another model to move the override to. */
+export interface CostOverrideUpdate extends CostOverrideRates {
+  model_configuration_id?: number;
+}
+
+/**
+ * A provider whose names are copy rather than brand names. Its names come from
+ * `admin.languageModels.providers.<key>`; show them with `useProviderNames`.
+ */
+export type ProviderCopyKey = "custom" | "openAICompatible";
+
+export interface ProviderEntry {
+  decisionOnly?: boolean;
+  icon: IconFunctionComponent;
+  /** A brand name, or the provider key when `copyKey` holds its names. */
+  productName: string;
+  /** A brand name, or the provider key when `copyKey` holds its names. */
+  companyName: string;
+  copyKey?: ProviderCopyKey;
+  Modal: React.ComponentType<LLMProviderFormProps>;
+}

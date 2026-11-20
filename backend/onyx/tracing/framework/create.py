@@ -1,25 +1,37 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
-from collections.abc import Mapping
-from collections.abc import Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from typing import Any
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+
+from pydantic import BaseModel, Field, JsonValue
 
 from onyx.utils.logger import setup_logger
+from shared_configs.contextvars import get_current_tenant_id
 
 from .setup import get_trace_provider
-from .span_data import AgentSpanData
-from .span_data import FunctionSpanData
-from .span_data import GenerationSpanData
+from .span_data import AgentSpanData, FunctionSpanData, GenerationSpanData
 from .spans import Span
-from .traces import Trace
+from .traces import Trace, TraceContentMode
 
 if TYPE_CHECKING:
     pass
 
 logger = setup_logger(__name__)
+
+
+class ChatTraceMetadata(BaseModel):
+    tenant_id: str = Field(default_factory=get_current_tenant_id)
+    chat_session_id: str | None = None
+    user_id: str | None = None
+
+
+class SearchTraceMetadata(BaseModel):
+    """Trace metadata for search entry points that have no chat session."""
+
+    tenant_id: str = Field(default_factory=get_current_tenant_id)
+    user_id: str | None = None
+    persona_id: int | None = None
 
 
 def trace(
@@ -28,6 +40,7 @@ def trace(
     group_id: str | None = None,
     metadata: dict[str, Any] | None = None,
     disabled: bool = False,
+    content_mode: TraceContentMode = TraceContentMode.FULL,
 ) -> Trace:
     """
     Create a new trace. The trace will not be started automatically; you should either use
@@ -63,6 +76,7 @@ def trace(
         trace_id=trace_id,
         group_id=group_id,
         metadata=metadata,
+        content_mode=content_mode,
         disabled=disabled,
     )
 
@@ -74,6 +88,7 @@ def ensure_trace(
     group_id: str | None = None,
     metadata: dict[str, Any] | None = None,
     disabled: bool = False,
+    content_mode: TraceContentMode = TraceContentMode.FULL,
 ) -> Iterator[Trace | None]:
     """
     Ensure a trace exists. If a trace is already active, reuse it.
@@ -89,6 +104,7 @@ def ensure_trace(
         trace_id=trace_id,
         group_id=group_id,
         metadata=metadata,
+        content_mode=content_mode,
         disabled=disabled,
     ) as created_trace:
         yield created_trace
@@ -148,6 +164,8 @@ def function_span(
     span_id: str | None = None,
     parent: Trace | Span[Any] | None = None,
     disabled: bool = False,
+    *,
+    metadata: Mapping[str, JsonValue] | None = None,
 ) -> Span[FunctionSpanData]:
     """Create a new function span. The span will not be started automatically, you should either do
     `with function_span() ...` or call `span.start()` + `span.finish()` manually.
@@ -162,12 +180,15 @@ def function_span(
         parent: The parent span or trace. If not provided, we will automatically use the current
             trace/span as the parent.
         disabled: If True, we will return a Span but the Span will not be recorded.
+        metadata: Attributes of the call, for filtering.
 
     Returns:
         The newly created function span.
     """
     return get_trace_provider().create_span(
-        span_data=FunctionSpanData(name=name, input=input, output=output),
+        span_data=FunctionSpanData(
+            name=name, input=input, output=output, metadata=metadata
+        ),
         span_id=span_id,
         parent=parent,
         disabled=disabled,
@@ -180,11 +201,15 @@ def generation_span(
     reasoning: str | None = None,
     model: str | None = None,
     model_config: Mapping[str, Any] | None = None,
+    image_count: int | None = None,
     usage: dict[str, Any] | None = None,
     time_to_first_action_seconds: float | None = None,
+    tools: Sequence[Mapping[str, Any]] | None = None,
     span_id: str | None = None,
     parent: Trace | Span[Any] | None = None,
     disabled: bool = False,
+    content_mode: TraceContentMode | None = None,
+    model_configuration_id: int | None = None,
 ) -> Span[GenerationSpanData]:
     """Create a new generation span. The span will not be started automatically, you should either
     do `with generation_span() ...` or call `span.start()` + `span.finish()` manually.
@@ -200,14 +225,17 @@ def generation_span(
         reasoning: The reasoning/thinking content from reasoning models (e.g., Claude extended thinking).
         model: The model identifier used for the generation.
         model_config: The model configuration (hyperparameters) used.
+        image_count: Number of images produced by an image generation call.
         usage: A dictionary of usage information (input tokens, output tokens, etc.).
         time_to_first_action_seconds: Time elapsed before the first model action is observed.
+        tools: The full tool schemas (name, description, parameters) offered to the model on this call.
         span_id: The ID of the span. Optional. If not provided, we will generate an ID. We
             recommend using `util.gen_span_id()` to generate a span ID, to guarantee that IDs are
             correctly formatted.
         parent: The parent span or trace. If not provided, we will automatically use the current
             trace/span as the parent.
         disabled: If True, we will return a Span but the Span will not be recorded.
+        model_configuration_id: The saved model configuration the call ran, when known.
 
     Returns:
         The newly created generation span.
@@ -219,10 +247,14 @@ def generation_span(
             reasoning=reasoning,
             model=model,
             model_config=model_config,
+            image_count=image_count,
             usage=usage,
             time_to_first_action_seconds=time_to_first_action_seconds,
+            tools=tools,
+            model_configuration_id=model_configuration_id,
         ),
         span_id=span_id,
         parent=parent,
+        content_mode=content_mode,
         disabled=disabled,
     )

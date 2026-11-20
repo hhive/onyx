@@ -1,25 +1,26 @@
 "use client";
 
+import { useParams, useNavigation } from "@opal/navigation";
+import { IconLoader } from "@opal/loaders";
 import { useCallback } from "react";
-import { useParams, useRouter } from "next/navigation";
+import { useTranslations } from "next-intl";
 import useSWR from "swr";
-import * as SettingsLayouts from "@/layouts/settings-layouts";
+import { SettingsLayouts } from "@opal/layouts";
 import { SvgClock } from "@opal/icons";
-import SimpleLoader from "@/refresh-components/loaders/SimpleLoader";
-import Text from "@/refresh-components/texts/Text";
+import { Text } from "@opal/components";
 import ScheduleTaskForm, {
   type ScheduleTaskFormInitial,
 } from "@/app/craft/v1/tasks/components/ScheduleTaskForm";
-import type { ScheduledTaskDetail } from "@/app/craft/v1/tasks/interfaces";
+import type { ScheduledTaskDetail } from "@/app/craft/v1/tasks/types";
 import { TASKS_PATH, taskDetailPath } from "@/app/craft/v1/tasks/constants";
-import { decodeCronToPayload } from "@/app/craft/v1/tasks/schedule";
-import { getBrowserTimezone } from "@/app/craft/v1/tasks/utils";
+import { decodeUtcCronToLocalPayload } from "@/app/craft/v1/tasks/schedule";
 import { SWR_KEYS } from "@/lib/swr-keys";
 import { errorHandlingFetcher } from "@/lib/fetcher";
 
 export default function EditScheduledTaskPage() {
+  const t = useTranslations("craft.tasks.editPage");
   const params = useParams<{ id: string }>();
-  const router = useRouter();
+  const navigation = useNavigation();
   const taskId = params?.id;
 
   const { data, error, isLoading } = useSWR<ScheduledTaskDetail>(
@@ -29,50 +30,60 @@ export default function EditScheduledTaskPage() {
   );
 
   const handleBack = useCallback(() => {
-    if (taskId) router.push(taskDetailPath(taskId));
-    else router.push(TASKS_PATH);
-  }, [router, taskId]);
+    if (taskId) navigation.go(taskDetailPath(taskId));
+    else navigation.go(TASKS_PATH);
+  }, [navigation, taskId]);
 
   if (!taskId) {
     return (
-      <SettingsLayouts.Root width="lg">
+      <SettingsLayouts.Root>
         <SettingsLayouts.Header
           icon={SvgClock}
-          title="Edit scheduled task"
-          backButton
-          onBack={handleBack}
+          title={t("fallbackTitle")}
+          cancel={handleBack}
+          divider
         />
         <SettingsLayouts.Body>
-          <Text mainUiBody text03>
-            Missing task id.
+          <Text font="main-ui-body" color="text-03">
+            {t("missingTaskId")}
           </Text>
         </SettingsLayouts.Body>
       </SettingsLayouts.Root>
     );
   }
 
+  if (isLoading || error || !data) {
+    return (
+      <SettingsLayouts.Root>
+        <SettingsLayouts.Header
+          icon={SvgClock}
+          title={data ? t("title", { name: data.name }) : t("fallbackTitle")}
+          cancel={handleBack}
+          divider
+        />
+        <SettingsLayouts.Body>
+          {isLoading ? (
+            <div className="flex justify-center py-12">
+              <IconLoader className="h-6 w-6" />
+            </div>
+          ) : (
+            <Text font="main-ui-body" color="text-03">
+              {t("loadFailed")}
+            </Text>
+          )}
+        </SettingsLayouts.Body>
+      </SettingsLayouts.Root>
+    );
+  }
+
   return (
-    <SettingsLayouts.Root width="lg">
-      <SettingsLayouts.Header
-        icon={SvgClock}
-        title={data ? `Edit "${data.name}"` : "Edit scheduled task"}
-        backButton
-        onBack={handleBack}
-      />
-      <SettingsLayouts.Body>
-        {isLoading ? (
-          <div className="flex justify-center py-12">
-            <SimpleLoader className="h-6 w-6" />
-          </div>
-        ) : error || !data ? (
-          <Text mainUiBody text03>
-            Failed to load scheduled task.
-          </Text>
-        ) : (
-          <ScheduleTaskForm initial={toFormInitial(data)} isEdit />
-        )}
-      </SettingsLayouts.Body>
-    </SettingsLayouts.Root>
+    <ScheduleTaskForm
+      key={data.id}
+      initial={toFormInitial(data)}
+      isEdit
+      title={t("title", { name: data.name })}
+      onBack={handleBack}
+    />
   );
 }
 
@@ -82,7 +93,7 @@ function toFormInitial(detail: ScheduledTaskDetail): ScheduleTaskFormInitial {
   // cron can't be decoded back into the chosen mode (rare, e.g. someone
   // hand-edited via the API), we fall back to ``advanced`` mode so the user
   // sees the raw expression.
-  const { mode, payload } = decodeCronToPayload(
+  const { mode, payload } = decodeUtcCronToLocalPayload(
     detail.editor_mode,
     detail.cron_expression
   );
@@ -92,6 +103,5 @@ function toFormInitial(detail: ScheduledTaskDetail): ScheduleTaskFormInitial {
     prompt: detail.prompt,
     mode,
     payload,
-    timezone: detail.timezone || getBrowserTimezone(),
   };
 }

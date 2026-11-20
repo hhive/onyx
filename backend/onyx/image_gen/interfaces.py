@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import abc
-from typing import Any
-from typing import TYPE_CHECKING
+from enum import Enum
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel
 
@@ -10,6 +10,12 @@ from onyx.image_gen.exceptions import ImageProviderCredentialsError
 
 if TYPE_CHECKING:
     from litellm.types.utils import ImageResponse as ImageGenerationResponse
+
+
+class ImageShape(str, Enum):
+    SQUARE = "square"
+    PORTRAIT = "portrait"
+    LANDSCAPE = "landscape"
 
 
 class ImageGenerationProviderCredentials(BaseModel):
@@ -50,9 +56,7 @@ class ImageGenerationProvider(abc.ABC):
         credentials: ImageGenerationProviderCredentials,
     ) -> ImageGenerationProvider:
         if not cls.validate_credentials(credentials):
-            raise ImageProviderCredentialsError(
-                f"Invalid image generation credentials: {credentials}"
-            )
+            raise ImageProviderCredentialsError("Invalid image generation credentials")
         return cls._build_from_credentials(credentials)
 
     @classmethod
@@ -65,7 +69,7 @@ class ImageGenerationProvider(abc.ABC):
         Given credentials, builds an instance of the provider.
         Should NOT be called directly - use build_from_credentials instead.
 
-        AssertionError if credentials are invalid.
+        Raises ImageProviderCredentialsError if credentials are invalid.
         """
         raise NotImplementedError("build_from_credentials not implemented")
 

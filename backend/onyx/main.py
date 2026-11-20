@@ -4,109 +4,130 @@ import traceback
 import warnings
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from typing import Any
-from typing import cast
+from typing import Any, cast
 
-import sentry_sdk
 import uvicorn
-from fastapi import APIRouter
-from fastapi import FastAPI
-from fastapi import HTTPException
-from fastapi import Request
-from fastapi import status
+from anyio import to_thread
+from fastapi import APIRouter, FastAPI, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 from httpx_oauth.clients.google import GoogleOAuth2
-from httpx_oauth.clients.openid import BASE_SCOPES
-from httpx_oauth.clients.openid import OpenID
 from sentry_sdk.integrations.fastapi import FastApiIntegration
 from sentry_sdk.integrations.starlette import StarletteIntegration
+from starlette.concurrency import run_in_threadpool
 from starlette.types import Lifespan
 
 from onyx import __version__
-from onyx.auth.schemas import UserCreate
-from onyx.auth.schemas import UserRead
-from onyx.auth.schemas import UserUpdate
-from onyx.auth.users import auth_backend
-from onyx.auth.users import create_onyx_oauth_router
-from onyx.auth.users import fastapi_users
-from onyx.cache.interface import CacheBackendType
-from onyx.configs.app_configs import APP_API_PREFIX
-from onyx.configs.app_configs import APP_HOST
-from onyx.configs.app_configs import APP_PORT
-from onyx.configs.app_configs import AUTH_RATE_LIMITING_ENABLED
-from onyx.configs.app_configs import AUTH_TYPE
-from onyx.configs.app_configs import CACHE_BACKEND
-from onyx.configs.app_configs import DISABLE_VECTOR_DB
-from onyx.configs.app_configs import GOOGLE_LOGIN_BASE_SCOPES
-from onyx.configs.app_configs import GOOGLE_OAUTH_SCOPE_OVERRIDE
-from onyx.configs.app_configs import LOG_ENDPOINT_LATENCY
-from onyx.configs.app_configs import OAUTH_CLIENT_ID
-from onyx.configs.app_configs import OAUTH_CLIENT_SECRET
-from onyx.configs.app_configs import OAUTH_ENABLED
-from onyx.configs.app_configs import OIDC_PKCE_ENABLED
-from onyx.configs.app_configs import OIDC_SCOPE_OVERRIDE
-from onyx.configs.app_configs import OPENID_CONFIG_URL
-from onyx.configs.app_configs import POSTGRES_API_SERVER_POOL_OVERFLOW
-from onyx.configs.app_configs import POSTGRES_API_SERVER_POOL_SIZE
-from onyx.configs.app_configs import POSTGRES_API_SERVER_READ_ONLY_POOL_OVERFLOW
-from onyx.configs.app_configs import POSTGRES_API_SERVER_READ_ONLY_POOL_SIZE
-from onyx.configs.app_configs import SYSTEM_RECURSION_LIMIT
-from onyx.configs.app_configs import USER_AUTH_SECRET
-from onyx.configs.app_configs import WEB_DOMAIN
-from onyx.configs.constants import AuthType
-from onyx.configs.constants import POSTGRES_WEB_APP_NAME
-from onyx.db.engine.async_sql_engine import get_sqlalchemy_async_engine
-from onyx.db.engine.async_sql_engine import reset_sqlalchemy_async_engine
+from onyx.auth.schemas import UserCreate, UserRead, UserUpdate
+from onyx.auth.users import (
+    auth_backend,
+    create_onyx_oauth_router,
+    fastapi_users,
+    mobile_auth_backend,
+    verify_auth_setting,
+    verify_user_auth_secret,
+)
+from onyx.chat.execution import chat_turn_work
+from onyx.configs.app_configs import (
+    API_SERVER_THREADPOOL_SIZE,
+    APP_API_PREFIX,
+    APP_HOST,
+    APP_PORT,
+    AUTH_BACKEND,
+    CACHE_BACKEND,
+    DISABLE_VECTOR_DB,
+    ENABLE_PUBLIC_DOCS,
+    GOOGLE_LOGIN_BASE_SCOPES,
+    GOOGLE_OAUTH_SCOPE_OVERRIDE,
+    LOG_ENDPOINT_LATENCY,
+    OAUTH_CLIENT_ID,
+    OAUTH_CLIENT_SECRET,
+    OAUTH_ENABLED,
+    POSTGRES_API_SERVER_POOL_OVERFLOW,
+    POSTGRES_API_SERVER_POOL_SIZE,
+    POSTGRES_API_SERVER_READ_ONLY_POOL_OVERFLOW,
+    POSTGRES_API_SERVER_READ_ONLY_POOL_SIZE,
+    SYSTEM_RECURSION_LIMIT,
+    USER_AUTH_SECRET,
+    WEB_DOMAIN,
+)
+from onyx.configs.chat_configs import CHAT_EXECUTION_TIMEOUT_S
+from onyx.configs.constants import POSTGRES_WEB_APP_NAME, AuthBackend, CacheBackendType
+from onyx.db.engine.async_sql_engine import (
+    get_sqlalchemy_async_engine,
+    reset_sqlalchemy_async_engine,
+)
 from onyx.db.engine.connection_warmup import warm_up_connections
-from onyx.db.engine.sql_engine import get_session_with_current_tenant
-from onyx.db.engine.sql_engine import SqlEngine
+from onyx.db.engine.sql_engine import SqlEngine, get_session_with_current_tenant
+from onyx.db.sso_provider import seed_saml_provider_from_conf_dir
+from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import register_onyx_exception_handlers
 from onyx.file_store.file_store import get_default_file_store
 from onyx.hooks.registry import validate_registry
+from onyx.oauth_provider.config import OAUTH_PROVIDER_SETTINGS
+from onyx.redis.redis_pool import log_redis_server_diagnostics
 from onyx.server.api_key.api import router as api_key_router
-from onyx.server.auth.captcha_api import CaptchaCookieMiddleware
-from onyx.server.auth.captcha_api import LoginCaptchaMiddleware
+from onyx.server.auth.captcha_api import CaptchaCookieMiddleware, LoginCaptchaMiddleware
 from onyx.server.auth.captcha_api import router as captcha_router
+from onyx.server.auth.mobile import router as mobile_auth_router
 from onyx.server.auth_check import check_router_auth
 from onyx.server.documents.cc_pair import router as cc_pair_router
 from onyx.server.documents.connector import router as connector_router
+from onyx.server.documents.connector_edit import router as connector_edit_router
 from onyx.server.documents.credential import router as credential_router
+from onyx.server.documents.credential_capabilities import (
+    router as credential_capabilities_router,
+)
 from onyx.server.documents.document import router as document_router
+from onyx.server.documents.index_monitoring import router as index_monitoring_router
 from onyx.server.documents.standard_oauth import router as standard_oauth_router
 from onyx.server.documents.targeted_reindex import router as targeted_reindex_router
-from onyx.server.features.build.api.api import public_build_router
-from onyx.server.features.build.api.api import router as build_router
+from onyx.server.features.admin_banner.api import admin_router as admin_banner_router
+from onyx.server.features.build.api import admin_router as build_admin_router
+from onyx.server.features.build.api import router as build_router
+from onyx.server.features.build.configs import SANDBOX_RUNTIME, SandboxRuntime
+from onyx.server.features.build.static_preview import (
+    public_router as static_preview_router,
+)
+from onyx.server.features.build.webapp_proxy import public_build_router
 from onyx.server.features.default_assistant.api import (
     router as default_assistant_router,
 )
 from onyx.server.features.document_set.api import router as document_set_router
 from onyx.server.features.hierarchy.api import router as hierarchy_router
+from onyx.server.features.image_generation.api import router as image_generation_router
 from onyx.server.features.input_prompt.api import (
     admin_router as admin_input_prompt_router,
 )
 from onyx.server.features.input_prompt.api import basic_router as input_prompt_router
+from onyx.server.features.integrations.admin_api import (
+    router as admin_integrations_router,
+)
+from onyx.server.features.integrations.api import (
+    action_policies_router,
+    mobile_plugins_router,
+)
+from onyx.server.features.integrations.api import router as integrations_router
+from onyx.server.features.integrations.connections_api import (
+    router as integration_connections_router,
+)
 from onyx.server.features.mcp.api import admin_router as mcp_admin_router
 from onyx.server.features.mcp.api import router as mcp_router
+from onyx.server.features.microvm.api import router as microvm_router
 from onyx.server.features.notifications.api import router as notification_router
-from onyx.server.features.oauth_config.api import (
-    admin_router as admin_oauth_config_router,
-)
-from onyx.server.features.oauth_config.api import router as oauth_config_router
 from onyx.server.features.password.api import router as password_router
-from onyx.server.features.persona.api import admin_agents_router
+from onyx.server.features.persona.api import admin_agents_router, agents_router
 from onyx.server.features.persona.api import admin_router as admin_persona_router
-from onyx.server.features.persona.api import agents_router
 from onyx.server.features.persona.api import basic_router as persona_router
 from onyx.server.features.projects.api import router as projects_router
 from onyx.server.features.search.api import router as search_api_router
-from onyx.server.features.skill.api import admin_router as skill_admin_router
 from onyx.server.features.skill.api import user_router as skill_router
 from onyx.server.features.tool.api import admin_router as admin_tool_router
 from onyx.server.features.tool.api import router as tool_router
-from onyx.server.features.user_oauth_token.api import router as user_oauth_token_router
+from onyx.server.features.usage.api import admin_usage_router, user_usage_router
+from onyx.server.features.usage.api import router as cost_override_router
 from onyx.server.features.web_search.api import router as web_search_router
 from onyx.server.federated.api import router as federated_router
 from onyx.server.kg.api import admin_router as kg_admin_router
@@ -123,54 +144,68 @@ from onyx.server.manage.image_generation.api import (
 )
 from onyx.server.manage.llm.api import admin_router as llm_admin_router
 from onyx.server.manage.llm.api import basic_router as llm_router
-from onyx.server.manage.opensearch_migration.api import (
-    admin_router as opensearch_migration_admin_router,
-)
+from onyx.server.manage.oauth_test import router as oauth_test_admin_router
+from onyx.server.manage.opensearch_health.api import router as opensearch_health_router
 from onyx.server.manage.search_settings import router as search_settings_router
 from onyx.server.manage.slack_bot import router as slack_bot_management_router
+from onyx.server.manage.sso.api import admin_router as sso_admin_router
+from onyx.server.manage.tracing.api import admin_router as tracing_admin_router
 from onyx.server.manage.users import router as user_router
 from onyx.server.manage.voice.api import admin_router as voice_admin_router
 from onyx.server.manage.voice.user_api import router as voice_router
 from onyx.server.manage.voice.websocket_api import router as voice_websocket_router
 from onyx.server.manage.web_search.api import admin_router as web_search_admin_router
+from onyx.server.metrics.connector_state_metrics import register_connector_state_metrics
 from onyx.server.metrics.postgres_connection_pool import (
     setup_postgres_connection_pool_metrics,
 )
 from onyx.server.metrics.prometheus_setup import setup_prometheus_metrics
-from onyx.server.middleware.latency_logging import add_latency_logging_middleware
-from onyx.server.middleware.rate_limiting import close_auth_limiter
-from onyx.server.middleware.rate_limiting import get_auth_rate_limiters
-from onyx.server.middleware.rate_limiting import setup_auth_limiter
+from onyx.server.middleware.latency_logging import latency_logging_middleware
+from onyx.server.middleware.rate_limiting import (
+    RATE_LIMITING_ENABLED,
+    close_auth_limiter,
+    get_auth_rate_limiters,
+    setup_auth_limiter,
+)
+from onyx.server.oidc_multi import router as oidc_multi_router
 from onyx.server.onyx_api.ingestion import router as onyx_api_router
 from onyx.server.pat.api import router as pat_router
 from onyx.server.query_and_chat.chat_backend import router as chat_router
 from onyx.server.query_and_chat.query_backend import admin_router as admin_query_router
 from onyx.server.query_and_chat.query_backend import basic_router as query_router
-from onyx.server.saml import router as saml_router
+from onyx.server.saml_multi import router as saml_multi_router
+from onyx.server.security.api import admin_router as security_admin_router
+from onyx.server.security.store import seed_jwt_settings_from_env
 from onyx.server.settings.api import admin_router as settings_admin_router
 from onyx.server.settings.api import basic_router as settings_router
+from onyx.server.sso_discovery import router as sso_discovery_router
 from onyx.server.sub2api.api import router as sub2api_router
-from onyx.server.token_rate_limits.api import router as token_rate_limit_settings_router
+from onyx.server.sub2api.app_api import router as sub2api_app_router
 from onyx.server.utils import BasicAuthenticationError
-from onyx.setup import setup_multitenant_onyx
-from onyx.setup import setup_onyx
+from onyx.setup import setup_multitenant_onyx, setup_onyx
 from onyx.tracing.setup import setup_tracing
 from onyx.utils.client_ip import ClientIPMiddleware
-from onyx.utils.logger import setup_logger
-from onyx.utils.logger import setup_uvicorn_logger
-from onyx.utils.middleware import add_endpoint_context_middleware
-from onyx.utils.middleware import add_onyx_request_id_middleware
-from onyx.utils.telemetry import get_or_generate_uuid
-from onyx.utils.telemetry import optional_telemetry
-from onyx.utils.telemetry import RecordType
-from onyx.utils.variable_functionality import fetch_versioned_implementation
-from onyx.utils.variable_functionality import global_version
-from onyx.utils.variable_functionality import set_is_ee_based_on_env_variable
-from shared_configs.configs import CORS_ALLOWED_ORIGIN
-from shared_configs.configs import MULTI_TENANT
-from shared_configs.configs import POSTGRES_DEFAULT_SCHEMA
-from shared_configs.configs import SENTRY_DSN
-from shared_configs.configs import SENTRY_TRACES_SAMPLE_RATE
+from onyx.utils.encryption import validate_encryption_configuration
+from onyx.utils.fleet_telemetry import start_telemetry
+from onyx.utils.logger import setup_logger, setup_uvicorn_logger
+from onyx.utils.middleware import (
+    add_endpoint_context_middleware,
+    request_id_middleware,
+)
+from onyx.utils.variable_functionality import (
+    fetch_ee_implementation_or_noop,
+    fetch_versioned_implementation,
+    global_version,
+    set_is_ee_if_available,
+)
+from shared_configs.configs import (
+    CORS_ALLOW_CREDENTIALS,
+    CORS_ALLOWED_ORIGIN,
+    MULTI_TENANT,
+    POSTGRES_DEFAULT_SCHEMA,
+    SENTRY_DSN,
+    SENTRY_TRACES_SAMPLE_RATE,
+)
 from shared_configs.contextvars import CURRENT_TENANT_ID_CONTEXTVAR
 
 warnings.filterwarnings(
@@ -189,16 +224,23 @@ file_handlers = [
 setup_uvicorn_logger(shared_file_handlers=file_handlers)
 
 
-def validation_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+def validation_exception_handler(_: Request, exc: Exception) -> JSONResponse:
     if not isinstance(exc, RequestValidationError):
         logger.error(
             "Unexpected exception type in validation_exception_handler - %s", type(exc)
         )
         raise exc
 
-    exc_str = f"{exc}".replace("\n", " ").replace("   ", " ")
-    logger.exception("%s: %s", request, exc_str)
-    content = {"status_code": 422, "message": exc_str, "data": None}
+    exc_str = "Request validation failed."
+    logger.warning(exc_str)
+    # message/status_code/data are kept for existing clients; error_code and
+    # detail make the body match every other error the API returns.
+    content = {
+        "status_code": 422,
+        "message": exc_str,
+        "data": None,
+        **OnyxErrorCode.VALIDATION_ERROR.detail(exc_str),
+    }
     return JSONResponse(content=content, status_code=422)
 
 
@@ -212,9 +254,14 @@ def value_error_handler(_: Request, exc: Exception) -> JSONResponse:
     except Exception:
         # log stacktrace
         logger.exception("ValueError")
+    # "message" is what this handler has always returned; the code and detail
+    # are added so a bare ValueError reads like any other Onyx error.
     return JSONResponse(
         status_code=400,
-        content={"message": str(exc)},
+        content={
+            "message": str(exc),
+            **OnyxErrorCode.BAD_REQUEST.detail(str(exc)),
+        },
     )
 
 
@@ -321,6 +368,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:  # noqa: ARG001
         sys.setrecursionlimit(SYSTEM_RECURSION_LIMIT)
         logger.notice("System recursion limit set to %s", SYSTEM_RECURSION_LIMIT)
 
+    # Size the anyio threadpool that serves sync endpoints (incl. the streaming
+    # chat generator). Must run inside the event loop, as the limiter is per-loop.
+    if API_SERVER_THREADPOOL_SIZE > 0:
+        to_thread.current_default_thread_limiter().total_tokens = (
+            API_SERVER_THREADPOOL_SIZE
+        )
+        logger.notice(
+            "API server threadpool size set to %s", API_SERVER_THREADPOOL_SIZE
+        )
+
     SqlEngine.set_app_name(POSTGRES_WEB_APP_NAME)
 
     SqlEngine.init_engine(
@@ -337,6 +394,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:  # noqa: ARG001
     # Register pool metrics now that engines are created.
     # HTTP instrumentation is set up earlier in get_application() since it
     # adds middleware (which Starlette forbids after the app has started).
+    register_connector_state_metrics()
     setup_postgres_connection_pool_metrics(
         engines={
             "sync": SqlEngine.get_engine(),
@@ -345,12 +403,21 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:  # noqa: ARG001
         },
     )
 
-    verify_auth = fetch_versioned_implementation(
-        "onyx.auth.users", "verify_auth_setting"
-    )
+    # Self-hosted license seat + expiry gauges on /metrics (EE-only, no-op on CE)
+    fetch_ee_implementation_or_noop(
+        "onyx.server.metrics.license_metrics", "register_license_metrics"
+    )()
 
-    # Will throw exception if an issue is found
-    verify_auth()
+    # Warns on stale AUTH_TYPE env values.
+    verify_auth_setting()
+
+    # Will throw exception if USER_AUTH_SECRET is missing on a real deployment
+    verify_user_auth_secret()
+
+    # Surface Redis configs that can silently drop session keys. Only relevant
+    # when sessions live in Redis; lite deployments may not run Redis at all.
+    if AUTH_BACKEND == AuthBackend.REDIS:
+        await log_redis_server_diagnostics()
 
     if OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET:
         logger.notice("Both OAuth Client ID and Secret are configured.")
@@ -362,66 +429,96 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:  # noqa: ARG001
     await warm_up_connections()
 
     if not MULTI_TENANT:
-        # We cache this at the beginning so there is no delay in the first telemetry
         CURRENT_TENANT_ID_CONTEXTVAR.set(POSTGRES_DEFAULT_SCHEMA)
-        get_or_generate_uuid()
 
         # If we are multi-tenant, we need to only set up initial public tables
         with get_session_with_current_tenant() as db_session:
             setup_onyx(db_session, POSTGRES_DEFAULT_SCHEMA)
+            # Import a legacy single-config SAML_CONF_DIR into a provider row. The
+            # api_server has the mount the migration job lacks, so this is where it
+            # runs once, so deleting the imported row is final.
+            seed_saml_provider_from_conf_dir(db_session)
+            # No-op when env is unset or the row already matches.
+            seed_jwt_settings_from_env()
             # set up the file store (e.g. create bucket if needed). On multi-tenant,
             # this is done via IaC
             get_default_file_store().initialize()
     else:
         setup_multitenant_onyx()
 
-    if not MULTI_TENANT:
-        # don't emit a metric for every pod rollover/restart
-        optional_telemetry(
-            record_type=RecordType.VERSION, data={"version": __version__}
-        )
+    start_telemetry("api")
 
-    if AUTH_RATE_LIMITING_ENABLED:
+    if RATE_LIMITING_ENABLED:
         await setup_auth_limiter()
 
     if DISABLE_VECTOR_DB:
-        from onyx.background.periodic_poller import recover_stuck_user_files
-        from onyx.background.periodic_poller import start_periodic_poller
+        from onyx.background.periodic_poller import (
+            recover_stuck_user_files,
+            start_periodic_poller,
+        )
 
         recover_stuck_user_files(POSTGRES_DEFAULT_SCHEMA)
         start_periodic_poller(POSTGRES_DEFAULT_SCHEMA)
 
-    yield
-
-    if DISABLE_VECTOR_DB:
-        from onyx.background.periodic_poller import stop_periodic_poller
-
-        stop_periodic_poller()
-
-    # Dispose every Postgres connection pool we opened in startup. Order:
-    # async first (its disposal is awaitable and can block), then the two
-    # sync engines. Each dispose() is wrapped so one failure cannot leak the
-    # remaining pools — this path runs on every uvicorn ``--reload`` worker
-    # shutdown, and any leaked pool accumulates until PG hits max_connections.
+    # Shutdown runs even when the app exits with an error. Each step has its
+    # own try so one failure cannot skip the steps after it.
     try:
-        await reset_sqlalchemy_async_engine()
-    except Exception:
-        logger.exception("Failed to dispose async SQLAlchemy engine on shutdown")
-    try:
-        SqlEngine.reset_engine()
-    except Exception:
-        logger.exception("Failed to dispose sync SQLAlchemy engine on shutdown")
-    try:
-        SqlEngine.reset_readonly_engine()
-    except Exception:
-        logger.exception("Failed to dispose readonly SQLAlchemy engine on shutdown")
+        yield
+    finally:
+        try:
+            # Chat may outlive its HTTP reader and still need DB and tracing services.
+            if not await run_in_threadpool(
+                chat_turn_work.wait_idle, CHAT_EXECUTION_TIMEOUT_S
+            ):
+                logger.error("Chat turns did not drain before API shutdown")
+        except Exception:
+            logger.exception("Failed to drain chat turns on shutdown")
 
-    if AUTH_RATE_LIMITING_ENABLED:
-        await close_auth_limiter()
+        # Flush buffered per-user usage before disposing the DB engines its drain
+        # thread writes through.
+        from onyx.tracing.setup import shutdown_tracing
+
+        try:
+            shutdown_tracing()
+        except Exception:
+            logger.exception("Failed to flush tracing on shutdown")
+
+        if DISABLE_VECTOR_DB:
+            from onyx.background.periodic_poller import stop_periodic_poller
+
+            try:
+                stop_periodic_poller()
+            except Exception:
+                logger.exception("Failed to stop periodic poller on shutdown")
+
+        # Dispose every Postgres connection pool we opened in startup. Order:
+        # async first (its disposal is awaitable and can block), then the two
+        # sync engines. Each dispose() is wrapped so one failure cannot leak the
+        # remaining pools — this path runs on every uvicorn ``--reload`` worker
+        # shutdown, and any leaked pool accumulates until PG hits max_connections.
+        try:
+            await reset_sqlalchemy_async_engine()
+        except Exception:
+            logger.exception("Failed to dispose async SQLAlchemy engine on shutdown")
+        try:
+            SqlEngine.reset_engine()
+        except Exception:
+            logger.exception("Failed to dispose sync SQLAlchemy engine on shutdown")
+        try:
+            SqlEngine.reset_readonly_engine()
+        except Exception:
+            logger.exception("Failed to dispose readonly SQLAlchemy engine on shutdown")
+
+        if RATE_LIMITING_ENABLED:
+            try:
+                await close_auth_limiter()
+            except Exception:
+                logger.exception("Failed to close auth rate limiter on shutdown")
 
 
 def log_http_error(request: Request, exc: Exception) -> JSONResponse:
-    status_code = getattr(exc, "status_code", 500)
+    status = getattr(exc, "status_code", None)  # ods: ignore[getattr]
+    status_code = status if isinstance(status, int) else 500
 
     if isinstance(exc, BasicAuthenticationError):
         # For BasicAuthenticationError, just log a brief message without stack trace
@@ -437,14 +534,26 @@ def log_http_error(request: Request, exc: Exception) -> JSONResponse:
         error_msg += "".join(traceback.format_tb(exc.__traceback__))
         logger.error(error_msg)
 
-    detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+    if isinstance(exc, HTTPException):
+        detail = exc.detail
+    elif status_code >= 500:
+        # Unhandled exception text can carry SQL, hostnames, or URLs. It is logged above.
+        detail = "An internal server error occurred."
+    else:
+        detail = str(exc)
+    # Routes that raise HTTPException name no error code, so derive the
+    # canonical one for the status. Clients reading "detail" are unaffected.
     return JSONResponse(
         status_code=status_code,
-        content={"detail": detail},
+        content={
+            "error_code": OnyxErrorCode.for_status(status_code).code,
+            "detail": detail,
+        },
     )
 
 
 def get_application(lifespan_override: Lifespan | None = None) -> FastAPI:
+    validate_encryption_configuration()
     application = FastAPI(
         title="Onyx Backend",
         version=__version__,
@@ -452,29 +561,37 @@ def get_application(lifespan_override: Lifespan | None = None) -> FastAPI:
         servers=[
             {"url": f"{WEB_DOMAIN.rstrip('/')}/api", "description": "Onyx API Server"}
         ],
+        # The interactive docs and schema are opt-in (see ENABLE_PUBLIC_DOCS).
+        # When disabled, these routes are not registered at all (404), so the
+        # API surface is not exposed publicly on a default deployment.
+        openapi_url="/openapi.json" if ENABLE_PUBLIC_DOCS else None,
+        docs_url="/docs" if ENABLE_PUBLIC_DOCS else None,
+        redoc_url="/redoc" if ENABLE_PUBLIC_DOCS else None,
         lifespan=lifespan_override or lifespan,
     )
     if SENTRY_DSN:
-        from onyx.configs.sentry import _add_instance_tags
+        from onyx.configs.sentry import init_sentry
+        from onyx.utils.telemetry import get_or_generate_uuid
 
-        sentry_sdk.init(
-            dsn=SENTRY_DSN,
-            integrations=[StarletteIntegration(), FastApiIntegration()],
+        init_sentry(
             traces_sample_rate=SENTRY_TRACES_SAMPLE_RATE,
-            release=__version__,
-            before_send=_add_instance_tags,
+            integrations=[StarletteIntegration(), FastApiIntegration()],
+            instance_id_resolver=get_or_generate_uuid,
         )
-        logger.info("Sentry initialized")
     else:
         logger.debug("Sentry DSN not provided, skipping Sentry initialization")
 
-    application.add_exception_handler(status.HTTP_400_BAD_REQUEST, log_http_error)
-    application.add_exception_handler(status.HTTP_401_UNAUTHORIZED, log_http_error)
-    application.add_exception_handler(status.HTTP_403_FORBIDDEN, log_http_error)
-    application.add_exception_handler(status.HTTP_404_NOT_FOUND, log_http_error)
-    application.add_exception_handler(
-        status.HTTP_500_INTERNAL_SERVER_ERROR, log_http_error
+    # http-exception: allow these register the handler that gives an
+    # HTTPException from FastAPI or a library the OnyxError body.
+    legacy_statuses = (
+        status.HTTP_400_BAD_REQUEST,
+        status.HTTP_401_UNAUTHORIZED,
+        status.HTTP_403_FORBIDDEN,
+        status.HTTP_404_NOT_FOUND,
+        status.HTTP_500_INTERNAL_SERVER_ERROR,
     )
+    for legacy_status in legacy_statuses:
+        application.add_exception_handler(legacy_status, log_http_error)
 
     register_onyx_exception_handlers(application)
 
@@ -483,17 +600,29 @@ def get_application(lifespan_override: Lifespan | None = None) -> FastAPI:
     include_router_with_global_prefix_prepended(application, query_router)
     include_router_with_global_prefix_prepended(application, document_router)
     include_router_with_global_prefix_prepended(application, user_router)
+    include_router_with_global_prefix_prepended(application, oauth_test_admin_router)
     include_router_with_global_prefix_prepended(application, admin_query_router)
     include_router_with_global_prefix_prepended(application, admin_router)
+    include_router_with_global_prefix_prepended(application, opensearch_health_router)
     include_router_with_global_prefix_prepended(application, connector_router)
     include_router_with_global_prefix_prepended(application, credential_router)
+    include_router_with_global_prefix_prepended(
+        application, credential_capabilities_router
+    )
     include_router_with_global_prefix_prepended(application, input_prompt_router)
     include_router_with_global_prefix_prepended(application, admin_input_prompt_router)
     include_router_with_global_prefix_prepended(application, cc_pair_router)
+    include_router_with_global_prefix_prepended(application, index_monitoring_router)
+    include_router_with_global_prefix_prepended(application, connector_edit_router)
     include_router_with_global_prefix_prepended(application, targeted_reindex_router)
     include_router_with_global_prefix_prepended(application, projects_router)
     include_router_with_global_prefix_prepended(application, public_build_router)
+    if SANDBOX_RUNTIME is SandboxRuntime.FIRECRACKER:
+        include_router_with_global_prefix_prepended(application, microvm_router)
+    include_router_with_global_prefix_prepended(application, static_preview_router)
     include_router_with_global_prefix_prepended(application, build_router)
+    include_router_with_global_prefix_prepended(application, build_admin_router)
+    include_router_with_global_prefix_prepended(application, image_generation_router)
     include_router_with_global_prefix_prepended(application, document_set_router)
     include_router_with_global_prefix_prepended(application, hierarchy_router)
     include_router_with_global_prefix_prepended(application, search_api_router)
@@ -508,15 +637,15 @@ def get_application(lifespan_override: Lifespan | None = None) -> FastAPI:
     include_router_with_global_prefix_prepended(application, admin_agents_router)
     include_router_with_global_prefix_prepended(application, default_assistant_router)
     include_router_with_global_prefix_prepended(application, notification_router)
+    include_router_with_global_prefix_prepended(application, admin_banner_router)
     include_router_with_global_prefix_prepended(application, tool_router)
     include_router_with_global_prefix_prepended(application, admin_tool_router)
-    include_router_with_global_prefix_prepended(application, oauth_config_router)
-    include_router_with_global_prefix_prepended(application, admin_oauth_config_router)
-    include_router_with_global_prefix_prepended(application, user_oauth_token_router)
     include_router_with_global_prefix_prepended(application, state_router)
     include_router_with_global_prefix_prepended(application, onyx_api_router)
     include_router_with_global_prefix_prepended(application, settings_router)
     include_router_with_global_prefix_prepended(application, settings_admin_router)
+    include_router_with_global_prefix_prepended(application, security_admin_router)
+    include_router_with_global_prefix_prepended(application, sso_admin_router)
     include_router_with_global_prefix_prepended(application, llm_admin_router)
     include_router_with_global_prefix_prepended(application, kg_admin_router)
     include_router_with_global_prefix_prepended(application, llm_router)
@@ -530,61 +659,82 @@ def get_application(lifespan_override: Lifespan | None = None) -> FastAPI:
     include_router_with_global_prefix_prepended(application, embedding_router)
     include_router_with_global_prefix_prepended(application, web_search_router)
     include_router_with_global_prefix_prepended(application, web_search_admin_router)
+    include_router_with_global_prefix_prepended(application, tracing_admin_router)
     include_router_with_global_prefix_prepended(application, voice_admin_router)
     include_router_with_global_prefix_prepended(application, voice_router)
     include_router_with_global_prefix_prepended(application, voice_websocket_router)
-    include_router_with_global_prefix_prepended(
-        application, opensearch_migration_admin_router
-    )
-    include_router_with_global_prefix_prepended(
-        application, token_rate_limit_settings_router
-    )
+    include_router_with_global_prefix_prepended(application, cost_override_router)
+    include_router_with_global_prefix_prepended(application, user_usage_router)
+    include_router_with_global_prefix_prepended(application, admin_usage_router)
     include_router_with_global_prefix_prepended(application, api_key_router)
     include_router_with_global_prefix_prepended(application, standard_oauth_router)
     include_router_with_global_prefix_prepended(application, federated_router)
     include_router_with_global_prefix_prepended(application, mcp_router)
     include_router_with_global_prefix_prepended(application, mcp_admin_router)
+    include_router_with_global_prefix_prepended(application, integrations_router)
+    include_router_with_global_prefix_prepended(application, admin_integrations_router)
+    include_router_with_global_prefix_prepended(
+        application, integration_connections_router
+    )
+    include_router_with_global_prefix_prepended(application, action_policies_router)
+    include_router_with_global_prefix_prepended(application, mobile_plugins_router)
     include_router_with_global_prefix_prepended(application, skill_router)
-    include_router_with_global_prefix_prepended(application, skill_admin_router)
 
     include_router_with_global_prefix_prepended(application, pat_router)
     include_router_with_global_prefix_prepended(application, captcha_router)
-    include_router_with_global_prefix_prepended(application, sub2api_router)
 
-    if AUTH_TYPE == AuthType.BASIC or AUTH_TYPE == AuthType.CLOUD:
-        include_auth_router_with_prefix(
-            application,
-            fastapi_users.get_auth_router(auth_backend),
-            prefix="/auth",
+    if OAUTH_PROVIDER_SETTINGS is not None:
+        from onyx.server.oauth_provider.api import router as oauth_provider_user_router
+        from onyx.server.oauth_provider.protocol import (
+            router as oauth_provider_protocol_router,
         )
 
-        include_auth_router_with_prefix(
-            application,
-            fastapi_users.get_register_router(UserRead, UserCreate),
-            prefix="/auth",
+        include_router_with_global_prefix_prepended(
+            application, oauth_provider_protocol_router
+        )
+        include_router_with_global_prefix_prepended(
+            application, oauth_provider_user_router
         )
 
-        include_auth_router_with_prefix(
-            application,
-            fastapi_users.get_reset_password_router(),
-            prefix="/auth",
-        )
-        include_auth_router_with_prefix(
-            application,
-            fastapi_users.get_verify_router(UserRead),
-            prefix="/auth",
-        )
-        include_auth_router_with_prefix(
-            application,
-            fastapi_users.get_users_router(UserRead, UserUpdate),
-            prefix="/users",
-        )
+    # Password login is served in every deployment mode.
+    include_auth_router_with_prefix(
+        application,
+        fastapi_users.get_auth_router(auth_backend),
+        prefix="/auth",
+    )
 
-    # Register Google OAuth when AUTH_TYPE is GOOGLE_OAUTH, or when
-    # AUTH_TYPE is BASIC and OAuth credentials are configured
-    if AUTH_TYPE == AuthType.GOOGLE_OAUTH or (
-        AUTH_TYPE == AuthType.BASIC and OAUTH_ENABLED
-    ):
+    include_auth_router_with_prefix(
+        application,
+        fastapi_users.get_register_router(UserRead, UserCreate),
+        prefix="/auth",
+    )
+
+    include_auth_router_with_prefix(
+        application,
+        fastapi_users.get_reset_password_router(),
+        prefix="/auth",
+    )
+    include_auth_router_with_prefix(
+        application,
+        fastapi_users.get_verify_router(UserRead),
+        prefix="/auth",
+    )
+    include_auth_router_with_prefix(
+        application,
+        fastapi_users.get_users_router(UserRead, UserUpdate),
+        prefix="/users",
+    )
+
+    # Mobile bearer gateway (login/refresh/logout + the SSO code exchange).
+    include_auth_router_with_prefix(
+        application,
+        mobile_auth_router,
+        prefix="/auth/mobile",
+    )
+
+    # Env-credential Google login rides alongside provider rows when OAuth
+    # credentials are configured.
+    if OAUTH_ENABLED:
         google_login_scopes = list(
             GOOGLE_OAUTH_SCOPE_OVERRIDE or GOOGLE_LOGIN_BASE_SCOPES
         )
@@ -607,70 +757,53 @@ def get_application(lifespan_override: Lifespan | None = None) -> FastAPI:
             prefix="/auth/oauth",
         )
 
-        # Need logout router for GOOGLE_OAUTH only (BASIC already has it from above)
-        if AUTH_TYPE == AuthType.GOOGLE_OAUTH:
-            include_auth_router_with_prefix(
-                application,
-                fastapi_users.get_logout_router(auth_backend),
-                prefix="/auth",
-            )
-
-    if AUTH_TYPE == AuthType.OIDC:
-        # Ensure we request offline_access for refresh tokens
-        try:
-            oidc_scopes = list(OIDC_SCOPE_OVERRIDE or BASE_SCOPES)
-            if "offline_access" not in oidc_scopes:
-                oidc_scopes.append("offline_access")
-        except Exception as e:
-            logger.warning("Error configuring OIDC scopes: %s", e)
-            # Fall back to default scopes if there's an error
-            oidc_scopes = BASE_SCOPES
-
+        # Dedicated mobile Google OAuth router. redirect_url is under /api so the IdP
+        # returns to the api_server, not the web callback wrapper (which drops the
+        # cookie-less deep-link 302). mobile_auth_backend only namespaces its route
+        # names apart from the web router's; same Google client + strategy.
         include_auth_router_with_prefix(
             application,
             create_onyx_oauth_router(
-                OpenID(
-                    OAUTH_CLIENT_ID,
-                    OAUTH_CLIENT_SECRET,
-                    OPENID_CONFIG_URL,
-                    # Use the configured scopes
-                    base_scopes=oidc_scopes,
-                ),
-                auth_backend,
+                oauth_client,
+                mobile_auth_backend,
                 USER_AUTH_SECRET,
                 associate_by_email=True,
                 is_verified_by_default=True,
-                redirect_url=f"{WEB_DOMAIN}/auth/oidc/callback",
-                enable_pkce=OIDC_PKCE_ENABLED,
+                redirect_url=f"{WEB_DOMAIN}/api/auth/mobile/oauth/callback",
             ),
-            prefix="/auth/oidc",
+            prefix="/auth/mobile/oauth",
         )
 
-        # need basic auth router for `logout` endpoint
-        include_auth_router_with_prefix(
-            application,
-            fastapi_users.get_auth_router(auth_backend),
-            prefix="/auth",
-        )
+    # The only SAML router. Always mounted: it resolves provider rows per request
+    # (fixed and parametric authorize, one issuer-resolved callback) and rejects
+    # requests when no rows exist, so it ships dark. A single-SAML deployment's row is seeded from
+    # SAML_CONF_DIR at startup, so its login keeps working with no reconfig.
+    include_auth_router_with_prefix(
+        application,
+        saml_multi_router,
+    )
 
-    elif AUTH_TYPE == AuthType.SAML:
-        include_auth_router_with_prefix(
-            application,
-            saml_router,
-        )
+    # DB-backed multi-provider OIDC/Google router. Always mounted: resolves
+    # provider rows per request and 404s when none exist, so it ships dark.
+    include_auth_router_with_prefix(
+        application,
+        oidc_multi_router,
+    )
 
-    if (
-        AUTH_TYPE == AuthType.CLOUD
-        or AUTH_TYPE == AuthType.BASIC
-        or AUTH_TYPE == AuthType.GOOGLE_OAUTH
-        or AUTH_TYPE == AuthType.OIDC
-    ):
-        # Add refresh token endpoint for OAuth as well
-        include_auth_router_with_prefix(
-            application,
-            fastapi_users.get_refresh_router(auth_backend),
-            prefix="/auth",
-        )
+    # Resolves which workspace's providers to offer before any of the above can
+    # run. Mounted unconditionally: single-tenant answers from its one schema.
+    include_auth_router_with_prefix(
+        application,
+        sso_discovery_router,
+    )
+    include_router_with_global_prefix_prepended(application, sub2api_router)
+    include_router_with_global_prefix_prepended(application, sub2api_app_router)
+
+    include_auth_router_with_prefix(
+        application,
+        fastapi_users.get_refresh_router(auth_backend),
+        prefix="/auth",
+    )
 
     application.add_exception_handler(
         RequestValidationError, validation_exception_handler
@@ -678,10 +811,17 @@ def get_application(lifespan_override: Lifespan | None = None) -> FastAPI:
 
     application.add_exception_handler(ValueError, value_error_handler)
 
+    if not CORS_ALLOW_CREDENTIALS:
+        logger.warning(
+            "CORS_ALLOWED_ORIGIN is unset or contains '*'; cross-origin "
+            "requests will be served without credentials. Set "
+            "CORS_ALLOWED_ORIGIN to your frontend origin(s) to allow "
+            "credentialed cross-origin requests."
+        )
     application.add_middleware(
         CORSMiddleware,
         allow_origins=CORS_ALLOWED_ORIGIN,  # Configurable via environment variable
-        allow_credentials=True,
+        allow_credentials=CORS_ALLOW_CREDENTIALS,
         allow_methods=["*"],
         allow_headers=["*"],
     )
@@ -691,16 +831,14 @@ def get_application(lifespan_override: Lifespan | None = None) -> FastAPI:
     application.add_middleware(CaptchaCookieMiddleware)
     application.add_middleware(LoginCaptchaMiddleware)
 
-    # Registered last so it is the outermost middleware and the client-IP
-    # contextvar is set before any downstream middleware, handler, or telemetry
-    # call runs. Added in place once — downstream capture sites read it via
-    # ``current_client_ip()`` rather than threading the request through.
+    # Set client-IP context before the captcha checks and route handlers.
+    # Downstream telemetry reads it through current_client_ip().
     application.add_middleware(ClientIPMiddleware)
 
     if LOG_ENDPOINT_LATENCY:
-        add_latency_logging_middleware(application, logger)
+        application.add_middleware(latency_logging_middleware, logger=logger)
 
-    add_onyx_request_id_middleware(application, "API", logger)
+    application.add_middleware(request_id_middleware, prefix="API")
 
     # Set endpoint context for per-endpoint DB pool attribution metrics.
     # Must be registered after all routes are added.
@@ -721,7 +859,7 @@ def get_application(lifespan_override: Lifespan | None = None) -> FastAPI:
 
 # NOTE: needs to be outside of the `if __name__ == "__main__"` block so that the
 # app is exportable
-set_is_ee_based_on_env_variable()
+set_is_ee_if_available()
 app = fetch_versioned_implementation(module="onyx.main", attribute="get_application")
 
 

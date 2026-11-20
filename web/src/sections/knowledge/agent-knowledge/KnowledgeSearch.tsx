@@ -1,0 +1,467 @@
+"use client";
+
+import { Section } from "@opal/layouts";
+import React from "react";
+import { useFormatter, useTranslations } from "next-intl";
+import { getSourceMetadata } from "@/lib/connectors/utils";
+import * as TableLayouts from "@/layouts/table-layouts";
+import type {
+  ConnectedSource,
+  HierarchyNodeSearchSummary,
+} from "@/lib/hierarchy/types";
+import type { SearchDocWithContent } from "@/lib/search/types";
+import type { ValidSources } from "@/lib/connectors/types/source";
+import {
+  Text,
+  Button,
+  InputCheckbox,
+  Divider,
+  InputTypeIn,
+  LineItemButton,
+} from "@opal/components";
+import {
+  SvgArrowLeft,
+  SvgChevronRight,
+  SvgFileText,
+  SvgFiles,
+  SvgFolder,
+  SvgSearch,
+  SvgXCircle,
+} from "@opal/icons";
+
+import type { KnowledgeSearchResults } from "@/sections/knowledge/agent-knowledge/types";
+
+interface KnowledgeSearchBarProps {
+  query: string;
+  onQueryChange: (q: string) => void;
+  onSubmit: () => void;
+  onClear: () => void;
+  onBack: () => void;
+  onFocus: () => void;
+  isSearchMode: boolean;
+}
+
+export function KnowledgeSearchBar({
+  query,
+  onQueryChange,
+  onSubmit,
+  onClear,
+  onBack,
+  onFocus,
+  isSearchMode,
+}: KnowledgeSearchBarProps) {
+  const t = useTranslations("knowledge");
+
+  function handleKeyDown(e: React.KeyboardEvent) {
+    if (e.key === "Enter") onSubmit();
+    if (e.key === "Escape" && isSearchMode) onBack();
+  }
+
+  return (
+    <Section flexDirection="row" alignItems="center" gap={1} height="auto">
+      {isSearchMode ? (
+        <Button
+          icon={SvgArrowLeft}
+          prominence="tertiary"
+          onClick={onBack}
+          aria-label="exit-search"
+        />
+      ) : null}
+      <Section height="auto">
+        <InputTypeIn
+          icon={isSearchMode ? undefined : "search"}
+          value={query}
+          onChange={(e) => onQueryChange(e.target.value)}
+          onKeyDown={handleKeyDown}
+          onFocus={onFocus}
+          placeholder={t("search.input.placeholder")}
+          variant="internal"
+        />
+      </Section>
+      {isSearchMode && query ? (
+        <Button
+          icon={SvgXCircle}
+          prominence="tertiary"
+          size="sm"
+          onClick={onClear}
+          aria-label="clear-search"
+        />
+      ) : null}
+      {isSearchMode ? (
+        <Button
+          icon={SvgSearch}
+          prominence="tertiary"
+          size="sm"
+          onClick={onSubmit}
+          aria-label="submit-search"
+        />
+      ) : null}
+    </Section>
+  );
+}
+
+interface KnowledgeSearchSidebarProps {
+  connectedSources: ConnectedSource[];
+  activeSourceFilter: ValidSources | null;
+  onSourceFilterClick: (source: ValidSources | null) => void;
+  resultCountBySource: Map<ValidSources, number>;
+  vectorDbEnabled: boolean;
+}
+
+export function KnowledgeSearchSidebar({
+  connectedSources,
+  activeSourceFilter,
+  onSourceFilterClick,
+  resultCountBySource,
+  vectorDbEnabled,
+}: KnowledgeSearchSidebarProps) {
+  const t = useTranslations("knowledge");
+  const format = useFormatter();
+  const totalCount = Array.from(resultCountBySource.values()).reduce(
+    (a, b) => a + b,
+    0
+  );
+
+  return (
+    <TableLayouts.SidebarLayout aria-label="knowledge-search-sidebar">
+      <LineItemButton
+        font="main-ui-action"
+        rounding={2}
+        icon={SvgFiles}
+        state={activeSourceFilter === null ? "selected" : "empty"}
+        onClick={() => onSourceFilterClick(null)}
+        rightChildren={
+          totalCount > 0 ? (
+            <Text font="main-ui-action" color="action-selection-05">
+              {format.number(totalCount)}
+            </Text>
+          ) : undefined
+        }
+        title={t("search.sidebar.all.label")}
+      />
+
+      {vectorDbEnabled &&
+        connectedSources.map((cs) => {
+          const sourceMetadata = getSourceMetadata(cs.source);
+          const count = resultCountBySource.get(cs.source) ?? 0;
+          return (
+            <LineItemButton
+              font="main-ui-action"
+              rounding={2}
+              key={cs.source}
+              icon={sourceMetadata.icon}
+              state={activeSourceFilter === cs.source ? "selected" : "empty"}
+              onClick={() => onSourceFilterClick(cs.source)}
+              rightChildren={
+                count > 0 ? (
+                  <Text font="main-ui-action" color="action-selection-05">
+                    {format.number(count)}
+                  </Text>
+                ) : undefined
+              }
+              title={sourceMetadata.displayName}
+            />
+          );
+        })}
+    </TableLayouts.SidebarLayout>
+  );
+}
+
+interface KnowledgeSearchResultsPanelProps {
+  committedQuery: string;
+  searchQuery: string;
+  isSearching: boolean;
+  searchError: boolean;
+  results: KnowledgeSearchResults | null;
+  activeSourceFilter: ValidSources | null;
+  selectedDocumentIds: string[];
+  selectedFolderIds: number[];
+  onToggleDocument: (id: string) => void;
+  onToggleFolder: (id: number) => void;
+  onNavigateToNode: (node: HierarchyNodeSearchSummary) => void;
+}
+
+export function KnowledgeSearchResultsPanel({
+  committedQuery,
+  searchQuery,
+  isSearching,
+  searchError,
+  results,
+  activeSourceFilter,
+  selectedDocumentIds,
+  selectedFolderIds,
+  onToggleDocument,
+  onToggleFolder,
+  onNavigateToNode,
+}: KnowledgeSearchResultsPanelProps) {
+  const t = useTranslations("knowledge");
+
+  if (!committedQuery) {
+    return (
+      <Section
+        alignItems="center"
+        justifyContent="center"
+        gap={2}
+        aria-label="search-empty-state"
+      >
+        <SvgSearch size={32} className="stroke-text-04" />
+        <Text font="secondary-body" color="text-03">
+          {t("search.prompt.description")}
+        </Text>
+      </Section>
+    );
+  }
+
+  if (isSearching) {
+    return (
+      <Section
+        alignItems="center"
+        justifyContent="center"
+        aria-label="search-loading"
+      >
+        <Text font="secondary-body" color="text-03">
+          {t("search.loading.description")}
+        </Text>
+      </Section>
+    );
+  }
+
+  if (searchError && committedQuery === searchQuery) {
+    return (
+      <Section
+        alignItems="center"
+        justifyContent="center"
+        gap={2}
+        aria-label="search-error"
+      >
+        <Text font="secondary-body" color="text-03">
+          {t("search.error.description")}
+        </Text>
+      </Section>
+    );
+  }
+
+  const allResults: Array<
+    | { kind: "node"; item: HierarchyNodeSearchSummary }
+    | { kind: "doc"; item: SearchDocWithContent }
+  > = [
+    ...(results?.nodes ?? []).map((n) => ({ kind: "node" as const, item: n })),
+    ...(results?.docs ?? []).map((d) => ({ kind: "doc" as const, item: d })),
+  ];
+
+  const isStale = committedQuery !== searchQuery;
+
+  const listContent =
+    allResults.length === 0 ? (
+      <Section
+        alignItems="center"
+        justifyContent="center"
+        gap={2}
+        aria-label="search-no-results"
+      >
+        <Text font="secondary-body" color="text-03">
+          {activeSourceFilter
+            ? t("search.noResultsInSource.description", {
+                source: getSourceMetadata(activeSourceFilter).displayName,
+              })
+            : t("search.noResults.description")}
+        </Text>
+      </Section>
+    ) : (
+      <Section gap={0} alignItems="stretch" height="auto">
+        <TableLayouts.TableRow>
+          <TableLayouts.CheckboxCell />
+          <TableLayouts.TableCell flex>
+            <Text font="secondary-body" color="text-03">
+              {t("table.columns.name.header")}
+            </Text>
+          </TableLayouts.TableCell>
+          <TableLayouts.TableCell width={8}>
+            <Text font="secondary-body" color="text-03">
+              {t("table.columns.sources.header")}
+            </Text>
+          </TableLayouts.TableCell>
+        </TableLayouts.TableRow>
+
+        <Divider paddingParallel={0} paddingPerpendicular={0} />
+
+        <div className="overflow-y-auto max-h-80">
+          {allResults.map((entry) => {
+            if (entry.kind === "node") {
+              const node = entry.item;
+              const isSelected = selectedFolderIds.includes(node.id);
+              const sourceMeta = getSourceMetadata(node.source);
+
+              return (
+                <TableLayouts.TableRow
+                  key={`node-${node.id}`}
+                  selected={isSelected}
+                  onClick={() => onToggleFolder(node.id)}
+                  aria-label={`search-node-${node.id}`}
+                >
+                  <TableLayouts.CheckboxCell>
+                    <InputCheckbox
+                      checked={isSelected}
+                      onCheckedChange={() => onToggleFolder(node.id)}
+                    />
+                  </TableLayouts.CheckboxCell>
+                  <TableLayouts.TableCell flex>
+                    <Section
+                      flexDirection="row"
+                      justifyContent="start"
+                      alignItems="center"
+                      gap={1}
+                      height="auto"
+                    >
+                      <SvgFolder size={16} />
+                      <Section
+                        flexDirection="column"
+                        justifyContent="start"
+                        alignItems="stretch"
+                        gap={0}
+                        height="auto"
+                        className="min-w-0 grow"
+                      >
+                        <Text
+                          maxLines={1}
+                          overflowTooltip
+                          as="p"
+                          textPosition="text-start"
+                          font="main-ui-body"
+                          color="text-05"
+                        >
+                          {node.title}
+                        </Text>
+                        {node.link && (
+                          <Text
+                            maxLines={1}
+                            overflowTooltip
+                            as="p"
+                            textPosition="text-start"
+                            font="secondary-body"
+                            color="text-03"
+                          >
+                            {node.link
+                              .replace(/^https?:\/\//i, "")
+                              .replace(/^www\./i, "")
+                              .replace(/\/+$/, "")}
+                          </Text>
+                        )}
+                      </Section>
+                      <Button
+                        icon={SvgChevronRight}
+                        prominence="tertiary"
+                        size="sm"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onNavigateToNode(node);
+                        }}
+                        aria-label={`navigate-to-node-${node.id}`}
+                      />
+                    </Section>
+                  </TableLayouts.TableCell>
+                  <TableLayouts.TableCell width={8}>
+                    <TableLayouts.SourceIconsRow>
+                      <sourceMeta.icon size={16} />
+                    </TableLayouts.SourceIconsRow>
+                  </TableLayouts.TableCell>
+                </TableLayouts.TableRow>
+              );
+            }
+
+            const doc = entry.item;
+            const isSelected = selectedDocumentIds.includes(doc.document_id);
+            const sourceMeta = getSourceMetadata(doc.source_type);
+
+            return (
+              <TableLayouts.TableRow
+                key={`doc-${doc.document_id}-${doc.chunk_ind}`}
+                selected={isSelected}
+                onClick={() => onToggleDocument(doc.document_id)}
+                aria-label={`search-doc-${doc.document_id}`}
+              >
+                <TableLayouts.CheckboxCell>
+                  <InputCheckbox
+                    checked={isSelected}
+                    onCheckedChange={() => onToggleDocument(doc.document_id)}
+                  />
+                </TableLayouts.CheckboxCell>
+                <TableLayouts.TableCell flex>
+                  <Section
+                    flexDirection="row"
+                    justifyContent="start"
+                    alignItems="center"
+                    gap={1}
+                    height="auto"
+                  >
+                    <SvgFileText size={16} />
+                    <Section
+                      flexDirection="column"
+                      justifyContent="start"
+                      alignItems="stretch"
+                      gap={0}
+                      height="auto"
+                      className="min-w-0 grow"
+                    >
+                      <Text
+                        maxLines={1}
+                        overflowTooltip
+                        as="p"
+                        textPosition="text-start"
+                        font="main-ui-body"
+                        color="text-05"
+                      >
+                        {doc.semantic_identifier}
+                      </Text>
+                      {doc.blurb && (
+                        <Text
+                          maxLines={1}
+                          overflowTooltip
+                          as="p"
+                          textPosition="text-start"
+                          font="secondary-body"
+                          color="text-03"
+                        >
+                          {doc.blurb}
+                        </Text>
+                      )}
+                    </Section>
+                  </Section>
+                </TableLayouts.TableCell>
+                <TableLayouts.TableCell width={8}>
+                  <TableLayouts.SourceIconsRow>
+                    <sourceMeta.icon size={16} />
+                  </TableLayouts.SourceIconsRow>
+                </TableLayouts.TableCell>
+              </TableLayouts.TableRow>
+            );
+          })}
+        </div>
+      </Section>
+    );
+
+  if (isStale) {
+    return (
+      <Section alignItems="stretch" justifyContent="start" className="relative">
+        <Section
+          alignItems="stretch"
+          justifyContent="start"
+          className="opacity-40 pointer-events-none"
+        >
+          {listContent}
+        </Section>
+        <Section
+          alignItems="center"
+          justifyContent="center"
+          className="absolute inset-0 z-10"
+        >
+          <Text font="secondary-body" color="text-03">
+            {t("search.stale.description")}
+          </Text>
+        </Section>
+      </Section>
+    );
+  }
+
+  return listContent;
+}

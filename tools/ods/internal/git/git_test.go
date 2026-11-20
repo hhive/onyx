@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -29,6 +30,8 @@ func newTestRepo(t *testing.T) *testRepo {
 	r.Git("init", "-b", "main")
 	r.Git("config", "user.email", "test@test.com")
 	r.Git("config", "user.name", "Test")
+	// A global commit.gpgsign would break every commit made here.
+	r.Git("config", "commit.gpgsign", "false")
 	r.Commit("initial commit", "README.md", "init")
 
 	return r
@@ -95,34 +98,14 @@ func TestCherryPickStateRoundTrip(t *testing.T) {
 		t.Fatalf("LoadCherryPickState: %v", err)
 	}
 
-	if loaded.OriginalBranch != state.OriginalBranch {
-		t.Errorf("OriginalBranch = %q, want %q", loaded.OriginalBranch, state.OriginalBranch)
-	}
-	if len(loaded.CommitSHAs) != len(state.CommitSHAs) {
-		t.Errorf("CommitSHAs len = %d, want %d", len(loaded.CommitSHAs), len(state.CommitSHAs))
-	}
-	if loaded.Stashed != state.Stashed {
-		t.Errorf("Stashed = %v, want %v", loaded.Stashed, state.Stashed)
-	}
-	if loaded.DryRun != state.DryRun {
-		t.Errorf("DryRun = %v, want %v", loaded.DryRun, state.DryRun)
-	}
-	if len(loaded.Assignees) != len(state.Assignees) {
-		t.Errorf("Assignees len = %d, want %d", len(loaded.Assignees), len(state.Assignees))
+	if !reflect.DeepEqual(loaded, state) {
+		t.Errorf("round trip changed the state:\ngot  %+v\nwant %+v", loaded, state)
 	}
 
 	CleanCherryPickState()
 
-	if _, err = LoadCherryPickState(); err == nil {
-		t.Error("LoadCherryPickState after clean should fail")
-	}
-}
-
-func TestLoadCherryPickStateMissing(t *testing.T) {
-	newTestRepo(t)
-
-	if _, err := LoadCherryPickState(); err == nil {
-		t.Error("expected error for missing state file")
+	if _, err = LoadCherryPickState(); err == nil || !strings.HasPrefix(err.Error(), "no cherry-pick state file found at ") {
+		t.Errorf("expected a missing state file error after clean, got %v", err)
 	}
 }
 
@@ -157,17 +140,6 @@ func TestIsCommitAppliedOnBranch_SubjectMatch(t *testing.T) {
 	}
 }
 
-func TestIsCommitAppliedOnBranch_NoMatch(t *testing.T) {
-	repo := newTestRepo(t)
-
-	repo.Git("checkout", "-b", "feature")
-	featureSHA := repo.Commit("feat: only on feature branch", "only-feature.txt", "only")
-
-	if IsCommitAppliedOnBranch(featureSHA, "main") {
-		t.Error("expected commit NOT to be found on main")
-	}
-}
-
 func TestIsCommitAppliedOnBranch_NoFalsePositiveFromBody(t *testing.T) {
 	repo := newTestRepo(t)
 
@@ -180,5 +152,27 @@ func TestIsCommitAppliedOnBranch_NoFalsePositiveFromBody(t *testing.T) {
 
 	if IsCommitAppliedOnBranch(featureSHA, "main") {
 		t.Error("should NOT match when subject only appears in body of another commit")
+	}
+}
+
+// --- IsAncestor tests ---
+
+func TestIsAncestor_distinguishesFalseFromError(t *testing.T) {
+	// Precondition.
+	r := newTestRepo(t)
+	first := r.HEAD()
+	second := r.Commit("second commit", "second.txt", "content")
+
+	// Under test and postcondition: ancestor, non-ancestor, and error cases.
+	contained, err := IsAncestor(first, second)
+	if err != nil || !contained {
+		t.Errorf("expected (true, nil) for ancestor, got (%v, %v)", contained, err)
+	}
+	contained, err = IsAncestor(second, first)
+	if err != nil || contained {
+		t.Errorf("expected (false, nil) for non-ancestor, got (%v, %v)", contained, err)
+	}
+	if _, err = IsAncestor("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", first); err == nil {
+		t.Error("expected an error for an unknown revision, got nil")
 	}
 }

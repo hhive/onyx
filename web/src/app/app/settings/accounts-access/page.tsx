@@ -1,31 +1,30 @@
 "use client";
 
+import { useNavigation } from "@opal/navigation";
 import { useEffect } from "react";
-import { useRouter } from "next/navigation";
 import { useUser } from "@/providers/UserProvider";
-import { useAuthType } from "@/lib/hooks";
-import { AuthType } from "@/lib/constants";
-import { AccountsAccessSettings } from "@/refresh-pages/SettingsPage";
+import { useIsMultiTenant } from "@/lib/auth/hooks";
+import { AccountsAccessSettings } from "@/views/SettingsPage";
 
 export default function AccountsAccessPage() {
-  const router = useRouter();
+  const navigation = useNavigation();
   const { user } = useUser();
-  const authType = useAuthType();
+  const isMultiTenant = useIsMultiTenant();
 
   const showPasswordSection = Boolean(user?.password_configured);
-  const showTokensSection = authType !== null;
+  const showTokensSection = isMultiTenant !== null;
   const hasAccess = showPasswordSection || showTokensSection;
 
-  // Only redirect after authType has loaded to avoid redirecting during loading state
-  const isAuthTypeLoaded = authType !== null;
+  // Only redirect after metadata has loaded to avoid redirecting during loading state
+  const isAuthTypeLoaded = isMultiTenant !== null;
 
   useEffect(() => {
     if (isAuthTypeLoaded && !hasAccess) {
-      router.replace("/app/settings/general");
+      navigation.go("/app/settings/general", { replace: true });
     }
-  }, [isAuthTypeLoaded, hasAccess, router]);
+  }, [isAuthTypeLoaded, hasAccess, navigation]);
 
-  // Don't render content until authType is loaded and access is determined
+  // Don't render content until metadata has loaded and access is determined
   if (!isAuthTypeLoaded || !hasAccess) {
     return null;
   }

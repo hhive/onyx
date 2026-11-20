@@ -1,26 +1,20 @@
 """Tests for license enforcement middleware."""
 
-from collections.abc import Awaitable
-from collections.abc import Callable
-from typing import Any
-from unittest.mock import MagicMock
-from unittest.mock import patch
+from collections.abc import AsyncIterator
+from datetime import datetime, timedelta, timezone
+from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
-from starlette.requests import Request
+import pytest_asyncio
 from starlette.responses import Response
 
 from ee.onyx.configs.license_enforcement_config import (
     LICENSE_ENFORCEMENT_ALLOWED_PREFIXES,
 )
 from ee.onyx.server.middleware.license_enforcement import _is_path_allowed
+from onyx.server.middleware import api_prefix
 from onyx.server.settings.models import ApplicationStatus
-
-# Type alias for the middleware harness tuple
-MiddlewareHarness = tuple[
-    Callable[[Request, Callable[[Request], Awaitable[Response]]], Awaitable[Response]],
-    Callable[[Request], Awaitable[Response]],
-]
 
 # Paths that should be blocked (core functionality requiring license)
 BLOCKED_PATHS = [
@@ -39,7 +33,10 @@ class TestPathAllowlist:
     as the source of truth to ensure tests stay in sync with production code.
     """
 
-    @pytest.mark.parametrize("path", list(LICENSE_ENFORCEMENT_ALLOWED_PREFIXES))
+    # Sorted so the parametrization order is deterministic across pytest-xdist
+    # workers; iterating the frozenset directly varies with per-process hash
+    # randomization, which makes xdist abort on a collection mismatch.
+    @pytest.mark.parametrize("path", sorted(LICENSE_ENFORCEMENT_ALLOWED_PREFIXES))
     def test_allowed_paths_are_allowed(self, path: str) -> None:
         """All paths in LICENSE_ENFORCEMENT_ALLOWED_PREFIXES should be allowed."""
         assert _is_path_allowed(path) is True
@@ -48,6 +45,15 @@ class TestPathAllowlist:
         """Subpaths of allowed prefixes should also be allowed."""
         assert _is_path_allowed("/auth/callback/google") is True
         assert _is_path_allowed("/admin/billing/checkout") is True
+        assert _is_path_allowed("/mcp/oauth/client-metadata") is True
+
+    def test_custom_api_prefix_allowlist(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(api_prefix, "APP_API_PREFIX", "v2")
+        assert _is_path_allowed(api_prefix.strip_api_prefix("/v2/auth/login")) is True
+        assert (
+            _is_path_allowed(api_prefix.strip_api_prefix("/v2/admin/billing/checkout"))
+            is True
+        )
 
     @pytest.mark.parametrize("path", BLOCKED_PATHS)
     def test_blocked_paths_are_blocked(self, path: str) -> None:
@@ -58,75 +64,75 @@ class TestPathAllowlist:
 class TestLicenseEnforcementMiddleware:
     """Tests for middleware behavior under different conditions."""
 
-    @pytest.fixture
-    def middleware_harness(self) -> MiddlewareHarness:
-        """Create a test harness for the middleware."""
+    @pytest_asyncio.fixture
+    async def client(self) -> AsyncIterator[httpx.AsyncClient]:
         from ee.onyx.server.middleware.license_enforcement import (
-            add_license_enforcement_middleware,
+            license_enforcement_middleware,
         )
 
-        app = MagicMock()
-        logger = MagicMock()
-        captured_middleware: Any = None
-
-        def capture_middleware(
-            middleware_type: str,  # noqa: ARG001
-        ) -> Callable[[Any], Any]:
-            def decorator(func: Any) -> Any:
-                nonlocal captured_middleware
-                captured_middleware = func
-                return func
-
-            return decorator
-
-        app.middleware = capture_middleware
-        add_license_enforcement_middleware(app, logger)
-
-        async def call_next(req: Request) -> Response:  # noqa: ARG001
-            response = MagicMock()
-            response.status_code = 200
-            return response
-
-        return captured_middleware, call_next  # ty: ignore[invalid-return-type]
+        app = license_enforcement_middleware(Response(status_code=200), MagicMock())
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            yield client
 
     @pytest.mark.asyncio
-    @patch(
-        "ee.onyx.server.middleware.license_enforcement.LICENSE_ENFORCEMENT_ENABLED",
-        True,
-    )
     @patch("ee.onyx.server.middleware.license_enforcement.get_current_tenant_id")
     @patch("ee.onyx.server.middleware.license_enforcement.get_cached_license_metadata")
     async def test_gated_access_status_gets_402(
         self,
         mock_get_metadata: MagicMock,
         mock_get_tenant: MagicMock,
-        middleware_harness: MiddlewareHarness,
+        client: httpx.AsyncClient,
     ) -> None:
         """GATED_ACCESS status blocks non-allowlisted paths with 402."""
         mock_get_tenant.return_value = "default"
         mock_metadata = MagicMock()
         mock_metadata.status = ApplicationStatus.GATED_ACCESS
+        mock_metadata.expires_at = datetime.now(timezone.utc) + timedelta(days=30)
         mock_get_metadata.return_value = mock_metadata
 
-        middleware, call_next = middleware_harness
-        mock_request = MagicMock()
-        mock_request.url.path = "/api/chat"
+        path = "/api/chat"
 
-        response = await middleware(mock_request, call_next)
+        response = await client.get(path)
         assert response.status_code == 402
 
     @pytest.mark.asyncio
     @patch(
-        "ee.onyx.server.middleware.license_enforcement.LICENSE_ENFORCEMENT_ENABLED",
-        True,
+        "ee.onyx.server.middleware.license_enforcement.maybe_schedule_license_reclaim"
     )
+    @patch("ee.onyx.server.middleware.license_enforcement.get_current_tenant_id")
+    @patch("ee.onyx.server.middleware.license_enforcement.get_cached_license_metadata")
+    async def test_reclaim_is_scheduled_before_gating(
+        self,
+        mock_get_metadata: MagicMock,
+        mock_get_tenant: MagicMock,
+        mock_schedule_reclaim: MagicMock,
+        client: httpx.AsyncClient,
+    ) -> None:
+        """A gated request still triggers the reclaim so the instance can heal."""
+        mock_get_tenant.return_value = "default"
+        mock_metadata = MagicMock()
+        mock_metadata.status = ApplicationStatus.GATED_ACCESS
+        mock_get_metadata.return_value = mock_metadata
+
+        path = "/api/chat"
+
+        response = await client.get(path)
+
+        assert response.status_code == 402
+        mock_schedule_reclaim.assert_called_once_with(
+            mock_metadata.expires_at, "default"
+        )
+
+    @pytest.mark.asyncio
     @patch("ee.onyx.server.middleware.license_enforcement.get_current_tenant_id")
     @patch("ee.onyx.server.middleware.license_enforcement.get_cached_license_metadata")
     async def test_grace_period_allows_access(
         self,
         mock_get_metadata: MagicMock,
         mock_get_tenant: MagicMock,
-        middleware_harness: MiddlewareHarness,
+        client: httpx.AsyncClient,
     ) -> None:
         """GRACE_PERIOD status allows access (for notifications only, not blocking)."""
         mock_get_tenant.return_value = "default"
@@ -134,20 +140,15 @@ class TestLicenseEnforcementMiddleware:
         mock_metadata.status = ApplicationStatus.GRACE_PERIOD
         mock_metadata.used_seats = 5
         mock_metadata.seats = 10
+        mock_metadata.expires_at = datetime.now(timezone.utc) + timedelta(days=30)
         mock_get_metadata.return_value = mock_metadata
 
-        middleware, call_next = middleware_harness
-        mock_request = MagicMock()
-        mock_request.url.path = "/api/chat"
+        path = "/api/chat"
 
-        response = await middleware(mock_request, call_next)
+        response = await client.get(path)
         assert response.status_code == 200
 
     @pytest.mark.asyncio
-    @patch(
-        "ee.onyx.server.middleware.license_enforcement.LICENSE_ENFORCEMENT_ENABLED",
-        True,
-    )
     @patch(
         "ee.onyx.server.middleware.license_enforcement.get_session_with_current_tenant"
     )
@@ -160,32 +161,26 @@ class TestLicenseEnforcementMiddleware:
         mock_get_tenant: MagicMock,
         mock_refresh: MagicMock,
         mock_get_session: MagicMock,  # noqa: ARG002
-        middleware_harness: MiddlewareHarness,
+        client: httpx.AsyncClient,
     ) -> None:
         """No license allows community features (non-EE paths)."""
         mock_get_tenant.return_value = "default"
         mock_get_metadata.return_value = None
         mock_refresh.return_value = None  # Still no license after DB check
 
-        middleware, call_next = middleware_harness
-        mock_request = MagicMock()
-        mock_request.url.path = "/api/chat"  # Community path
+        path = "/api/chat"  # Community path
 
-        response = await middleware(mock_request, call_next)
+        response = await client.get(path)
         assert response.status_code == 200
 
     @pytest.mark.asyncio
-    @patch(
-        "ee.onyx.server.middleware.license_enforcement.LICENSE_ENFORCEMENT_ENABLED",
-        True,
-    )
     @patch("ee.onyx.server.middleware.license_enforcement.get_current_tenant_id")
     @patch("ee.onyx.server.middleware.license_enforcement.get_cached_license_metadata")
     async def test_redis_error_fails_open(
         self,
         mock_get_metadata: MagicMock,
         mock_get_tenant: MagicMock,
-        middleware_harness: MiddlewareHarness,
+        client: httpx.AsyncClient,
     ) -> None:
         """Redis errors should not block users - fail open to allow access."""
         from redis.exceptions import RedisError
@@ -193,42 +188,19 @@ class TestLicenseEnforcementMiddleware:
         mock_get_tenant.return_value = "test_tenant"
         mock_get_metadata.side_effect = RedisError("Connection failed")
 
-        middleware, call_next = middleware_harness
-        mock_request = MagicMock()
-        mock_request.url.path = "/api/chat"
+        path = "/api/chat"
 
-        response = await middleware(mock_request, call_next)
+        response = await client.get(path)
         assert response.status_code == 200  # Fail open
 
     @pytest.mark.asyncio
-    @patch(
-        "ee.onyx.server.middleware.license_enforcement.LICENSE_ENFORCEMENT_ENABLED",
-        False,
-    )
-    async def test_disabled_enforcement_allows_all(
-        self,
-        middleware_harness: MiddlewareHarness,
-    ) -> None:
-        """When enforcement is disabled, all requests pass through."""
-        middleware, call_next = middleware_harness
-        mock_request = MagicMock()
-        mock_request.url.path = "/api/chat"
-
-        response = await middleware(mock_request, call_next)
-        assert response.status_code == 200
-
-    @pytest.mark.asyncio
-    @patch(
-        "ee.onyx.server.middleware.license_enforcement.LICENSE_ENFORCEMENT_ENABLED",
-        True,
-    )
     @patch("ee.onyx.server.middleware.license_enforcement.get_current_tenant_id")
     @patch("ee.onyx.server.middleware.license_enforcement.get_cached_license_metadata")
     async def test_seat_limit_exceeded_gets_402(
         self,
         mock_get_metadata: MagicMock,
         mock_get_tenant: MagicMock,
-        middleware_harness: MiddlewareHarness,
+        client: httpx.AsyncClient,
     ) -> None:
         """Seat limit exceeded returns 402."""
         mock_get_tenant.return_value = "default"
@@ -236,11 +208,10 @@ class TestLicenseEnforcementMiddleware:
         mock_metadata.status = ApplicationStatus.ACTIVE
         mock_metadata.used_seats = 15
         mock_metadata.seats = 10  # Over limit
+        mock_metadata.expires_at = datetime.now(timezone.utc) + timedelta(days=30)
         mock_get_metadata.return_value = mock_metadata
 
-        middleware, call_next = middleware_harness
-        mock_request = MagicMock()
-        mock_request.url.path = "/api/chat"
+        path = "/api/chat"
 
-        response = await middleware(mock_request, call_next)
+        response = await client.get(path)
         assert response.status_code == 402

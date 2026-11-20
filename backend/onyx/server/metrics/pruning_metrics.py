@@ -17,8 +17,7 @@ Usage:
     )
 """
 
-from prometheus_client import Counter
-from prometheus_client import Histogram
+from prometheus_client import Counter, Histogram
 
 from onyx.utils.logger import setup_logger
 
@@ -42,6 +41,13 @@ PRUNING_RATE_LIMIT_ERRORS = Counter(
     "onyx_pruning_rate_limit_errors_total",
     "Total rate limit errors encountered during pruning document ID enumeration",
     ["connector_type"],
+)
+
+
+PRUNING_FAILURES = Counter(
+    "onyx_pruning_failures_total",
+    "Total prune runs that raised, including timeouts; last_pruned does not advance",
+    ["tenant_id", "connector_type"],
 )
 
 
@@ -70,3 +76,12 @@ def inc_pruning_rate_limit_error(connector_type: str) -> None:
         PRUNING_RATE_LIMIT_ERRORS.labels(connector_type=connector_type).inc()
     except Exception:
         logger.debug("Failed to record pruning rate limit error", exc_info=True)
+
+
+def inc_pruning_failure(tenant_id: str, connector_type: str) -> None:
+    try:
+        PRUNING_FAILURES.labels(
+            tenant_id=tenant_id, connector_type=connector_type or "unknown"
+        ).inc()
+    except Exception:
+        logger.debug("Failed to record pruning failure", exc_info=True)

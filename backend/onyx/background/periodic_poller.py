@@ -15,13 +15,10 @@ that runs from the API server process.  Two responsibilities:
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
-from dataclasses import field
-from datetime import datetime
-from datetime import timedelta
-from datetime import timezone
+from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy import func
 
 from onyx.utils.logger import setup_logger
@@ -41,13 +38,14 @@ PERIODIC_TASK_KV_PREFIX = "periodic_poller:last_claimed:"
 _NEVER_RAN: float = -1e18
 
 
-@dataclass
-class _PeriodicTaskDef:
+class _PeriodicTaskDef(BaseModel):
+    model_config = ConfigDict(strict=True)
+
     name: str
     interval_seconds: float
     lock_id: int
     run_fn: Callable[[], None]
-    last_run_at: float = field(default=_NEVER_RAN)
+    last_run_at: float = _NEVER_RAN
 
 
 def _run_auto_llm_update() -> None:
@@ -58,11 +56,11 @@ def _run_auto_llm_update() -> None:
 
     from onyx.db.engine.sql_engine import get_session_with_current_tenant
     from onyx.llm.well_known_providers.auto_update_service import (
-        sync_llm_models_from_github,
+        sync_auto_update_providers,
     )
 
     with get_session_with_current_tenant() as db_session:
-        sync_llm_models_from_github(db_session)
+        sync_auto_update_providers(db_session)
 
 
 def _run_cache_cleanup() -> None:
@@ -71,11 +69,23 @@ def _run_cache_cleanup() -> None:
     cleanup_expired_cache_entries()
 
 
+def _run_license_reclaim() -> None:
+    from onyx.utils.variable_functionality import fetch_versioned_implementation
+    from shared_configs.contextvars import get_current_tenant_id
+
+    fetch_versioned_implementation(
+        "onyx.background.celery.tasks.license_reclaim.tasks",
+        "reclaim_license_task",
+    )(tenant_id=get_current_tenant_id())
+
+
 def _run_scheduled_eval() -> None:
-    from onyx.configs.app_configs import BRAINTRUST_API_KEY
-    from onyx.configs.app_configs import SCHEDULED_EVAL_DATASET_NAMES
-    from onyx.configs.app_configs import SCHEDULED_EVAL_PERMISSIONS_EMAIL
-    from onyx.configs.app_configs import SCHEDULED_EVAL_PROJECT
+    from onyx.configs.app_configs import (
+        BRAINTRUST_API_KEY,
+        SCHEDULED_EVAL_DATASET_NAMES,
+        SCHEDULED_EVAL_PERMISSIONS_EMAIL,
+        SCHEDULED_EVAL_PROJECT,
+    )
 
     if not all(
         [
@@ -87,8 +97,7 @@ def _run_scheduled_eval() -> None:
     ):
         return
 
-    from datetime import datetime
-    from datetime import timezone
+    from datetime import datetime, timezone
 
     from onyx.evals.eval import run_eval
     from onyx.evals.models import EvalConfigurationOptions
@@ -112,7 +121,30 @@ def _run_scheduled_eval() -> None:
             )
 
 
+def _run_oauth_provider_cleanup() -> None:
+    from onyx.background.celery.tasks.oauth_provider.tasks import (
+        cleanup_oauth_provider_clients,
+        cleanup_oauth_provider_grants,
+    )
+    from shared_configs.contextvars import get_current_tenant_id
+
+    cleanup_oauth_provider_grants.run(tenant_id=get_current_tenant_id())
+    cleanup_oauth_provider_clients.run()
+
+
+def _run_fleet_telemetry() -> None:
+    from onyx.utils.fleet_telemetry_collector import collect_snapshots
+    from shared_configs.contextvars import get_current_tenant_id
+
+    collect_snapshots(get_current_tenant_id())
+
+
 _CACHE_CLEANUP_INTERVAL_SECONDS = 300
+_OAUTH_PROVIDER_CLEANUP_INTERVAL_SECONDS = 24 * 3600
+# The lead-up reclaim rate. No beat runs here, so this thread sets the cadence.
+_LICENSE_RECLAIM_INTERVAL_SECONDS = 6 * 3600
+
+
 _USER_FILE_RETENTION_CHECK_INTERVAL_SECONDS = 60
 _USER_FILE_RETENTION_LAST_RUN_KV_KEY = (
     "periodic_poller:user_file_retention_cleanup:last_run_date"
@@ -129,8 +161,7 @@ def select_user_file_ids_for_retention_cleanup(
 ) -> list[UUID]:
     """Return user files to delete under age and total-size retention rules."""
     from onyx.db.enums import UserFileStatus
-    from onyx.db.models import FileContent
-    from onyx.db.models import UserFile
+    from onyx.db.models import FileContent, UserFile
 
     cutoff = now - timedelta(days=retention_days)
     rows = (
@@ -140,7 +171,9 @@ def select_user_file_ids_for_retention_cleanup(
             func.coalesce(FileContent.file_size, 0).label("file_size"),
         )
         .outerjoin(FileContent, FileContent.file_id == UserFile.file_id)
-        .filter(UserFile.status.notin_([UserFileStatus.DELETING, UserFileStatus.FAILED]))
+        .filter(
+            UserFile.status.notin_([UserFileStatus.DELETING, UserFileStatus.FAILED])
+        )
         .order_by(UserFile.created_at.asc(), UserFile.id.asc())
         .all()
     )
@@ -175,15 +208,16 @@ def select_user_file_ids_for_retention_cleanup(
 
 
 def _run_user_file_retention_cleanup() -> None:
-    from onyx.configs.app_configs import USER_FILE_RETENTION_CLEANUP_ENABLED
-    from onyx.configs.app_configs import USER_FILE_RETENTION_DAYS
-    from onyx.configs.app_configs import USER_FILE_RETENTION_MAX_TOTAL_BYTES
-    from onyx.configs.app_configs import USER_FILE_RETENTION_RUN_HOUR_UTC
-    from onyx.configs.app_configs import USER_FILE_RETENTION_TARGET_TOTAL_BYTES
+    from onyx.configs.app_configs import (
+        USER_FILE_RETENTION_CLEANUP_ENABLED,
+        USER_FILE_RETENTION_DAYS,
+        USER_FILE_RETENTION_MAX_TOTAL_BYTES,
+        USER_FILE_RETENTION_RUN_HOUR_UTC,
+        USER_FILE_RETENTION_TARGET_TOTAL_BYTES,
+    )
     from onyx.db.engine.sql_engine import get_session_with_current_tenant
     from onyx.db.enums import UserFileStatus
-    from onyx.db.models import KVStore
-    from onyx.db.models import UserFile
+    from onyx.db.models import KVStore, UserFile
 
     if not USER_FILE_RETENTION_CLEANUP_ENABLED:
         return
@@ -231,11 +265,13 @@ def _run_user_file_retention_cleanup() -> None:
         if last_run_row:
             last_run_row.value = today
         else:
-            db_session.add(KVStore(key=_USER_FILE_RETENTION_LAST_RUN_KV_KEY, value=today))
+            db_session.add(
+                KVStore(key=_USER_FILE_RETENTION_LAST_RUN_KV_KEY, value=today)
+            )
         db_session.commit()
 
     logger.info(
-        f"Periodic poller - Marked {len(file_ids)} user file(s) for retention cleanup"
+        "Periodic poller - Marked %d user file(s) for retention cleanup", len(file_ids)
     )
     from shared_configs.contextvars import CURRENT_TENANT_ID_CONTEXTVAR
 
@@ -245,11 +281,16 @@ def _run_user_file_retention_cleanup() -> None:
 
 
 def _build_periodic_tasks() -> list[_PeriodicTaskDef]:
-    from onyx.cache.interface import CacheBackendType
-    from onyx.configs.app_configs import AUTO_LLM_CONFIG_URL
-    from onyx.configs.app_configs import AUTO_LLM_UPDATE_INTERVAL_SECONDS
-    from onyx.configs.app_configs import CACHE_BACKEND
-    from onyx.configs.app_configs import SCHEDULED_EVAL_DATASET_NAMES
+    from onyx.configs.app_configs import (
+        AUTO_LLM_CONFIG_URL,
+        CACHE_BACKEND,
+        DISABLE_TELEMETRY,
+        SCHEDULED_EVAL_DATASET_NAMES,
+    )
+    from onyx.configs.constants import CacheBackendType
+    from onyx.utils.fleet_telemetry import COLLECTION_INTERVAL_SECONDS
+    from onyx.utils.variable_functionality import global_version
+    from shared_configs.configs import AUTO_LLM_UPDATE_INTERVAL_SECONDS
 
     tasks: list[_PeriodicTaskDef] = []
     if CACHE_BACKEND == CacheBackendType.POSTGRES:
@@ -279,11 +320,39 @@ def _build_periodic_tasks() -> list[_PeriodicTaskDef]:
                 run_fn=_run_scheduled_eval,
             )
         )
+    # EE-only: no license exists elsewhere. This deployment runs no Celery
+    # worker, so neither beat nor the point-of-use scheduler can renew.
+    if global_version.is_ee_version():
+        tasks.append(
+            _PeriodicTaskDef(
+                name="license-reclaim",
+                interval_seconds=_LICENSE_RECLAIM_INTERVAL_SECONDS,
+                lock_id=PERIODIC_TASK_LOCK_BASE + 3,
+                run_fn=_run_license_reclaim,
+            )
+        )
+    tasks.append(
+        _PeriodicTaskDef(
+            name="oauth-provider-cleanup",
+            interval_seconds=_OAUTH_PROVIDER_CLEANUP_INTERVAL_SECONDS,
+            lock_id=PERIODIC_TASK_LOCK_BASE + 4,
+            run_fn=_run_oauth_provider_cleanup,
+        )
+    )
+    if not DISABLE_TELEMETRY:
+        tasks.append(
+            _PeriodicTaskDef(
+                name="fleet-telemetry",
+                interval_seconds=COLLECTION_INTERVAL_SECONDS,
+                lock_id=PERIODIC_TASK_LOCK_BASE + 5,
+                run_fn=_run_fleet_telemetry,
+            )
+        )
     tasks.append(
         _PeriodicTaskDef(
             name="user-file-retention-cleanup",
             interval_seconds=_USER_FILE_RETENTION_CHECK_INTERVAL_SECONDS,
-            lock_id=PERIODIC_TASK_LOCK_BASE + 3,
+            lock_id=PERIODIC_TASK_LOCK_BASE + 6,
             run_fn=_run_user_file_retention_cleanup,
         )
     )
@@ -302,17 +371,17 @@ def _try_claim_task(task_def: _PeriodicTaskDef) -> bool:
     ``KVStore`` timestamp for cross-instance dedup.  The DB session is held
     only for this brief claim transaction, not during task execution.
     """
-    from datetime import datetime
-    from datetime import timezone
+    from datetime import datetime, timezone
 
     from sqlalchemy import text
 
     from onyx.db.engine.sql_engine import get_session_with_current_tenant
-    from onyx.db.models import KVStore
+    from onyx.db.kv_store import add_kv_store_row__no_commit, fetch_kv_store_row
 
     kv_key = PERIODIC_TASK_KV_PREFIX + task_def.name
 
     with get_session_with_current_tenant() as db_session:
+        # db-ops-outside-db: allow advisory lock, not a table query
         acquired = db_session.execute(
             text("SELECT pg_try_advisory_xact_lock(:id)"),
             {"id": task_def.lock_id},
@@ -320,7 +389,7 @@ def _try_claim_task(task_def: _PeriodicTaskDef) -> bool:
         if not acquired:
             return False
 
-        row = db_session.query(KVStore).filter_by(key=kv_key).first()
+        row = fetch_kv_store_row(db_session, kv_key)
         if row and row.value is not None:
             last_claimed = datetime.fromisoformat(str(row.value))
             elapsed = (datetime.now(timezone.utc) - last_claimed).total_seconds()
@@ -331,7 +400,7 @@ def _try_claim_task(task_def: _PeriodicTaskDef) -> bool:
         if row:
             row.value = now_ts
         else:
-            db_session.add(KVStore(key=kv_key, value=now_ts))
+            add_kv_store_row__no_commit(db_session, kv_key, now_ts)
         db_session.commit()
 
     return True
@@ -361,9 +430,11 @@ def _try_run_periodic_task(task_def: _PeriodicTaskDef) -> None:
 
 
 def _run_drain_loops(tenant_id: str) -> None:
-    from onyx.background.task_utils import drain_delete_loop
-    from onyx.background.task_utils import drain_processing_loop
-    from onyx.background.task_utils import drain_project_sync_loop
+    from onyx.background.task_utils import (
+        drain_delete_loop,
+        drain_processing_loop,
+        drain_project_sync_loop,
+    )
 
     drain_processing_loop(tenant_id)
     drain_delete_loop(tenant_id)

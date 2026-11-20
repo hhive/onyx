@@ -2,7 +2,8 @@
 
 import React from "react";
 import { cn } from "@opal/utils";
-import type { WithoutStyles } from "@opal/types";
+import type { Spacing, WithoutStyles } from "@opal/types";
+import { spacingToRem } from "@opal/shared";
 
 type FlexDirection = "row" | "column";
 type JustifyContent = "start" | "center" | "end" | "between";
@@ -46,11 +47,23 @@ interface SectionProps extends WithoutStyles<
   width?: Length;
   height?: Length;
 
-  gap?: number;
-  padding?: number;
+  /** Spacing between children, as a {@link Spacing} step (`N / 4` rem). @default 4 */
+  gap?: Spacing;
+  /** Inner padding, as a {@link Spacing} step (`N / 4` rem). @default 0 */
+  padding?: Spacing;
   wrap?: boolean;
+  /** Spacing between wrapped lines, as a {@link Spacing} step. @default gap */
+  wrapGap?: Spacing;
 
-  dbg?: boolean;
+  /** As a flex child: the share of the free space it takes. Setting it, or
+   * `basis`, lets the content shrink below its own width. */
+  grow?: number;
+  /** As a flex child: `false` keeps it from shrinking. @default true */
+  shrink?: boolean;
+  /** As a flex child: its starting size along the parent's row or column, in rem. */
+  basis?: number;
+  /** Minimum height, in rem. */
+  minHeight?: number;
 
   ref?: React.Ref<HTMLDivElement>;
 }
@@ -62,10 +75,14 @@ function Section({
   alignItems = "center",
   width = "full",
   height = "full",
-  gap = 1,
+  gap = 4,
   padding = 0,
   wrap,
-  dbg,
+  wrapGap,
+  grow,
+  shrink = true,
+  basis,
+  minHeight,
   ref,
   ...rest
 }: SectionProps) {
@@ -83,14 +100,23 @@ function Section({
         typeof height === "number" && "overflow-hidden",
 
         wrap && "flex-wrap",
-        dbg && "dbg-red",
+        (grow !== undefined || basis !== undefined) && "min-w-0",
+        !shrink && "shrink-0",
         className
       )}
       style={{
-        gap: `${gap}rem`,
-        padding: `${padding}rem`,
+        // Longhands only: React drops a removed longhand without re-applying
+        // a `gap` shorthand beside it.
+        rowGap: spacingToRem(flexDirection === "row" ? (wrapGap ?? gap) : gap),
+        columnGap: spacingToRem(
+          flexDirection === "row" ? gap : (wrapGap ?? gap)
+        ),
+        padding: spacingToRem(padding),
         ...(typeof width === "number" && { width: `${width}rem` }),
         ...(typeof height === "number" && { height: `${height}rem` }),
+        ...(grow !== undefined && { flexGrow: grow }),
+        ...(basis !== undefined && { flexBasis: `${basis}rem` }),
+        ...(minHeight !== undefined && { minHeight: `${minHeight}rem` }),
       }}
       {...rest}
     />

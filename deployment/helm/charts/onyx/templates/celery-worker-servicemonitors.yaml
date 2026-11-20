@@ -4,7 +4,7 @@
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
-  name: {{ include "onyx.fullname" . }}-celery-worker-monitoring
+  name: {{ include "onyx.resourceName" (list . "celery-worker-monitoring") }}
   labels:
     {{- include "onyx.labels" . | nindent 4 }}
     {{- with .Values.monitoring.serviceMonitors.labels }}
@@ -29,7 +29,7 @@ spec:
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
-  name: {{ include "onyx.fullname" . }}-celery-worker-docfetching
+  name: {{ include "onyx.resourceName" (list . "celery-worker-docfetching") }}
   labels:
     {{- include "onyx.labels" . | nindent 4 }}
     {{- with .Values.monitoring.serviceMonitors.labels }}
@@ -54,7 +54,7 @@ spec:
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
-  name: {{ include "onyx.fullname" . }}-celery-worker-docprocessing
+  name: {{ include "onyx.resourceName" (list . "celery-worker-docprocessing") }}
   labels:
     {{- include "onyx.labels" . | nindent 4 }}
     {{- with .Values.monitoring.serviceMonitors.labels }}
@@ -74,12 +74,37 @@ spec:
       interval: 30s
       scrapeTimeout: 10s
 {{- end }}
+{{- if and .Values.celery_worker_docconversion.enabled (or .Values.celery_worker_docconversion.autoscaling.enabled (gt (int .Values.celery_worker_docconversion.replicaCount) 0)) }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "onyx.resourceName" (list . "celery-worker-docconversion") }}
+  labels:
+    {{- include "onyx.labels" . | nindent 4 }}
+    {{- with .Values.monitoring.serviceMonitors.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  selector:
+    matchLabels:
+      app: {{ .Values.celery_worker_docconversion.deploymentLabels.app }}
+      metrics: "true"
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+{{- end }}
 {{- if gt (int .Values.celery_worker_heavy.replicaCount) 0 }}
 ---
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
-  name: {{ include "onyx.fullname" . }}-celery-worker-heavy
+  name: {{ include "onyx.resourceName" (list . "celery-worker-heavy") }}
   labels:
     {{- include "onyx.labels" . | nindent 4 }}
     {{- with .Values.monitoring.serviceMonitors.labels }}
@@ -104,7 +129,7 @@ spec:
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
-  name: {{ include "onyx.fullname" . }}-celery-worker-light
+  name: {{ include "onyx.resourceName" (list . "celery-worker-light") }}
   labels:
     {{- include "onyx.labels" . | nindent 4 }}
     {{- with .Values.monitoring.serviceMonitors.labels }}
@@ -129,7 +154,7 @@ spec:
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
-  name: {{ include "onyx.fullname" . }}-celery-worker-primary
+  name: {{ include "onyx.resourceName" (list . "celery-worker-primary") }}
   labels:
     {{- include "onyx.labels" . | nindent 4 }}
     {{- with .Values.monitoring.serviceMonitors.labels }}
@@ -154,7 +179,7 @@ spec:
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
-  name: {{ include "onyx.fullname" . }}-celery-worker-scheduled-tasks
+  name: {{ include "onyx.resourceName" (list . "celery-worker-scheduled-tasks") }}
   labels:
     {{- include "onyx.labels" . | nindent 4 }}
     {{- with .Values.monitoring.serviceMonitors.labels }}

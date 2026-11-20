@@ -2,30 +2,35 @@ import csv
 import io
 from datetime import datetime
 
-from celery import shared_task
-from celery import Task
+from celery import Task, shared_task
 
-from ee.onyx.server.query_history.api import fetch_and_process_chat_session_history
-from ee.onyx.server.query_history.api import ONYX_ANONYMIZED_EMAIL
 from ee.onyx.server.query_history.models import QuestionAnswerPairSnapshot
 from onyx.background.task_utils import construct_query_history_report_name
 from onyx.configs.app_configs import JOB_TIMEOUT
-from onyx.configs.constants import FileOrigin
-from onyx.configs.constants import FileType
-from onyx.configs.constants import OnyxCeleryTask
-from onyx.configs.constants import QueryHistoryType
+from onyx.configs.constants import (
+    FileOrigin,
+    FileType,
+    OnyxCeleryTask,
+    QueryHistoryType,
+)
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
-from onyx.db.tasks import delete_task_with_id
-from onyx.db.tasks import mark_task_as_finished_with_id
-from onyx.db.tasks import mark_task_as_started_with_id
+from onyx.db.enums import TaskStatus
+from onyx.db.tasks import (
+    claim_task_with_id,
+    delete_task_with_id,
+    fail_task_with_id,
+    get_started_task_for_update,
+    is_task_started,
+)
 from onyx.file_store.file_store import get_default_file_store
 from onyx.server.settings.store import load_settings
+from onyx.utils.csv_utils import sanitize_csv_row
 from onyx.utils.logger import setup_logger
 
 logger = setup_logger()
 
 
-@shared_task(
+@shared_task(  # ty: ignore[invalid-argument-type]
     name=OnyxCeleryTask.EXPORT_QUERY_HISTORY_TASK,
     ignore_result=True,
     soft_time_limit=JOB_TIMEOUT,
@@ -41,6 +46,11 @@ def export_query_history_task(
     # Need to include the tenant_id since the TenantAwareTask needs this
     tenant_id: str,  # noqa: ARG001
 ) -> None:
+    from ee.onyx.server.query_history.api import (
+        ONYX_ANONYMIZED_EMAIL,
+        fetch_and_process_chat_session_history,
+    )
+
     if not self.request.id:
         raise RuntimeError("No task id defined for this task; cannot identify it")
 
@@ -53,12 +63,9 @@ def export_query_history_task(
     writer.writeheader()
 
     with get_session_with_current_tenant() as db_session:
+        if not claim_task_with_id(db_session, task_id):
+            return
         try:
-            mark_task_as_started_with_id(
-                db_session=db_session,
-                task_id=task_id,
-            )
-
             snapshot_generator = fetch_and_process_chat_session_history(
                 db_session=db_session,
                 start=start,
@@ -71,7 +78,9 @@ def export_query_history_task(
                     snapshot.user_email = ONYX_ANONYMIZED_EMAIL
 
                 writer.writerows(
-                    qa_pair.to_json()
+                    # Sanitize to prevent CSV/formula injection against
+                    # whoever opens the export in a spreadsheet (ON-008).
+                    sanitize_csv_row(qa_pair.to_json())
                     for qa_pair in QuestionAnswerPairSnapshot.from_chat_session_snapshot(
                         snapshot
                     )
@@ -79,18 +88,20 @@ def export_query_history_task(
 
         except Exception:
             logger.exception("Failed to export query history with task_id=%r", task_id)
-            mark_task_as_finished_with_id(
-                db_session=db_session,
-                task_id=task_id,
-                success=False,
-            )
+            fail_task_with_id(db_session, task_id, TaskStatus.STARTED)
             raise
 
     report_name = construct_query_history_report_name(task_id)
+    file_store = get_default_file_store()
     with get_session_with_current_tenant() as db_session:
+        # Cleanup can fail the job while history is read. Do not upload then.
+        if not is_task_started(db_session, task_id):
+            return
+        # End the transaction, so the upload holds no lock or open transaction.
+        db_session.commit()
         try:
             stream.seek(0)
-            get_default_file_store().save_file(
+            file_store.save_file(
                 content=stream,
                 display_name=report_name,
                 file_origin=FileOrigin.QUERY_HISTORY_CSV,
@@ -102,7 +113,11 @@ def export_query_history_task(
                 },
                 file_id=report_name,
             )
-
+            # Serialize publication with the reaper. A failed job cannot publish.
+            if get_started_task_for_update(db_session, task_id) is None:
+                db_session.rollback()
+                file_store.delete_file(report_name, error_on_missing=False)
+                return
             delete_task_with_id(
                 db_session=db_session,
                 task_id=task_id,
@@ -111,9 +126,5 @@ def export_query_history_task(
             logger.exception(
                 "Failed to save query history export file; report_name=%r", report_name
             )
-            mark_task_as_finished_with_id(
-                db_session=db_session,
-                task_id=task_id,
-                success=False,
-            )
+            fail_task_with_id(db_session, task_id, TaskStatus.STARTED)
             raise

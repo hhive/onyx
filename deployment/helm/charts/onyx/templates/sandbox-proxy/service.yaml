@@ -1,8 +1,8 @@
-{{- if eq (include "onyx.sandboxProxyEnabled" .) "true" }}
+{{- if eq (include "onyx.craftEnabled" .) "true" }}
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "onyx.fullname" . }}-sandbox-proxy
+  name: {{ include "onyx.resourceName" (list . "sandbox-proxy") }}
   labels:
     {{- include "onyx.labels" . | nindent 4 }}
     app.kubernetes.io/component: sandbox-proxy
@@ -13,7 +13,13 @@ spec:
     app.kubernetes.io/component: sandbox-proxy
   ports:
     - name: proxy
-      port: {{ .Values.sandboxProxy.service.proxyPort }}
+      port: {{ include "onyx.sandboxProxyPort" . }}
       targetPort: proxy
       protocol: TCP
+    {{- if include "onyx.craftFcRelayTls.enabled" . }}
+    - name: relay-tls
+      port: {{ include "onyx.craftFcRelayTls.port" . }}
+      targetPort: relay-tls
+      protocol: TCP
+    {{- end }}
 {{- end }}

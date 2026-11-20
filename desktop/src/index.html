@@ -358,10 +358,10 @@
               <div class="setting-row">
                 <div class="setting-row-content">
                   <label class="setting-label" for="onyxDomain"
-                    >Root Domain</label
+                    >Server URL</label
                   >
                   <div class="setting-description">
-                    The root URL for your Onyx instance
+                    The URL for your Onyx instance
                   </div>
                 </div>
               </div>
@@ -473,7 +473,7 @@
             return;
           }
 
-          window.location.href = currentServerUrl;
+          window.location.replace(currentServerUrl);
         } catch (error) {
           // On error, default to cloud
           domainInput.value = DEFAULT_DOMAIN;
@@ -535,7 +535,7 @@
           await invoke("set_server_url", { url: validation.url });
 
           // Success - redirect to the new URL (login page)
-          window.location.href = validation.url;
+          window.location.replace(validation.url);
         } catch (error) {
           showError(error || "Failed to save configuration");
           saveBtn.disabled = false;

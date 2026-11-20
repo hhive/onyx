@@ -11,8 +11,10 @@ import (
 	"mime/multipart"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -22,21 +24,25 @@ import (
 
 // Client is the Onyx API client.
 //
-// Three http.Clients are kept so each call site can pick a timeout matched to
-// its expected work: 30s for quick JSON endpoints, 60s for /search (which
-// runs LLM query expansion + relevance selection), and 5min for streaming
-// chat responses and uploads.
+// Each call site picks an http.Client with a timeout matched to its expected
+// work: 3min for quick JSON endpoints, 5min for /search (which runs LLM query
+// expansion + relevance selection) and uploads, and 6min for image generation.
+// Chat streams have no total timeout: a turn can run for many minutes, so
+// streamIdleTimeout bounds each wait for data instead.
 type Client struct {
-	baseURL             string
-	apiKey              string
-	httpClient          *http.Client // 30s
-	searchHTTPClient    *http.Client // 60s
-	streamingHTTPClient *http.Client // 5min
+	baseURL           string
+	apiKey            string
+	httpClient        *http.Client
+	searchHTTPClient  *http.Client
+	uploadHTTPClient  *http.Client
+	streamHTTPClient  *http.Client
+	imageHTTPClient   *http.Client
+	streamIdleTimeout time.Duration
 }
 
 // NewClient creates a new API client from config.
-// ServerURL is the server origin (e.g. "https://cloud.onyx.app").
-// APIURL appends the /api prefix to form the API base URL.
+// ServerURL may be a server origin or an API base that already includes the
+// configured API prefix.
 func NewClient(cfg config.OnyxCliConfig) *Client {
 	var transport *http.Transport
 	if t, ok := http.DefaultTransport.(*http.Transport); ok {
@@ -48,15 +54,24 @@ func NewClient(cfg config.OnyxCliConfig) *Client {
 		baseURL: config.APIURL(cfg.ServerURL),
 		apiKey:  cfg.APIKey,
 		httpClient: &http.Client{
-			Timeout:   30 * time.Second,
+			Timeout:   3 * time.Minute,
 			Transport: transport,
 		},
 		searchHTTPClient: &http.Client{
-			Timeout:   60 * time.Second,
+			Timeout:   5 * time.Minute,
 			Transport: transport,
 		},
-		streamingHTTPClient: &http.Client{
+		uploadHTTPClient: &http.Client{
 			Timeout:   5 * time.Minute,
+			Transport: transport,
+		},
+		streamHTTPClient: &http.Client{Transport: transport},
+		// The server sends a heartbeat every 15 seconds while a turn has no output.
+		streamIdleTimeout: 2 * time.Minute,
+		// Must exceed the server's 5-minute image-generation stream ceiling,
+		// or the client gives up before the server's timeout envelope arrives.
+		imageHTTPClient: &http.Client{
+			Timeout:   6 * time.Minute,
 			Transport: transport,
 		},
 	}
@@ -86,7 +101,19 @@ func checkResponse(resp *http.Response) error {
 			Detail:     "server returned HTML instead of JSON — check that your server URL is correct",
 		}
 	}
-	return &OnyxAPIError{StatusCode: resp.StatusCode, Detail: string(body)}
+	apiErr := &OnyxAPIError{StatusCode: resp.StatusCode, Detail: string(body)}
+	// Onyx errors carry {"error_code", "detail"}; other errors keep the raw body.
+	var structured struct {
+		ErrorCode string `json:"error_code"`
+		Detail    any    `json:"detail"`
+	}
+	if json.Unmarshal(body, &structured) == nil && structured.ErrorCode != "" {
+		apiErr.ErrorCode = structured.ErrorCode
+		if detail, ok := structured.Detail.(string); ok && detail != "" {
+			apiErr.Detail = detail
+		}
+	}
+	return apiErr
 }
 
 func isHTMLResponse(contentType string, body []byte) bool {
@@ -150,6 +177,41 @@ func (c *Client) Search(ctx context.Context, req models.SearchRequest) (*models.
 		return nil, err
 	}
 	return &resp, nil
+}
+
+// GenerateImage calls POST /image-generation/generate, which generates
+// image(s) using the workspace's default image-gen provider.
+//
+// The server streams keepalive whitespace before the JSON body (which
+// json.Decoder skips) and reports errors in-band on a 200, since the status
+// line is already committed when a slow generation fails.
+func (c *Client) GenerateImage(ctx context.Context, req models.ImageGenerationRequest) (*models.ImageGenerationResponse, error) {
+	var resp struct {
+		models.ImageGenerationResponse
+		ErrorCode string `json:"error_code"`
+		Detail    string `json:"detail"`
+	}
+	if err := c.doJSONWith(ctx, c.imageHTTPClient, "POST", "/image-generation/generate", req, &resp); err != nil {
+		return nil, err
+	}
+	if resp.ErrorCode != "" {
+		var statusCode int
+		switch resp.ErrorCode {
+		case "NOT_FOUND":
+			statusCode = 404
+		case "INVALID_INPUT":
+			statusCode = 400
+		case "GATEWAY_TIMEOUT":
+			statusCode = 504
+		default:
+			statusCode = 502
+		}
+		return nil, &OnyxAPIError{StatusCode: statusCode, Detail: resp.Detail}
+	}
+	if len(resp.Images) == 0 {
+		return nil, &OnyxAPIError{StatusCode: 502, Detail: "server returned no images"}
+	}
+	return &resp.ImageGenerationResponse, nil
 }
 
 // TestConnection checks if the server is reachable and credentials are valid.
@@ -229,6 +291,25 @@ func (c *Client) ListAgents(ctx context.Context) ([]models.AgentSummary, error) 
 	return result, nil
 }
 
+// ListDocumentSets returns the document sets the current user can search.
+func (c *Client) ListDocumentSets(ctx context.Context) ([]models.DocumentSetSummary, error) {
+	var result []models.DocumentSetSummary
+	if err := c.doJSON(ctx, "GET", "/manage/document-set?searchable_only=true", nil, &result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// ListLLMProviders returns LLM providers (with their models) accessible to
+// the current user, plus the workspace default model.
+func (c *Client) ListLLMProviders(ctx context.Context) (*models.LLMProviderResponse, error) {
+	var resp models.LLMProviderResponse
+	if err := c.doJSON(ctx, "GET", "/llm/provider", nil, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
 // ListChatSessions returns recent chat sessions.
 func (c *Client) ListChatSessions(ctx context.Context) ([]models.ChatSessionDetails, error) {
 	var resp struct {
@@ -292,7 +373,7 @@ func (c *Client) UploadFile(ctx context.Context, filePath string) (*models.FileD
 	}
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 
-	resp, err := c.streamingHTTPClient.Do(req)
+	resp, err := c.uploadHTTPClient.Do(req)
 	if err != nil {
 		return nil, wrapTimeoutError(err)
 	}
@@ -331,8 +412,8 @@ func (c *Client) GetBackendVersion(ctx context.Context) (string, error) {
 }
 
 // StopChatSession sends a stop signal for a streaming session (best-effort).
-func (c *Client) StopChatSession(ctx context.Context, sessionID string) {
-	req, err := c.newRequest(ctx, "POST", "/chat/stop-chat-session/"+sessionID, nil)
+func (c *Client) StopChatSession(ctx context.Context, sessionID string, streamID int) {
+	req, err := c.newRequest(ctx, "POST", fmt.Sprintf("/chat/stop-chat-session/%s?stream_id=%d", sessionID, streamID), nil)
 	if err != nil {
 		return
 	}
@@ -343,18 +424,130 @@ func (c *Client) StopChatSession(ctx context.Context, sessionID string) {
 	_ = resp.Body.Close()
 }
 
+// DecideApproval answers a tool approval request and returns the decision the
+// server saved. An error for which IsNoLongerWaiting is true means the
+// request no longer waits.
+func (c *Client) DecideApproval(ctx context.Context, approvalID string, decision models.ApprovalDecision) (models.ApprovalDecisionResult, error) {
+	body := map[string]models.ApprovalDecision{"decision": decision}
+	var result models.ApprovalDecisionResult
+	err := c.doJSON(ctx, "POST", "/chat/approvals/"+url.PathEscape(approvalID)+"/decision", body, &result)
+	return result, err
+}
+
+// AnswerQuestions answers a question request and returns the stream that
+// continues its response, if any. An error for which IsNoLongerWaiting is true
+// means the questions no longer wait; IsApprovalPending refuses a message.
+func (c *Client) AnswerQuestions(ctx context.Context, questionRequestID string, answers models.QuestionAnswers) (models.QuestionAnswersResult, error) {
+	var result models.QuestionAnswersResult
+	err := c.doJSON(ctx, "POST", "/chat/question-requests/"+url.PathEscape(questionRequestID)+"/answers", answers, &result)
+	return result, err
+}
+
+// ChatSessionStatus confirms whether the server still owns the session. A
+// failed query reports a running session.
+func (c *Client) ChatSessionStatus(ctx context.Context, sessionID string) (models.ChatSessionStatus, error) {
+	var status struct {
+		IsProcessing       *bool              `json:"is_processing"`
+		CurrentStream      *models.ChatStream `json:"current_stream"`
+		ApprovalsVersion   string             `json:"approvals_version"`
+		HasActiveSubagents bool               `json:"has_active_subagents"`
+		HasStartableInput  bool               `json:"has_startable_input"`
+		LatestResponseID   *int               `json:"latest_response_id"`
+	}
+	unknown := models.ChatSessionStatus{IsProcessing: true}
+	if err := c.doJSON(ctx, "GET", "/chat/chat-session/"+sessionID+"/status", nil, &status); err != nil {
+		var apiErr *OnyxAPIError
+		if errors.As(err, &apiErr) && (apiErr.StatusCode == http.StatusNotFound || apiErr.StatusCode == http.StatusMethodNotAllowed) {
+			return unknown, fmt.Errorf("session or readiness endpoint unavailable; use a server with the chat readiness API: %w", err)
+		}
+		return unknown, err
+	}
+	if status.IsProcessing == nil {
+		return unknown, fmt.Errorf("invalid chat readiness response")
+	}
+	return models.ChatSessionStatus{
+		IsProcessing:       *status.IsProcessing,
+		CurrentStream:      status.CurrentStream,
+		ApprovalsVersion:   status.ApprovalsVersion,
+		HasActiveSubagents: status.HasActiveSubagents,
+		HasStartableInput:  status.HasStartableInput,
+		LatestResponseID:   status.LatestResponseID,
+	}, nil
+}
+
+// StatusPollInterval paces the status reads that wait for the server.
+var StatusPollInterval = time.Second
+
+// WaitForChatSessionIdle keeps completion separate from delivery.
+func WaitForChatSessionIdle(ctx context.Context, client ClientAPI, sessionID string) error {
+	for {
+		status, err := client.ChatSessionStatus(ctx, sessionID)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err != nil && !IsRetryableReadinessError(err) {
+			return err
+		}
+		if err == nil && !status.IsProcessing {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(StatusPollInterval):
+		}
+	}
+}
+
+// FollowResponse reads the session status until a stream other than
+// streamID writes the response responseID, and returns that stream. While
+// another turn holds the session, the status reports processing, so the
+// read continues. It returns nil once the session is idle: the saved session
+// then shows how the response went on.
+func FollowResponse(ctx context.Context, client ClientAPI, sessionID string, responseID, streamID int) (*models.ChatStream, error) {
+	for {
+		status, err := client.ChatSessionStatus(ctx, sessionID)
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if err != nil && !IsRetryableReadinessError(err) {
+			return nil, err
+		}
+		if err == nil {
+			current := status.CurrentStream
+			if current != nil && current.StreamID != streamID && slices.Contains(current.ResponseIDs, responseID) {
+				return current, nil
+			}
+			if !status.IsProcessing {
+				return nil, nil
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(StatusPollInterval):
+		}
+	}
+}
+
 // ClientAPI is the interface satisfied by Client.
 type ClientAPI interface {
 	TestConnection(ctx context.Context) error
 	ListAgents(ctx context.Context) ([]models.AgentSummary, error)
+	ListLLMProviders(ctx context.Context) (*models.LLMProviderResponse, error)
 	ListChatSessions(ctx context.Context) ([]models.ChatSessionDetails, error)
 	GetChatSession(ctx context.Context, sessionID string) (*models.ChatSessionDetailResponse, error)
 	RenameChatSession(ctx context.Context, sessionID string, name *string) (string, error)
 	UploadFile(ctx context.Context, filePath string) (*models.FileDescriptorPayload, error)
 	GetBackendVersion(ctx context.Context) (string, error)
-	StopChatSession(ctx context.Context, sessionID string)
-	SendMessageStream(ctx context.Context, message string, chatSessionID *string, agentID int, parentMessageID *int, fileDescriptors []models.FileDescriptorPayload) <-chan models.StreamEvent
+	StopChatSession(ctx context.Context, sessionID string, streamID int)
+	ChatSessionStatus(ctx context.Context, sessionID string) (models.ChatSessionStatus, error)
+	DecideApproval(ctx context.Context, approvalID string, decision models.ApprovalDecision) (models.ApprovalDecisionResult, error)
+	AnswerQuestions(ctx context.Context, questionRequestID string, answers models.QuestionAnswers) (models.QuestionAnswersResult, error)
+	SendMessageStream(ctx context.Context, message string, chatSessionID *string, agentID int, parentMessageID *int, fileDescriptors []models.FileDescriptorPayload, llmOverride *models.LLMOverride) <-chan models.StreamEvent
+	ResumeChatStream(ctx context.Context, sessionID string, streamID *int, cursor int) <-chan models.StreamEvent
 	Search(ctx context.Context, req models.SearchRequest) (*models.SearchResponse, error)
+	GenerateImage(ctx context.Context, req models.ImageGenerationRequest) (*models.ImageGenerationResponse, error)
 }
 
 var _ ClientAPI = (*Client)(nil)

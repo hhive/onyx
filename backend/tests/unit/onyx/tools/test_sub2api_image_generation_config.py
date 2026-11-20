@@ -1,8 +1,10 @@
 from types import SimpleNamespace
 from uuid import uuid4
 
+from onyx.context.search.models import PersonaSearchInfo
 from onyx.image_gen.factory import ImageGenerationProviderName
 from onyx.tools import tool_constructor
+from onyx.tools.models import PersonaToolConfiguration, ToolConfiguration
 
 
 class _Secret:
@@ -21,6 +23,7 @@ def test_get_user_sub2api_image_generation_config_uses_user_credential(
 
     user = SimpleNamespace(id=uuid4())
     credential = SimpleNamespace(
+        api_key_id=7,
         api_key=_Secret("sk-image-user"),
         api_base_url="https://sub2api.example.com/v1",
         image_model_name="gpt-image-2",
@@ -70,6 +73,7 @@ def test_get_user_sub2api_image_generation_config_prefers_sub2api_llm_base_url(
 
     user = SimpleNamespace(id=uuid4())
     credential = SimpleNamespace(
+        api_key_id=7,
         api_key=_Secret("sk-image-user"),
         api_base_url="https://sub2api.example.com/v1",
         image_model_name="gpt-image-2",
@@ -110,26 +114,31 @@ def test_construct_tools_prefers_user_sub2api_image_generation_config(
         enable_memory_tool=False,
     )
     credential = SimpleNamespace(
+        api_key_id=7,
         api_key=_Secret("sk-image-user"),
         api_base_url="https://sub2api.example.com/v1",
         image_model_name="gpt-image-2",
     )
     llm = SimpleNamespace(config=SimpleNamespace(max_input_tokens=8192))
-    tool_model = SimpleNamespace(
-        id=7,
-        name="generate_image",
-        in_code_tool_id=100,
-        openapi_schema=None,
-        mcp_server_id=None,
-    )
-    persona = SimpleNamespace(
-        id=1,
-        name="Assistant",
-        tools=[tool_model],
-        document_sets=[],
-        search_start_date=None,
-        attached_documents=[],
-        hierarchy_nodes=[],
+    configuration = PersonaToolConfiguration(
+        persona_id=1,
+        persona_name="Assistant",
+        tools=[
+            ToolConfiguration(
+                id=7,
+                name="generate_image",
+                display_name=None,
+                description=None,
+                in_code_tool_id="ImageGenerationTool",
+                enabled=True,
+            )
+        ],
+        search=PersonaSearchInfo(
+            document_set_names=[],
+            search_start_date=None,
+            attached_document_ids=[],
+            hierarchy_node_ids=[],
+        ),
     )
     created_tools = []
 
@@ -142,13 +151,13 @@ def test_construct_tools_prefers_user_sub2api_image_generation_config(
             provider,
             model,
             tool_id,
-            emitter,
+            chat_session_id,
         ) -> None:
             self.image_generation_credentials = image_generation_credentials
             self.provider = provider
             self.model = model
             self.tool_id = tool_id
-            self.emitter = emitter
+            self.chat_session_id = chat_session_id
             created_tools.append(self)
 
         @classmethod
@@ -164,7 +173,6 @@ def test_construct_tools_prefers_user_sub2api_image_generation_config(
     def get_default_document_index(
         _search_settings,
         _secondary_search_settings,
-        _db_session,
     ):
         return object()
 
@@ -174,7 +182,9 @@ def test_construct_tools_prefers_user_sub2api_image_generation_config(
     def get_global_image_generation_config(_llm, _db_session):
         raise AssertionError("global image generation config should not be used")
 
-    monkeypatch.setattr(tool_constructor, "ImageGenerationTool", FakeImageGenerationTool)
+    monkeypatch.setattr(
+        tool_constructor, "ImageGenerationTool", FakeImageGenerationTool
+    )
     monkeypatch.setattr(
         tool_constructor,
         "get_built_in_tool_by_id",
@@ -201,15 +211,18 @@ def test_construct_tools_prefers_user_sub2api_image_generation_config(
         get_global_image_generation_config,
     )
 
+    monkeypatch.setattr(
+        tool_constructor, "build_integration_chat_tools", lambda *_a, **_kw: []
+    )
     result = tool_constructor._construct_tools_impl(
-        persona=persona,
+        configuration=configuration,
         db_session=object(),
-        emitter=object(),
+        custom_tool_config=tool_constructor.CustomToolConfig(chat_session_id=uuid4()),
         user=user,
         llm=llm,
     )
 
-    assert result[7] == created_tools
+    assert result == created_tools
     assert len(created_tools) == 1
     image_tool = created_tools[0]
     assert image_tool.provider == ImageGenerationProviderName.OPENAI.value

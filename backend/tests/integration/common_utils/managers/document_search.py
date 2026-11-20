@@ -1,5 +1,7 @@
-from ee.onyx.server.query_and_chat.models import SearchFullResponse
-from ee.onyx.server.query_and_chat.models import SendSearchQueryRequest
+from ee.onyx.server.query_and_chat.models import (
+    SearchFullResponse,
+    SendSearchQueryRequest,
+)
 from tests.integration.common_utils.constants import API_SERVER_URL
 from tests.integration.common_utils.http_client import client
 from tests.integration.common_utils.test_models import DATestUser
@@ -10,6 +12,7 @@ class DocumentSearchManager:
     def search_documents(
         query: str,
         user_performing_action: DATestUser,
+        hybrid_alpha: float | None = None,
     ) -> list[str]:
         """
         Search for documents using the EE search API.
@@ -17,6 +20,7 @@ class DocumentSearchManager:
         Args:
             query: The search query string
             user_performing_action: The user performing the search (for auth)
+            hybrid_alpha: 1.0 for a pure vector search. None keeps the default.
 
         Returns:
             A list of document content strings (blurbs) from the search results
@@ -25,6 +29,7 @@ class DocumentSearchManager:
             search_query=query,
             filters=None,
             stream=False,
+            hybrid_alpha=hybrid_alpha,
         )
         result = client.post(
             url=f"{API_SERVER_URL}/search/send-search-message",

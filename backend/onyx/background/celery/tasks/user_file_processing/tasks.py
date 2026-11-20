@@ -1,59 +1,82 @@
 import datetime
 import time
-from typing import Any
 from uuid import UUID
 
-import httpx
-import sqlalchemy as sa
-from celery import Celery
-from celery import shared_task
-from celery import Task
+from celery import Celery, Task, shared_task
 from redis.lock import Lock as RedisLock
-from retry import retry
-from sqlalchemy import select
 
 from onyx.access.access import build_access_for_user_files
 from onyx.access.models import DocumentAccess
 from onyx.background.celery.apps.app_base import task_logger
-from onyx.background.celery.celery_redis import celery_get_broker_client
-from onyx.background.celery.celery_redis import celery_get_queue_length
-from onyx.background.celery.celery_utils import httpx_init_vespa_pool
-from onyx.background.celery.tasks.shared.RetryDocumentIndex import RetryDocumentIndex
+from onyx.background.celery.celery_redis import (
+    celery_get_broker_client,
+    celery_get_queue_length,
+)
+from onyx.background.task_utils import send_user_file_delete_task
+from onyx.chat.incognito import (
+    sweep_incognito_generated_files,
+    sweep_stale_incognito_user_files,
+)
+from onyx.chat.incognito_context import retry_incognito_teardowns
 from onyx.configs.app_configs import DISABLE_VECTOR_DB
-from onyx.configs.app_configs import MANAGED_VESPA
-from onyx.configs.app_configs import VESPA_CLOUD_CERT_PATH
-from onyx.configs.app_configs import VESPA_CLOUD_KEY_PATH
-from onyx.configs.constants import CELERY_GENERIC_BEAT_LOCK_TIMEOUT
-from onyx.configs.constants import CELERY_USER_FILE_DELETE_TASK_EXPIRES
-from onyx.configs.constants import CELERY_USER_FILE_PROCESSING_LOCK_TIMEOUT
-from onyx.configs.constants import CELERY_USER_FILE_PROCESSING_TASK_EXPIRES
-from onyx.configs.constants import CELERY_USER_FILE_PROJECT_SYNC_LOCK_TIMEOUT
-from onyx.configs.constants import CELERY_USER_FILE_PROJECT_SYNC_TASK_EXPIRES
-from onyx.configs.constants import DocumentSource
-from onyx.configs.constants import OnyxCeleryPriority
-from onyx.configs.constants import OnyxCeleryQueues
-from onyx.configs.constants import OnyxCeleryTask
-from onyx.configs.constants import OnyxRedisLocks
-from onyx.configs.constants import USER_FILE_DELETE_MAX_QUEUE_DEPTH
-from onyx.configs.constants import USER_FILE_PROCESSING_MAX_QUEUE_DEPTH
-from onyx.configs.constants import USER_FILE_PROJECT_SYNC_MAX_QUEUE_DEPTH
+from onyx.configs.constants import (
+    CELERY_GENERIC_BEAT_LOCK_TIMEOUT,
+    CELERY_USER_FILE_DELETE_TASK_EXPIRES,
+    CELERY_USER_FILE_PROCESSING_LOCK_TIMEOUT,
+    CELERY_USER_FILE_PROCESSING_TASK_EXPIRES,
+    CELERY_USER_FILE_PROJECT_SYNC_LOCK_TIMEOUT,
+    CELERY_USER_FILE_PROJECT_SYNC_TASK_EXPIRES,
+    USER_FILE_DELETE_MAX_QUEUE_DEPTH,
+    USER_FILE_PROCESSING_MAX_QUEUE_DEPTH,
+    USER_FILE_PROJECT_SYNC_MAX_QUEUE_DEPTH,
+    DocumentSource,
+    OnyxCeleryPriority,
+    OnyxCeleryQueues,
+    OnyxCeleryTask,
+    OnyxRedisLocks,
+)
 from onyx.connectors.file.connector import LocalFileConnector
-from onyx.connectors.models import Document
-from onyx.connectors.models import HierarchyNode
+from onyx.connectors.models import Document, HierarchyNode
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.enums import UserFileStatus
-from onyx.db.models import UserFile
-from onyx.db.search_settings import get_active_search_settings
-from onyx.db.search_settings import get_active_search_settings_list
-from onyx.db.user_file import fetch_user_files_with_access_relationships
-from onyx.document_index.factory import get_all_document_indices
-from onyx.document_index.interfaces_new import MetadataUpdateRequest
-from onyx.document_index.vespa_constants import DOCUMENT_ID_ENDPOINT
+from onyx.db.models import SearchSettings
+from onyx.db.port_attempt import port_backfill_has_pending_work
+from onyx.db.port_orphan_candidate import record_port_orphan_candidates_for_user_file
+from onyx.db.search_settings import (
+    active_secondary_port_target,
+    get_active_search_settings,
+    get_active_search_settings_list,
+    get_search_settings_by_id,
+)
+from onyx.db.user_file import (
+    add_user_file__no_commit,
+    consume_user_file_processing_attempt,
+    delete_user_file__no_commit,
+    fetch_user_file_ids_by_status,
+    fetch_user_file_ids_needing_sync,
+    fetch_user_files_with_access_relationships,
+    get_user_file_by_pk,
+    mark_user_file_reconcile_pending,
+)
+from onyx.document_index.factory import get_default_document_index
+from onyx.document_index.interfaces import (
+    DocumentIndex,
+    MetadataUpdateRequest,
+    SecondaryIndexDocumentMissingError,
+)
 from onyx.file_store.file_store import get_default_file_store
-from onyx.file_store.utils import store_user_file_plaintext
-from onyx.file_store.utils import user_file_id_to_plaintext_file_name
-from onyx.httpx.httpx_pool import HttpxPool
-from onyx.indexing.adapters.user_file_indexing_adapter import UserFileIndexingAdapter
+from onyx.file_store.staging import (
+    build_tracking_raw_file_callback,
+    delete_files_best_effort,
+)
+from onyx.file_store.utils import (
+    store_user_file_plaintext,
+    user_file_id_to_plaintext_file_name,
+)
+from onyx.indexing.adapters.user_file_indexing_adapter import (
+    UserFileDeletingSkip,
+    UserFileIndexingAdapter,
+)
 from onyx.indexing.embedder import DefaultIndexingEmbedder
 from onyx.indexing.indexing_pipeline import run_indexing_pipeline
 from onyx.redis.redis_pool import get_redis_client
@@ -148,53 +171,7 @@ def enqueue_user_file_project_sync_task(
     return True
 
 
-@retry(tries=3, delay=1, backoff=2, jitter=(0.0, 1.0))
-def _visit_chunks(
-    *,
-    http_client: httpx.Client,
-    index_name: str,
-    selection: str,
-    continuation: str | None = None,
-) -> tuple[list[dict[str, Any]], str | None]:
-    task_logger.info(
-        f"Visiting chunks for index={index_name} with selection={selection}"
-    )
-    base_url = DOCUMENT_ID_ENDPOINT.format(index_name=index_name)
-    params: dict[str, str] = {
-        "selection": selection,
-        "wantedDocumentCount": "100",  # Use smaller batch size to avoid timeouts
-    }
-    if continuation:
-        params["continuation"] = continuation
-    resp = http_client.get(base_url, params=params, timeout=None)
-    resp.raise_for_status()
-    payload = resp.json()
-    return payload.get("documents", []), payload.get("continuation")
-
-
-def _get_document_chunk_count(
-    *,
-    index_name: str,
-    selection: str,
-) -> int:
-    chunk_count = 0
-    continuation = None
-    while True:
-        docs, continuation = _visit_chunks(
-            http_client=HttpxPool.get("vespa"),
-            index_name=index_name,
-            selection=selection,
-            continuation=continuation,
-        )
-        if not docs:
-            break
-        chunk_count += len(docs)
-        if not continuation:
-            break
-    return chunk_count
-
-
-@shared_task(
+@shared_task(  # ty: ignore[invalid-argument-type]
     name=OnyxCeleryTask.CHECK_FOR_USER_FILE_PROCESSING,
     soft_time_limit=300,
     bind=True,
@@ -251,14 +228,8 @@ def check_user_file_processing(self: Task, *, tenant_id: str) -> None:
             return None
 
         with get_session_with_current_tenant() as db_session:
-            user_file_ids = (
-                db_session.execute(
-                    select(UserFile.id).where(
-                        UserFile.status == UserFileStatus.PROCESSING
-                    )
-                )
-                .scalars()
-                .all()
+            user_file_ids = fetch_user_file_ids_by_status(
+                db_session, UserFileStatus.PROCESSING
             )
 
             for user_file_id in user_file_ids:
@@ -316,15 +287,19 @@ def _process_user_file_without_vector_db(
     Opens its own short DB session only for the final status write, so the
     caller does not need to hold a session open during the text/token work.
     """
-    from onyx.llm.factory import get_default_llm
-    from onyx.llm.factory import get_llm_tokenizer_encode_func
+    from onyx.llm.factory import get_default_llm, get_llm_tokenizer_encode_func
 
     user_file_uuid = _as_uuid(user_file_id)
 
-    # Combine section text from all document sections
-    combined_text = " ".join(
-        section.text for doc in documents for section in doc.sections if section.text
-    )
+    # Combine section text from all document sections. Tabular sections are
+    # file-backed and materialize their staged CSV on demand.
+    text_parts: list[str] = []
+    for doc in documents:
+        for section in doc.sections:
+            text = section.materialize_text()
+            if text:
+                text_parts.append(text)
+    combined_text = " ".join(text_parts)
 
     # Compute token count using the user's default LLM tokenizer
     try:
@@ -345,7 +320,7 @@ def _process_user_file_without_vector_db(
 
     # Short session only for the status write
     with get_session_with_current_tenant() as db_session:
-        uf = db_session.get(UserFile, user_file_uuid)
+        uf = get_user_file_by_pk(db_session, user_file_uuid)
         if uf is None:
             return
         if uf.status != UserFileStatus.DELETING:
@@ -353,12 +328,54 @@ def _process_user_file_without_vector_db(
         uf.token_count = token_count
         uf.chunk_count = 0  # no chunks without vector DB
         uf.last_project_sync_at = datetime.datetime.now(datetime.timezone.utc)
-        db_session.add(uf)
+        add_user_file__no_commit(db_session, uf)
         db_session.commit()
 
     task_logger.info(
         f"_process_user_file_without_vector_db - Completed id={user_file_uuid} tokens={token_count}"
     )
+
+
+def _load_user_file_documents(
+    user_file_id: str,
+    file_id: str,
+    file_name: str | None,
+    tenant_id: str,
+) -> tuple[list[Document], list[str]]:
+    """Parse a user file's blob into indexable Documents (id/source stamped), plus the ids of
+    any CSVs staged for tabular sections — the caller reaps them after indexing reads them. A
+    load failure reaps its own staged files before re-raising (the caller gets no id list)."""
+    connector = LocalFileConnector(
+        file_locations=[file_id],
+        file_names=[file_name] if file_name else None,
+    )
+    connector.load_credentials({})
+    # User files keep their spreadsheet content regardless of the setting.
+    connector.skip_spreadsheet_content = False
+
+    # User files aren't attempt-scoped, so the docfetching staging reapers don't cover them.
+    staging_callback, staged_csv_ids = build_tracking_raw_file_callback(
+        metadata={"user_file_id": str(user_file_id), "tenant_id": tenant_id}
+    )
+    connector.set_raw_file_callback(staging_callback)
+
+    documents: list[Document] = []
+    try:
+        for batch in connector.load_from_state():
+            documents.extend(
+                [doc for doc in batch if not isinstance(doc, HierarchyNode)]
+            )
+    except Exception:
+        delete_files_best_effort(
+            staged_csv_ids,
+            context=f"user-file load-failure staging cleanup uf={user_file_id}",
+        )
+        raise
+
+    for document in documents:
+        document.id = str(user_file_id)
+        document.source = DocumentSource.USER_FILE
+    return documents, staged_csv_ids
 
 
 def _process_user_file_with_indexing(
@@ -371,15 +388,14 @@ def _process_user_file_with_indexing(
     Opens its own DB session for the indexing pipeline.  The caller should
     not hold an open session when calling this function.
     """
-    # 20 is the documented default for httpx max_keepalive_connections
-    if MANAGED_VESPA:
-        httpx_init_vespa_pool(
-            20, ssl_cert=VESPA_CLOUD_CERT_PATH, ssl_key=VESPA_CLOUD_KEY_PATH
-        )
-    else:
-        httpx_init_vespa_pool(20)
-
     with get_session_with_current_tenant() as db_session:
+        user_file = get_user_file_by_pk(db_session, _as_uuid(user_file_id))
+        if user_file is None or user_file.status == UserFileStatus.DELETING:
+            task_logger.info(
+                f"_process_user_file_with_indexing - user file {user_file_id} is gone or "
+                "being deleted; skipping indexing (the delete owns removal)"
+            )
+            return
         search_settings_list = get_active_search_settings_list(db_session)
         current_search_settings = next(
             (ss for ss in search_settings_list if ss.status.is_current()),
@@ -392,25 +408,30 @@ def _process_user_file_with_indexing(
         embedding_model = DefaultIndexingEmbedder.from_db_search_settings(
             search_settings=current_search_settings,
         )
-        document_indices = get_all_document_indices(
-            current_search_settings,
-            None,
-            httpx_client=HttpxPool.get("vespa"),
-        )
+        document_index = get_default_document_index(current_search_settings, None)
         adapter = UserFileIndexingAdapter(
             tenant_id=tenant_id,
             db_session=db_session,
         )
-        index_pipeline_result = run_indexing_pipeline(
-            embedder=embedding_model,
-            document_indices=document_indices,
-            ignore_time_skip=True,
-            db_session=db_session,
-            tenant_id=tenant_id,
-            document_batch=documents,
-            request_id=None,
-            adapter=adapter,
-        )
+        try:
+            index_pipeline_result = run_indexing_pipeline(
+                embedder=embedding_model,
+                document_index=document_index,
+                ignore_time_skip=True,
+                db_session=db_session,
+                tenant_id=tenant_id,
+                document_batch=documents,
+                adapter=adapter,
+                written_search_settings_id=current_search_settings.id,
+            )
+        except UserFileDeletingSkip:
+            # File began deleting mid-pipeline — the delete owns removal; skip cleanly
+            # rather than fail. (The early-out above catches the already-deleting case.)
+            task_logger.info(
+                f"_process_user_file_with_indexing - user file {user_file_id} began "
+                "deleting mid-indexing; skipping"
+            )
+            return
 
     task_logger.info(
         f"_process_user_file_with_indexing - Indexing pipeline completed ={index_pipeline_result}"
@@ -425,12 +446,161 @@ def _process_user_file_with_indexing(
             f"_process_user_file_with_indexing - Indexing pipeline failed id={user_file_id}"
         )
         with get_session_with_current_tenant() as db_session:
-            uf = db_session.get(UserFile, _as_uuid(user_file_id))
+            uf = get_user_file_by_pk(db_session, _as_uuid(user_file_id))
             if uf is not None and uf.status != UserFileStatus.DELETING:
                 uf.status = UserFileStatus.FAILED
-                db_session.add(uf)
+                add_user_file__no_commit(db_session, uf)
                 db_session.commit()
         raise RuntimeError(f"Indexing pipeline failed for user file {user_file_id}")
+
+    _dual_write_new_file_to_secondary(user_file_id, documents, tenant_id)
+
+
+def _index_user_file_to_secondary(
+    user_file_id: str,
+    documents: list[Document],
+    secondary: SearchSettings,
+    tenant_id: str,
+) -> None:
+    """Index one user file into the secondary (reindex-port target) index, re-embedding with
+    its model. `index_to_secondary=True` makes the adapter skip the terminal side-effects the
+    PRESENT pass already applied. Raises on an incomplete write; the caller owns the flag."""
+    with get_session_with_current_tenant() as db_session:
+        # Callers resolve `secondary` in a separate, already-closed session, so it arrives
+        # detached. Re-bind before from_db_search_settings reads its cloud_provider-backed
+        # properties (api_key/api_url/api_version/deployment_name), which would otherwise
+        # lazy-load and raise DetachedInstanceError.
+        bound_secondary = get_search_settings_by_id(db_session, secondary.id)
+        if bound_secondary is None:
+            raise RuntimeError(
+                f"secondary search settings gone for user file {user_file_id}"
+            )
+        # Don't resurrect a file already being deleted into the target index — the delete
+        # owns removing it, and the port orphan sweep can't remove these non-port chunks.
+        # (the adapter's DELETING skip re-checks under the row lock to close the race.)
+        user_file = get_user_file_by_pk(db_session, _as_uuid(user_file_id))
+        if user_file is None or user_file.status == UserFileStatus.DELETING:
+            task_logger.info(
+                f"_index_user_file_to_secondary - user file {user_file_id} is gone or "
+                "being deleted; skipping secondary write"
+            )
+            return
+        embedder = DefaultIndexingEmbedder.from_db_search_settings(
+            search_settings=bound_secondary,
+        )
+        document_index = get_default_document_index(bound_secondary, None)
+        adapter = UserFileIndexingAdapter(
+            tenant_id=tenant_id,
+            db_session=db_session,
+        )
+        try:
+            result = run_indexing_pipeline(
+                embedder=embedder,
+                document_index=document_index,
+                ignore_time_skip=True,
+                # skip the content_hash gate, else the PRESENT run's hash no-ops this write
+                index_to_secondary=True,
+                db_session=db_session,
+                tenant_id=tenant_id,
+                document_batch=documents,
+                adapter=adapter,
+                written_search_settings_id=bound_secondary.id,
+            )
+        except UserFileDeletingSkip:
+            # File began deleting mid-pipeline — skip cleanly so the caller doesn't flag it
+            # for reconcile; the delete owns removal from the target index.
+            task_logger.info(
+                f"_index_user_file_to_secondary - user file {user_file_id} began deleting "
+                "mid-write; skipping secondary write"
+            )
+            return
+    if (
+        result.failures
+        or result.total_docs != len(documents)
+        or result.total_chunks == 0
+    ):
+        raise RuntimeError(
+            f"secondary index write incomplete for user file {user_file_id}: {result}"
+        )
+
+
+def _dual_write_new_file_to_secondary(
+    user_file_id: str, documents: list[Document], tenant_id: str
+) -> None:
+    """During a reindex-port, also index a freshly-processed file into the secondary target so
+    it isn't missing at swap. Target resolved fresh (catches a file crossing kickoff). Isolated:
+    a failure only flags the file for the reconciler, never touching live status."""
+    with get_session_with_current_tenant() as db_session:
+        secondary = active_secondary_port_target(db_session)
+    if secondary is None:
+        return
+    try:
+        _index_user_file_to_secondary(user_file_id, documents, secondary, tenant_id)
+    except Exception as e:
+        task_logger.exception(
+            f"_dual_write_new_file_to_secondary - failed id={user_file_id}; "
+            f"flagging for reconcile - {e.__class__.__name__}"
+        )
+        with get_session_with_current_tenant() as db_session:
+            mark_user_file_reconcile_pending(db_session, _as_uuid(user_file_id))
+
+
+def _supply_user_file_to_secondary(user_file_id: str, tenant_id: str) -> bool:
+    """The reconciler's 404 fallback: (re)supply a user file's content to the secondary target
+    when a metadata update() found it missing. Returns True if the content landed (flag can
+    clear), False to keep the flag — no target (INSTANT self-heals via the port) or the write
+    failed (retried next scan)."""
+    with get_session_with_current_tenant() as db_session:
+        secondary = active_secondary_port_target(db_session)
+        user_file = get_user_file_by_pk(db_session, _as_uuid(user_file_id))
+        file_id = user_file.file_id if user_file is not None else None
+        file_name = user_file.name if user_file is not None else None
+        incognito = user_file is not None and user_file.incognito
+    # Incognito files never enter any index, so the flag clears with no write.
+    if incognito:
+        return True
+    if secondary is None or file_id is None:
+        return False
+
+    # Fully isolated: any failure keeps the flag and never propagates into the sync task.
+    # The loader self-reaps on a load failure, so staged_csv_ids stays empty there.
+    staged_csv_ids: list[str] = []
+    try:
+        documents, staged_csv_ids = _load_user_file_documents(
+            user_file_id, file_id, file_name, tenant_id
+        )
+        _index_user_file_to_secondary(user_file_id, documents, secondary, tenant_id)
+        return True
+    except Exception as e:
+        task_logger.exception(
+            f"_supply_user_file_to_secondary - failed id={user_file_id} "
+            f"- {e.__class__.__name__}"
+        )
+        return False
+    finally:
+        delete_files_best_effort(
+            staged_csv_ids,
+            context=f"user-file secondary supply staging cleanup uf={user_file_id}",
+        )
+
+
+def _sync_metadata_and_reconcile_secondary(
+    document_index: DocumentIndex,
+    update_request: MetadataUpdateRequest,
+    user_file_id: str,
+    tenant_id: str,
+) -> bool:
+    """Apply the metadata update to the index; if the secondary is still porting and lacks
+    the doc, supply its content instead. Returns whether the secondary now matches PRESENT."""
+    try:
+        document_index.update([update_request])
+    except SecondaryIndexDocumentMissingError:
+        task_logger.debug(
+            f"user_file={user_file_id} missing from a still-porting index; "
+            "supplying content."
+        )
+        return _supply_user_file_to_secondary(user_file_id, tenant_id)
+    return True
 
 
 def process_user_file_impl(
@@ -461,10 +631,10 @@ def process_user_file_impl(
 
     documents: list[Document] = []
     try:
-        # Short read session: fetch what we need from UserFile then release the
-        # connection before the slow file-I/O and indexing pipeline phases.
+        # Short session: count the pickup and read what we need, then release
+        # the connection before the slow file-I/O and indexing pipeline phases.
         with get_session_with_current_tenant() as db_session:
-            uf = db_session.get(UserFile, _as_uuid(user_file_id))
+            uf = get_user_file_by_pk(db_session, _as_uuid(user_file_id))
             if not uf:
                 task_logger.warning(
                     f"process_user_file_impl - UserFile not found id={user_file_id}"
@@ -480,50 +650,55 @@ def process_user_file_impl(
                 )
                 return
 
+            if not consume_user_file_processing_attempt(db_session, uf):
+                task_logger.error(
+                    f"process_user_file_impl - Marked FAILED id={user_file_id} "
+                    f"after {uf.processing_attempts - 1} pickups"
+                )
+                return
+
             file_id = uf.file_id
             file_name = uf.name
+            skip_search_index = uf.incognito
         # DB connection returned to pool here; file I/O and indexing run without it.
 
-        connector = LocalFileConnector(
-            file_locations=[file_id],
-            file_names=[file_name] if file_name else None,
-        )
-        connector.load_credentials({})
-
         try:
-            for batch in connector.load_from_state():
-                documents.extend(
-                    [doc for doc in batch if not isinstance(doc, HierarchyNode)]
+            documents, staged_csv_ids = _load_user_file_documents(
+                user_file_id, file_id, file_name, tenant_id
+            )
+            try:
+                # Incognito uploads get text extraction for chat use but never
+                # enter the search index.
+                if DISABLE_VECTOR_DB or skip_search_index:
+                    _process_user_file_without_vector_db(
+                        user_file_id=user_file_id,
+                        documents=documents,
+                    )
+                else:
+                    _process_user_file_with_indexing(
+                        user_file_id=user_file_id,
+                        documents=documents,
+                        tenant_id=tenant_id,
+                    )
+            finally:
+                delete_files_best_effort(
+                    staged_csv_ids,
+                    context=f"user-file tabular staging cleanup uf={user_file_id}",
                 )
-
-            for document in documents:
-                document.id = str(user_file_id)
-                document.source = DocumentSource.USER_FILE
-
-            if DISABLE_VECTOR_DB:
-                _process_user_file_without_vector_db(
-                    user_file_id=user_file_id,
-                    documents=documents,
-                )
-            else:
-                _process_user_file_with_indexing(
-                    user_file_id=user_file_id,
-                    documents=documents,
-                    tenant_id=tenant_id,
-                )
-
         except Exception as e:
             task_logger.exception(
                 f"process_user_file_impl - Error processing file id={user_file_id} - {e.__class__.__name__}"
             )
             with get_session_with_current_tenant() as db_session:
-                current_user_file = db_session.get(UserFile, _as_uuid(user_file_id))
+                current_user_file = get_user_file_by_pk(
+                    db_session, _as_uuid(user_file_id)
+                )
                 if (
                     current_user_file
                     and current_user_file.status != UserFileStatus.DELETING
                 ):
                     current_user_file.status = UserFileStatus.FAILED
-                    db_session.add(current_user_file)
+                    add_user_file__no_commit(db_session, current_user_file)
                     db_session.commit()
             return
 
@@ -533,11 +708,11 @@ def process_user_file_impl(
         )
     except Exception as e:
         with get_session_with_current_tenant() as db_session:
-            uf = db_session.get(UserFile, _as_uuid(user_file_id))
+            uf = get_user_file_by_pk(db_session, _as_uuid(user_file_id))
             if uf:
                 if uf.status != UserFileStatus.DELETING:
                     uf.status = UserFileStatus.FAILED
-                db_session.add(uf)
+                add_user_file__no_commit(db_session, uf)
                 db_session.commit()
 
         task_logger.exception(
@@ -549,7 +724,7 @@ def process_user_file_impl(
             file_lock.release()
 
 
-@shared_task(
+@shared_task(  # ty: ignore[invalid-argument-type]
     name=OnyxCeleryTask.PROCESS_SINGLE_USER_FILE,
     bind=True,
     ignore_result=True,
@@ -565,7 +740,7 @@ def process_single_user_file(
     )
 
 
-@shared_task(
+@shared_task(  # ty: ignore[invalid-argument-type]
     name=OnyxCeleryTask.CHECK_FOR_USER_FILE_DELETE,
     soft_time_limit=300,
     bind=True,
@@ -615,14 +790,19 @@ def check_for_user_file_delete(self: Task, *, tenant_id: str) -> None:
             return None
 
         with get_session_with_current_tenant() as db_session:
-            user_file_ids = (
-                db_session.execute(
-                    select(UserFile.id).where(
-                        UserFile.status == UserFileStatus.DELETING
-                    )
+            # Orphaned incognito uploads (teardown never arrived) join the
+            # DELETING pool here so the standard machinery below cleans them.
+            stale_incognito = sweep_stale_incognito_user_files(db_session)
+            # Always: the sweep also restarts the orphan clock on sessions it
+            # found live, which is lost if only a queued file triggers this.
+            db_session.commit()
+            if stale_incognito:
+                task_logger.info(
+                    f"check_for_user_file_delete - Queued {len(stale_incognito)} "
+                    f"stale incognito files for tenant={tenant_id}"
                 )
-                .scalars()
-                .all()
+            user_file_ids = fetch_user_file_ids_by_status(
+                db_session, UserFileStatus.DELETING
             )
             for user_file_id in user_file_ids:
                 # --- Protection 2: per-file queued guard ---
@@ -639,16 +819,7 @@ def check_for_user_file_delete(self: Task, *, tenant_id: str) -> None:
 
                 # --- Protection 3: task expiry ---
                 try:
-                    self.app.send_task(
-                        OnyxCeleryTask.DELETE_SINGLE_USER_FILE,
-                        kwargs={
-                            "user_file_id": str(user_file_id),
-                            "tenant_id": tenant_id,
-                        },
-                        queue=OnyxCeleryQueues.USER_FILE_DELETE,
-                        priority=OnyxCeleryPriority.HIGH,
-                        expires=CELERY_USER_FILE_DELETE_TASK_EXPIRES,
-                    )
+                    send_user_file_delete_task(self.app, user_file_id, tenant_id)
                 except Exception:
                     redis_client.delete(queued_key)
                     raise
@@ -690,24 +861,13 @@ def delete_user_file_impl(
             return
 
     try:
-        skip_vespa = DISABLE_VECTOR_DB
-        retry_document_indices: list[RetryDocumentIndex] = []
+        document_index: DocumentIndex | None = None
         chunk_count_from_db: int | None = None
-        index_name: str = ""
-        selection: str = ""
         file_id: str = ""
-
-        if not skip_vespa:
-            if MANAGED_VESPA:
-                httpx_init_vespa_pool(
-                    20, ssl_cert=VESPA_CLOUD_CERT_PATH, ssl_key=VESPA_CLOUD_KEY_PATH
-                )
-            else:
-                httpx_init_vespa_pool(20)
 
         # Phase 1: short read session — extract everything needed for slow I/O
         with get_session_with_current_tenant() as db_session:
-            user_file = db_session.get(UserFile, _as_uuid(user_file_id))
+            user_file = get_user_file_by_pk(db_session, _as_uuid(user_file_id))
             if not user_file:
                 task_logger.info(
                     f"delete_user_file_impl - User file not found id={user_file_id}"
@@ -717,52 +877,66 @@ def delete_user_file_impl(
             file_id = user_file.file_id
             chunk_count_from_db = user_file.chunk_count
 
-            if not skip_vespa:
+            if not DISABLE_VECTOR_DB:
                 active_search_settings = get_active_search_settings(db_session)
-                document_indices = get_all_document_indices(
+                document_index = get_default_document_index(
                     search_settings=active_search_settings.primary,
                     secondary_search_settings=active_search_settings.secondary,
-                    httpx_client=HttpxPool.get("vespa"),
                 )
-                retry_document_indices = [
-                    RetryDocumentIndex(document_index)
-                    for document_index in document_indices
-                ]
-                index_name = active_search_settings.primary.index_name
-                selection = f"{index_name}.document_id=='{user_file_id}'"
 
-        # Phase 2: Vespa deletes + file store deletes (no DB session held)
-        if not skip_vespa:
-            chunk_count: int = (
+                # Record the deletion before the index delete (below) so a racing port's
+                # sweep removes any chunk its create-only copy resurrects. No-op when no
+                # port targets this file.
+                if user_file.user_id is not None:
+                    recorded = record_port_orphan_candidates_for_user_file(
+                        db_session,
+                        port_user_id=user_file.user_id,
+                        document_id=str(user_file.id),
+                        primary=active_search_settings.primary,
+                        secondary=active_search_settings.secondary,
+                    )
+                    if recorded:
+                        db_session.commit()
+
+        # Phase 2: vector DB deletes + file store deletes (no DB session held).
+        # Pass the DB chunk count when known; otherwise None, which the document
+        # index resolves itself.
+        if document_index is not None:
+            chunk_count: int | None = (
                 chunk_count_from_db
                 if chunk_count_from_db is not None and chunk_count_from_db > 0
-                else _get_document_chunk_count(
-                    index_name=index_name,
-                    selection=selection,
-                )
+                else None
             )
-            for retry_document_index in retry_document_indices:
-                retry_document_index.delete(
-                    user_file_id,
-                    chunk_count=chunk_count,
-                )
+            document_index.delete(
+                user_file_id,
+                chunk_count=chunk_count,
+            )
 
         file_store = get_default_file_store()
+        blob_deleted = True
         try:
-            file_store.delete_file(file_id)
+            file_store.delete_file(file_id, error_on_missing=False)
             file_store.delete_file(
-                user_file_id_to_plaintext_file_name(_as_uuid(user_file_id))
+                user_file_id_to_plaintext_file_name(_as_uuid(user_file_id)),
+                error_on_missing=False,
             )
         except Exception as e:
+            blob_deleted = False
             task_logger.exception(
                 f"delete_user_file_impl - Error deleting file id={user_file_id} - {e.__class__.__name__}"
             )
 
-        # Phase 3: short write session — remove the DB record
+        # Phase 3: short write session, removing the DB record. The row is the
+        # only handle a retry has on the blob, so a refused delete keeps it.
+        if not blob_deleted:
+            task_logger.warning(
+                f"delete_user_file_impl - Keeping row id={user_file_id} for retry"
+            )
+            return
         with get_session_with_current_tenant() as db_session:
-            user_file = db_session.get(UserFile, _as_uuid(user_file_id))
+            user_file = get_user_file_by_pk(db_session, _as_uuid(user_file_id))
             if user_file is not None:
-                db_session.delete(user_file)
+                delete_user_file__no_commit(db_session, user_file)
                 db_session.commit()
         task_logger.info(f"delete_user_file_impl - Completed id={user_file_id}")
     except Exception as e:
@@ -775,7 +949,7 @@ def delete_user_file_impl(
             file_lock.release()
 
 
-@shared_task(
+@shared_task(  # ty: ignore[invalid-argument-type]
     name=OnyxCeleryTask.DELETE_SINGLE_USER_FILE,
     bind=True,
     ignore_result=True,
@@ -791,7 +965,7 @@ def process_single_user_file_delete(
     )
 
 
-@shared_task(
+@shared_task(  # ty: ignore[invalid-argument-type]
     name=OnyxCeleryTask.CHECK_FOR_USER_FILE_PROJECT_SYNC,
     soft_time_limit=300,
     bind=True,
@@ -822,21 +996,7 @@ def check_for_user_file_project_sync(self: Task, *, tenant_id: str) -> None:
             return None
 
         with get_session_with_current_tenant() as db_session:
-            user_file_ids = (
-                db_session.execute(
-                    select(UserFile.id).where(
-                        sa.and_(
-                            sa.or_(
-                                UserFile.needs_project_sync.is_(True),
-                                UserFile.needs_persona_sync.is_(True),
-                            ),
-                            UserFile.status == UserFileStatus.COMPLETED,
-                        )
-                    )
-                )
-                .scalars()
-                .all()
-            )
+            user_file_ids = fetch_user_file_ids_needing_sync(db_session)
 
             for user_file_id in user_file_ids:
                 if not enqueue_user_file_project_sync_task(
@@ -885,23 +1045,14 @@ def project_sync_user_file_impl(
             return
 
     try:
-        # Phase 1: short read session — extract all data needed for Vespa, then
-        # release the connection before the network-bound update calls.
-        retry_document_indices: list[RetryDocumentIndex] = []
+        # Phase 1: short read session — extract all data needed for the document
+        # index, then release the connection before the network-bound update calls.
+        document_index: DocumentIndex | None = None
         project_ids: list[int] = []
         persona_ids: list[int] = []
         file_id_str: str = ""
         chunk_count: int | None = None
         access: DocumentAccess | None = None
-        skip_vespa = DISABLE_VECTOR_DB
-
-        if not skip_vespa:
-            if MANAGED_VESPA:
-                httpx_init_vespa_pool(
-                    20, ssl_cert=VESPA_CLOUD_CERT_PATH, ssl_key=VESPA_CLOUD_KEY_PATH
-                )
-            else:
-                httpx_init_vespa_pool(20)
 
         with get_session_with_current_tenant() as db_session:
             user_files = fetch_user_files_with_access_relationships(
@@ -916,17 +1067,21 @@ def project_sync_user_file_impl(
                 )
                 return
 
-            if not skip_vespa:
+            if not DISABLE_VECTOR_DB:
                 active_search_settings = get_active_search_settings(db_session)
-                document_indices = get_all_document_indices(
+                # INSTANT-promoted primary still backfilling: defer updates to
+                # not-yet-ported files, else the create-only port reinstalls a stale ACL.
+                primary_backfill_in_progress = (
+                    active_search_settings.primary.port_backfill_source_id is not None
+                    and port_backfill_has_pending_work(
+                        db_session, active_search_settings.primary.id
+                    )
+                )
+                document_index = get_default_document_index(
                     search_settings=active_search_settings.primary,
                     secondary_search_settings=active_search_settings.secondary,
-                    httpx_client=HttpxPool.get("vespa"),
+                    primary_backfill_in_progress=primary_backfill_in_progress,
                 )
-                retry_document_indices = [
-                    RetryDocumentIndex(document_index)
-                    for document_index in document_indices
-                ]
 
                 project_ids = [project.id for project in user_file.projects]
                 persona_ids = [p.id for p in user_file.assistants if not p.deleted]
@@ -934,10 +1089,11 @@ def project_sync_user_file_impl(
                 chunk_count = user_file.chunk_count
                 access_map = build_access_for_user_files([user_file])
                 access = access_map.get(file_id_str)
-        # DB connection returned to pool here; Vespa HTTP calls run without it.
+        # DB connection returned to pool here; index update calls run without it.
 
-        # Phase 2: Vespa HTTP calls (no DB session held)
-        if not skip_vespa:
+        # Phase 2: index update calls (no DB session held)
+        secondary_consistent = True
+        if document_index is not None:
             update_request = MetadataUpdateRequest(
                 document_ids=[file_id_str],
                 doc_id_to_chunk_cnt={
@@ -947,21 +1103,28 @@ def project_sync_user_file_impl(
                 project_ids=set(project_ids),
                 persona_ids=set(persona_ids),
             )
-            for retry_document_index in retry_document_indices:
-                retry_document_index.update([update_request])
+            secondary_consistent = _sync_metadata_and_reconcile_secondary(
+                document_index, update_request, user_file_id, tenant_id
+            )
 
         task_logger.info(f"project_sync_user_file_impl - User file id={user_file_id}")
 
         # Phase 3: short write session — mark sync as done
         with get_session_with_current_tenant() as db_session:
-            user_file = db_session.get(UserFile, _as_uuid(user_file_id))
+            user_file = get_user_file_by_pk(db_session, _as_uuid(user_file_id))
             if user_file is not None:
                 user_file.needs_project_sync = False
                 user_file.needs_persona_sync = False
                 user_file.last_project_sync_at = datetime.datetime.now(
                     datetime.timezone.utc
                 )
-                db_session.add(user_file)
+                # Flag only a portable (COMPLETED) file — a non-portable one is never ported,
+                # so its flag would never reconcile (leave it clear instead).
+                user_file.secondary_reconcile_pending = (
+                    not secondary_consistent
+                    and user_file.status == UserFileStatus.COMPLETED
+                )
+                add_user_file__no_commit(db_session, user_file)
                 db_session.commit()
 
     except Exception as e:
@@ -974,7 +1137,7 @@ def project_sync_user_file_impl(
             file_lock.release()
 
 
-@shared_task(
+@shared_task(  # ty: ignore[invalid-argument-type]
     name=OnyxCeleryTask.PROCESS_SINGLE_USER_FILE_PROJECT_SYNC,
     bind=True,
     ignore_result=True,
@@ -988,3 +1151,31 @@ def process_single_user_file_project_sync(
     project_sync_user_file_impl(
         user_file_id=user_file_id, tenant_id=tenant_id, redis_locking=True
     )
+
+
+@shared_task(  # ty: ignore[invalid-argument-type]
+    name=OnyxCeleryTask.CHECK_FOR_INCOGNITO_FILE_CLEANUP,
+    soft_time_limit=300,
+    bind=True,
+    ignore_result=True,
+)
+def check_for_incognito_file_cleanup(self: Task, *, tenant_id: str) -> None:  # noqa: ARG001
+    """Retry pending context teardown and deletion of tool-generated blobs.
+
+    A blob's own record carries the session that produced it, and deleting the
+    blob deletes the record, so anything still stamped is what a store failure
+    left behind."""
+    redis_client = get_redis_client(tenant_id=tenant_id)
+    lock: RedisLock = redis_client.lock(
+        OnyxRedisLocks.INCOGNITO_FILE_CLEANUP_BEAT_LOCK,
+        timeout=CELERY_GENERIC_BEAT_LOCK_TIMEOUT,
+    )
+    if not lock.acquire(blocking=False):
+        return
+    try:
+        retry_incognito_teardowns()
+        with get_session_with_current_tenant() as db_session:
+            sweep_incognito_generated_files(db_session)
+    finally:
+        if lock.owned():
+            lock.release()

@@ -18,7 +18,7 @@ test.describe("Appearance Theme Settings @exclusive", () => {
   test.beforeEach(async ({ page, eeEnabled }) => {
     test.skip(
       !eeEnabled,
-      "Enterprise license not active — skipping theme tests"
+      "Enterprise license not active. Skipping theme tests"
     );
 
     // Fresh session — the eeEnabled fixture already logged in to check the
@@ -89,30 +89,21 @@ test.describe("Appearance Theme Settings @exclusive", () => {
       await helpLinkLabelInput.clear();
     }
 
-    // Disable hide-onyx-branding toggle if enabled
-    const hideBrandingToggle = page.locator(
-      '[data-label="hide-onyx-branding-toggle"]'
-    );
-    if (
-      await hideBrandingToggle.isVisible({ timeout: 1000 }).catch(() => false)
-    ) {
-      const hideBrandingState =
-        await hideBrandingToggle.getAttribute("aria-checked");
-      if (hideBrandingState === "true") {
-        await hideBrandingToggle.click();
-        await page.waitForTimeout(300);
-      }
-    }
-
-    // Save reset
+    // Save reset. Arm the PUT waiter *before* clicking — a post-click
+    // waitForResponse can miss a fast response and then hang until the test
+    // timeout (the whole point of saveAndWaitForPut in AppearanceThemePage).
+    // This is best-effort cleanup, so bound it and swallow a missed/absent PUT
+    // rather than letting afterEach blow the 100s test budget.
     const saveButton = page.getByRole("button", { name: "Apply Changes" });
     if (await saveButton.isEnabled()) {
-      await saveButton.click();
-      await page.waitForResponse(
+      const putPromise = page.waitForResponse(
         (r) =>
           r.url().includes("/api/admin/enterprise-settings") &&
-          r.request().method() === "PUT"
+          r.request().method() === "PUT",
+        { timeout: 10_000 }
       );
+      await saveButton.click();
+      await putPromise.catch(() => {});
     }
 
     // Clear localStorage
@@ -307,32 +298,25 @@ test.describe("Appearance Theme Settings @exclusive", () => {
     await themePage.clearCustomHelpLinkLabel();
   });
 
-  test("Hide Onyx Branding toggle removes the 'Powered by Onyx' tagline", async ({
+  test("custom application name keeps the 'Powered by Onyx' tagline", async ({
     page,
   }) => {
+    const settings = await (await page.request.get("/api/settings")).json();
+    test.skip(
+      settings.hide_onyx_branding === true,
+      "HIDE_ONYX_BRANDING hides the tagline on this deployment"
+    );
+
     const themePage = new AppearanceThemePage(page);
 
-    // The sidebar's "Powered by Onyx" tagline only renders alongside an
-    // application name (the Logo's logo_and_name fall-through path), so
-    // first set a name and save a baseline that we can then assert against.
+    // With the default display style, the tagline renders only when an
+    // application name is set.
     await themePage.setApplicationName(TEST_VALUES.applicationName);
-    const baselineResponse = await themePage.saveAndWaitForPut();
-    expect(baselineResponse.status()).toBe(200);
-    await themePage.expectSaveSuccessToast();
-    await themePage.reloadAndWaitForForm();
-
-    // Sanity: tagline now visible alongside the application name
-    await themePage.expectPoweredByOnyxVisible();
-
-    await themePage.toggleHideBranding();
-
     const response = await themePage.saveAndWaitForPut();
     expect(response.status()).toBe(200);
     await themePage.expectSaveSuccessToast();
-
-    // Reload to read the persisted setting fresh — the sidebar then re-
-    // renders the Logo without the tagline.
     await themePage.reloadAndWaitForForm();
-    await themePage.expectPoweredByOnyxAbsent();
+
+    await themePage.expectPoweredByOnyxVisible();
   });
 });

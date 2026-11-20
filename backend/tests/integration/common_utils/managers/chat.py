@@ -1,30 +1,33 @@
 import json
-from typing import Any
-from typing import cast
-from typing import Literal
-from typing import TypedDict
+from typing import Any, Literal, TypedDict, cast
 from uuid import UUID
 
 import httpx
+from pydantic import TypeAdapter
 
-from onyx.context.search.models import SavedSearchDoc
-from onyx.context.search.models import SearchDoc
+from onyx.chat.mention_models import Mention, RecordedMention
+from onyx.context.search.models import SavedSearchDoc, SearchDoc
 from onyx.file_store.models import FileDescriptor
 from onyx.llm.override_models import LLMOverride
-from onyx.server.query_and_chat.models import AUTO_PLACE_AFTER_LATEST_MESSAGE
-from onyx.server.query_and_chat.models import ChatSessionCreationRequest
-from onyx.server.query_and_chat.models import SendMessageRequest
+from onyx.server.query_and_chat.models import (
+    AUTO_PLACE_AFTER_LATEST_MESSAGE,
+    ChatSessionCreationRequest,
+    SendMessageRequest,
+)
 from onyx.server.query_and_chat.streaming_models import StreamingType
+from onyx.tools.models import ToolOptions
 from tests.integration.common_utils.constants import API_SERVER_URL
 from tests.integration.common_utils.http_client import client
-from tests.integration.common_utils.test_models import DATestChatMessage
-from tests.integration.common_utils.test_models import DATestChatSession
-from tests.integration.common_utils.test_models import DATestUser
-from tests.integration.common_utils.test_models import ErrorResponse
-from tests.integration.common_utils.test_models import StreamedResponse
-from tests.integration.common_utils.test_models import ToolCallDebug
-from tests.integration.common_utils.test_models import ToolName
-from tests.integration.common_utils.test_models import ToolResult
+from tests.integration.common_utils.test_models import (
+    DATestChatMessage,
+    DATestChatSession,
+    DATestUser,
+    ErrorResponse,
+    StreamedResponse,
+    ToolCallDebug,
+    ToolName,
+    ToolResult,
+)
 
 
 class StreamPacketObj(TypedDict, total=False):
@@ -40,6 +43,7 @@ class StreamPacketObj(TypedDict, total=False):
         "image_generation_heartbeat",
         "image_generation_final",
         "tool_call_debug",
+        "error",
     ]
     content: str
     final_documents: list[dict[str, Any]]
@@ -50,6 +54,10 @@ class StreamPacketObj(TypedDict, total=False):
     tool_call_id: str
     tool_name: str
     tool_args: dict[str, Any]
+    error: str
+    stack_trace: str
+    error_code: str | None
+    details: dict[str, Any] | None
 
 
 class PlacementData(TypedDict, total=False):
@@ -64,8 +72,11 @@ class StreamPacketData(TypedDict, total=False):
     """Structure for streaming response packets."""
 
     reserved_assistant_message_id: int
+    mentions: list[dict[str, str]]
     error: str
     stack_trace: str
+    error_code: str | None
+    details: dict[str, Any] | None
     obj: StreamPacketObj
     placement: PlacementData
 
@@ -101,12 +112,12 @@ class ChatSessionManager:
         user_performing_action: DATestUser,
         parent_message_id: int | None = None,
         file_descriptors: list[FileDescriptor] | None = None,
-        allowed_tool_ids: list[int] | None = None,
-        forced_tool_ids: list[int] | None = None,
+        tool_options: ToolOptions | None = None,
         chat_session: DATestChatSession | None = None,
-        mock_llm_response: str | None = None,
         deep_research: bool = False,
+        accepts_follow_ups: bool = False,
         llm_override: LLMOverride | None = None,
+        mentions: list[Mention] | None = None,
     ) -> StreamedResponse:
         chat_message_req = SendMessageRequest(
             message=message,
@@ -117,11 +128,11 @@ class ChatSessionManager:
                 else AUTO_PLACE_AFTER_LATEST_MESSAGE
             ),
             file_descriptors=file_descriptors or [],
-            allowed_tool_ids=allowed_tool_ids,
-            forced_tool_id=forced_tool_ids[0] if forced_tool_ids else None,
-            mock_llm_response=mock_llm_response,
+            tool_options=tool_options,
             deep_research=deep_research,
+            accepts_follow_ups=accepts_follow_ups,
             llm_override=llm_override,
+            mentions=mentions or [],
         )
 
         with client.stream(
@@ -161,9 +172,7 @@ class ChatSessionManager:
         disconnect_after_packets: int = 0,
         parent_message_id: int | None = None,
         file_descriptors: list[FileDescriptor] | None = None,
-        allowed_tool_ids: list[int] | None = None,
-        forced_tool_ids: list[int] | None = None,
-        mock_llm_response: str | None = None,
+        tool_options: ToolOptions | None = None,
         deep_research: bool = False,
         llm_override: LLMOverride | None = None,
     ) -> None:
@@ -191,9 +200,7 @@ class ChatSessionManager:
                 else AUTO_PLACE_AFTER_LATEST_MESSAGE
             ),
             file_descriptors=file_descriptors or [],
-            allowed_tool_ids=allowed_tool_ids,
-            forced_tool_id=forced_tool_ids[0] if forced_tool_ids else None,
-            mock_llm_response=mock_llm_response,
+            tool_options=tool_options,
             deep_research=deep_research,
             llm_override=llm_override,
         )
@@ -229,17 +236,23 @@ class ChatSessionManager:
         heartbeat_packets: list[StreamPacketData] = []
         full_message = ""
         assistant_message_id: int | None = None
+        mentions: list[RecordedMention] = []
         error = None
         ind: int
         for data in response_data:
             if reserved_id := data.get("reserved_assistant_message_id"):
                 assistant_message_id = reserved_id
+                mentions = TypeAdapter(list[RecordedMention]).validate_python(
+                    data["mentions"]
+                )
             elif data.get("error"):
                 error = ErrorResponse(
                     error=str(data["error"]),
                     stack_trace=str(data.get("stack_trace") or ""),
+                    error_code=data.get("error_code"),
+                    details=data.get("details") or {},
                 )
-            elif (error_obj := cast(dict[str, Any], data.get("obj") or {})) and (
+            elif (error_obj := data.get("obj")) and (
                 error_obj.get("error")
                 or error_obj.get("type") == StreamingType.ERROR.value
             ):
@@ -248,6 +261,8 @@ class ChatSessionManager:
                     stack_trace=str(
                         error_obj.get("stack_trace") or data.get("stack_trace") or ""
                     ),
+                    error_code=error_obj.get("error_code"),
+                    details=error_obj.get("details") or {},
                 )
             elif (
                 (data_obj := data.get("obj"))
@@ -264,9 +279,7 @@ class ChatSessionManager:
                 )
                 is not None
             ):
-                packet_type_str = str(
-                    packet_type  # ty: ignore[possibly-unresolved-reference]
-                )
+                packet_type_str = str(packet_type)
                 if packet_type_str == StreamingType.MESSAGE_START.value:
                     final_docs = data_obj.get("final_documents")
                     if isinstance(final_docs, list):
@@ -280,18 +293,14 @@ class ChatSessionManager:
                         if data_obj.get("is_internet_search", False)
                         else ToolName.INTERNAL_SEARCH
                     )
-                    ind_to_tool_use[ind] = (  # type: ignore
-                        ToolResult(
-                            tool_name=tool_name,
-                        )
+                    ind_to_tool_use[ind] = ToolResult(
+                        tool_name=tool_name,
                     )
                 elif packet_type_str == StreamingType.IMAGE_GENERATION_START.value:
-                    ind_to_tool_use[ind] = (  # type: ignore
-                        ToolResult(
-                            tool_name=ToolName.IMAGE_GENERATION,
-                        )
+                    ind_to_tool_use[ind] = ToolResult(
+                        tool_name=ToolName.IMAGE_GENERATION,
                     )
-                elif packet_type_str == StreamingType.IMAGE_GENERATION_HEARTBEAT.value:
+                elif packet_type_str == StreamingType.CHAT_HEARTBEAT.value:
                     # Track heartbeat packets for debugging/testing
                     heartbeat_packets.append(data)
                 elif packet_type_str == StreamingType.IMAGE_GENERATION_FINAL.value:
@@ -300,13 +309,11 @@ class ChatSessionManager:
                     )
 
                     images = data_obj.get("images", [])
-                    ind_to_tool_use[
-                        ind  # ty: ignore[possibly-unresolved-reference]
-                    ].images.extend([GeneratedImage(**img) for img in images])
+                    ind_to_tool_use[ind].images.extend(
+                        [GeneratedImage(**img) for img in images]
+                    )
                 elif packet_type_str == StreamingType.SEARCH_TOOL_QUERIES_DELTA.value:
-                    ind_to_tool_use[
-                        ind  # ty: ignore[possibly-unresolved-reference]
-                    ].queries.extend(data_obj.get("queries", []))
+                    ind_to_tool_use[ind].queries.extend(data_obj.get("queries", []))
                 elif packet_type_str == StreamingType.SEARCH_TOOL_DOCUMENTS_DELTA.value:
                     docs = []
                     for doc in data_obj.get("documents", []):
@@ -319,9 +326,7 @@ class ChatSessionManager:
                             docs.append(
                                 SavedSearchDoc.from_search_doc(search_doc, db_doc_id=0)
                             )
-                    ind_to_tool_use[
-                        ind  # ty: ignore[possibly-unresolved-reference]
-                    ].documents.extend(docs)
+                    ind_to_tool_use[ind].documents.extend(docs)
                 elif packet_type_str == StreamingType.TOOL_CALL_DEBUG.value:
                     tool_call_debug.append(
                         ToolCallDebug(
@@ -338,12 +343,15 @@ class ChatSessionManager:
         return StreamedResponse(
             full_message=full_message,
             assistant_message_id=assistant_message_id or -1,  # Use -1 for error cases
+            mentions=mentions,
             top_documents=top_documents,
             used_tools=list(ind_to_tool_use.values()),
             tool_call_debug=tool_call_debug,
-            heartbeat_packets=[
-                dict(packet)  # ty: ignore[no-matching-overload]
-                for packet in heartbeat_packets
+            heartbeat_packets=[dict(packet) for packet in heartbeat_packets],
+            packets=[
+                {"placement": dict(data["placement"]), "obj": dict(data["obj"])}
+                for data in response_data
+                if "obj" in data and "placement" in data
             ],
             error=error,
         )
@@ -367,6 +375,8 @@ class ChatSessionManager:
                 message=msg["message"],
                 message_type=msg.get("message_type"),
                 files=msg.get("files"),
+                mentions=msg.get("mentions", []),
+                reasoning_tokens=msg.get("reasoning_tokens"),
             )
             for msg in response.json()["messages"]
         ]

@@ -1,16 +1,22 @@
 # These are helper objects for tracking the keys we need to write in redis
+import base64
 import json
 import threading
-from typing import Any
-from typing import cast
+from typing import Any, cast
 
 from celery import Celery
 from redis import Redis
 
 from onyx.background.celery.configs.base import CELERY_SEPARATOR
-from onyx.configs.app_configs import REDIS_HEALTH_CHECK_INTERVAL
-from onyx.configs.constants import OnyxCeleryPriority
-from onyx.configs.constants import REDIS_SOCKET_KEEPALIVE_OPTIONS
+from onyx.configs.app_configs import (
+    REDIS_DB_NUMBER_CELERY,
+    REDIS_HEALTH_CHECK_INTERVAL,
+    REDIS_POOL_MAX_CONNECTIONS,
+    REDIS_SENTINEL_HOSTS,
+    REDIS_SOCKET_TIMEOUT_KWARGS,
+)
+from onyx.configs.constants import REDIS_SOCKET_KEEPALIVE_OPTIONS, OnyxCeleryPriority
+from onyx.redis.redis_pool import RedisPool
 
 _broker_client: Redis | None = None
 _broker_url: str | None = None
@@ -51,6 +57,18 @@ def celery_get_broker_client(app: Celery) -> Redis:
             _broker_client = None
 
         _broker_url = url
+        # redis-py can't parse kombu's `sentinel://` URLs, so resolve the master
+        # through the same Sentinel config the app Redis pool uses.
+        if REDIS_SENTINEL_HOSTS and url.startswith("sentinel://"):
+            _broker_client = Redis(
+                connection_pool=RedisPool.create_pool(
+                    db=REDIS_DB_NUMBER_CELERY,
+                    max_connections=REDIS_POOL_MAX_CONNECTIONS,
+                    replica=False,
+                )
+            )
+            return _broker_client
+
         _broker_client = Redis.from_url(
             url,
             decode_responses=False,
@@ -58,6 +76,7 @@ def celery_get_broker_client(app: Celery) -> Redis:
             socket_keepalive=True,
             socket_keepalive_options=REDIS_SOCKET_KEEPALIVE_OPTIONS,
             retry_on_timeout=True,
+            **REDIS_SOCKET_TIMEOUT_KWARGS,
         )
         return _broker_client
 
@@ -173,6 +192,55 @@ def celery_get_queued_task_ids(queue: str, r: Redis) -> set[str]:
     return task_set
 
 
+def _message_kwargs(message: dict[str, Any]) -> dict[str, Any] | None:
+    """The kwargs of a task message as kombu stores it in Redis: the body is
+    the JSON of (args, kwargs, embed), base64 encoded. None when the body
+    cannot be read."""
+    body = message.get("body")
+    if not isinstance(body, str):
+        return None
+    try:
+        if message.get("properties", {}).get("body_encoding") == "base64":
+            body = base64.b64decode(body).decode("utf-8")
+        decoded = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if isinstance(decoded, list) and len(decoded) >= 2 and isinstance(decoded[1], dict):
+        return decoded[1]
+    return None
+
+
+def celery_get_task_kwargs(queue: str, r: Redis) -> list[dict[str, Any]]:
+    """The kwargs of each task that waits in the queue or that a worker holds
+    unacked from it. Priority aware. A message whose body cannot be read is
+    skipped.
+
+    This is a linear search over the queue and the unacked hash, so be careful
+    using it when they can be large."""
+    messages: list[dict[str, Any]] = []
+    for priority in range(len(OnyxCeleryPriority)):
+        queue_name = f"{queue}{CELERY_SEPARATOR}{priority}" if priority > 0 else queue
+        messages.extend(
+            json.loads(task.decode("utf-8"))
+            for task in cast(list[bytes], r.lrange(queue_name, 0, -1))
+        )
+
+    queue_marker = f'"{queue}"'.encode("utf-8")
+    for _, v in r.hscan_iter("unacked"):
+        v_bytes = cast(bytes, v)
+        if queue_marker not in v_bytes:
+            continue
+        entry = json.loads(v_bytes)
+        if entry[2] == queue:
+            messages.append(entry[0])
+
+    return [
+        kwargs
+        for message in messages
+        if (kwargs := _message_kwargs(message)) is not None
+    ]
+
+
 def celery_inspect_get_workers(name_filter: str | None, app: Celery) -> list[str]:
     """Returns a list of current workers containing name_filter, or all workers if
     name_filter is None.
@@ -214,11 +282,9 @@ def celery_inspect_get_reserved(worker_names: list[str], app: Celery) -> set[str
     inspect = app.control.inspect(destination=worker_names)
 
     # get the list of reserved tasks
-    reserved_tasks: dict[str, list] | None = (  # ty: ignore[invalid-assignment]
-        inspect.reserved()
-    )
+    reserved_tasks: dict[str, list] | None = inspect.reserved()
     if reserved_tasks:
-        for _, task_list in reserved_tasks.items():
+        for task_list in reserved_tasks.values():
             for task in task_list:
                 reserved_task_ids.add(task["id"])
 
@@ -237,11 +303,9 @@ def celery_inspect_get_active(worker_names: list[str], app: Celery) -> set[str]:
     inspect = app.control.inspect(destination=worker_names)
 
     # get the list of reserved tasks
-    active_tasks: dict[str, list] | None = (  # ty: ignore[invalid-assignment]
-        inspect.active()
-    )
+    active_tasks: dict[str, list] | None = inspect.active()
     if active_tasks:
-        for _, task_list in active_tasks.items():
+        for task_list in active_tasks.values():
             for task in task_list:
                 active_task_ids.add(task["id"])
 

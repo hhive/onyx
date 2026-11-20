@@ -1,15 +1,15 @@
 from typing import Any
-from unittest.mock import MagicMock
-from unittest.mock import patch
-from uuid import UUID
-from uuid import uuid4
+from unittest.mock import MagicMock, patch
+from uuid import UUID, uuid4
 
-from onyx.db.models import DocumentSet
-from onyx.db.models import DocumentSet__User
-from onyx.db.models import Persona
-from onyx.db.models import Persona__User
-from onyx.db.models import SamlAccount
-from onyx.db.models import User__UserGroup
+from onyx.db.models import (
+    DocumentSet,
+    DocumentSet__User,
+    Persona,
+    Persona__User,
+    SamlAccount,
+    User__UserGroup,
+)
 from onyx.db.users import delete_user_from_db
 
 
@@ -40,6 +40,7 @@ def test_delete_user_nulls_out_document_set_ownership(
 ) -> None:
     user = _mock_user()
     db_session = MagicMock()
+    db_session.scalars.return_value.all.return_value = []
 
     query_chains: dict[type, MagicMock] = {}
 
@@ -59,12 +60,12 @@ def test_delete_user_nulls_out_document_set_ownership(
         {DocumentSet.user_id: None}
     )
 
-    # Verify Persona.user_id is nulled out (update, not delete)
+    # Owned personas are orphaned the same way, never soft-deleted
     persona_chain = query_chains[Persona]
-    persona_chain.filter.assert_called()
     persona_chain.filter.return_value.update.assert_called_once_with(
-        {Persona.user_id: None}
+        {Persona.user_id: None}, synchronize_session="fetch"
     )
+    persona_chain.filter.return_value.delete.assert_not_called()
 
 
 @patch("onyx.db.users.remove_user_from_invited_users")
@@ -77,6 +78,7 @@ def test_delete_user_cleans_up_join_tables(
 ) -> None:
     user = _mock_user()
     db_session = MagicMock()
+    db_session.scalars.return_value.all.return_value = []
 
     query_chains: dict[type, MagicMock] = {}
 
@@ -105,6 +107,7 @@ def test_delete_user_commits_and_removes_invited(
 ) -> None:
     user = _mock_user(email="deleted@example.com")
     db_session = MagicMock()
+    db_session.scalars.return_value.all.return_value = []
     db_session.query.return_value = _make_query_chain()
 
     delete_user_from_db(user, db_session)
@@ -127,6 +130,7 @@ def test_delete_user_deletes_oauth_accounts(
     oauth2 = MagicMock()
     user.oauth_accounts = [oauth1, oauth2]
     db_session = MagicMock()
+    db_session.scalars.return_value.all.return_value = []
     db_session.query.return_value = _make_query_chain()
 
     delete_user_from_db(user, db_session)

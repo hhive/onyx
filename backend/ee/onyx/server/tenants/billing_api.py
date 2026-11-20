@@ -12,50 +12,47 @@ Current endpoints to migrate:
 - POST /tenants/create-subscription-session    -> POST /admin/billing/checkout-session
 - GET  /tenants/stripe-publishable-key  -> (keep as-is, shared endpoint)
 
-Note: /tenants/product-gating/* endpoints are control-plane-to-data-plane calls
-and are NOT part of this migration - they stay here.
+The routes the control plane calls (product gating, tier update) live in
+control_plane_api.py. The playground mounts those and not this file.
 """
 
 import asyncio
 
 import httpx
-from fastapi import APIRouter
-from fastapi import Depends
+from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
 from ee.onyx.server.billing.api import update_seats as _admin_update_seats
-from ee.onyx.server.billing.models import SeatUpdateRequest
-from ee.onyx.server.billing.models import SeatUpdateResponse
-from ee.onyx.server.tenants.access import control_plane_dep
-from ee.onyx.server.tenants.billing import fetch_billing_information
-from ee.onyx.server.tenants.billing import fetch_customer_portal_session
-from ee.onyx.server.tenants.billing import fetch_stripe_checkout_session
-from ee.onyx.server.tenants.models import BillingInformation
-from ee.onyx.server.tenants.models import CreateCheckoutSessionRequest
-from ee.onyx.server.tenants.models import CreateSubscriptionSessionRequest
-from ee.onyx.server.tenants.models import ProductGatingFullSyncRequest
-from ee.onyx.server.tenants.models import ProductGatingRequest
-from ee.onyx.server.tenants.models import ProductGatingResponse
-from ee.onyx.server.tenants.models import StripePublishableKeyResponse
-from ee.onyx.server.tenants.models import SubscriptionSessionResponse
-from ee.onyx.server.tenants.models import SubscriptionStatusResponse
-from ee.onyx.server.tenants.models import TierUpdateRequest
-from ee.onyx.server.tenants.models import TierUpdateResponse
-from ee.onyx.server.tenants.product_gating import overwrite_full_gated_set
-from ee.onyx.server.tenants.product_gating import store_product_gating
-from ee.onyx.server.tenants.tier_management import update_tenant_tier
+from ee.onyx.server.billing.models import SeatUpdateRequest, SeatUpdateResponse
+from ee.onyx.server.tenants.billing import (
+    fetch_billing_information,
+    fetch_customer_portal_session,
+    fetch_stripe_checkout_session,
+)
+from ee.onyx.server.tenants.models import (
+    BillingInformation,
+    CreateCheckoutSessionRequest,
+    CreateSubscriptionSessionRequest,
+    StripePublishableKeyResponse,
+    SubscriptionSessionResponse,
+    SubscriptionStatusResponse,
+)
 from onyx.auth.permissions import require_permission
 from onyx.auth.users import User
-from onyx.configs.app_configs import STRIPE_PUBLISHABLE_KEY_OVERRIDE
-from onyx.configs.app_configs import STRIPE_PUBLISHABLE_KEY_URL
-from onyx.configs.app_configs import WEB_DOMAIN
+from onyx.configs.app_configs import (
+    STRIPE_PUBLISHABLE_KEY_OVERRIDE,
+    STRIPE_PUBLISHABLE_KEY_URL,
+    WEB_DOMAIN,
+)
 from onyx.db.engine.sql_engine import get_session
 from onyx.db.enums import Permission
 from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
 from onyx.utils.logger import setup_logger
-from shared_configs.contextvars import CURRENT_TENANT_ID_CONTEXTVAR
-from shared_configs.contextvars import get_current_tenant_id
+from shared_configs.contextvars import (
+    CURRENT_TENANT_ID_CONTEXTVAR,
+    get_current_tenant_id,
+)
 
 logger = setup_logger()
 
@@ -64,63 +61,6 @@ router = APIRouter(prefix="/tenants")
 # Cache for Stripe publishable key to avoid hitting S3 on every request
 _stripe_publishable_key_cache: str | None = None
 _stripe_key_lock = asyncio.Lock()
-
-
-@router.post("/product-gating")
-def gate_product(
-    product_gating_request: ProductGatingRequest, _: None = Depends(control_plane_dep)
-) -> ProductGatingResponse:
-    """
-    Gating the product means that the product is not available to the tenant.
-    They will be directed to the billing page.
-    We gate the product when their subscription has ended.
-    """
-    try:
-        store_product_gating(
-            product_gating_request.tenant_id, product_gating_request.application_status
-        )
-        return ProductGatingResponse(updated=True, error=None)
-
-    except Exception as e:
-        logger.exception("Failed to gate product")
-        return ProductGatingResponse(updated=False, error=str(e))
-
-
-@router.post("/product-gating/full-sync")
-def gate_product_full_sync(
-    product_gating_request: ProductGatingFullSyncRequest,
-    _: None = Depends(control_plane_dep),
-) -> ProductGatingResponse:
-    """
-    Bulk operation to overwrite the entire gated tenant set.
-    This replaces all currently gated tenants with the provided list.
-    Gated tenants are not available to access the product and will be
-    directed to the billing page when their subscription has ended.
-    """
-    try:
-        overwrite_full_gated_set(product_gating_request.gated_tenant_ids)
-        return ProductGatingResponse(updated=True, error=None)
-
-    except Exception as e:
-        logger.exception("Failed to gate products during full sync")
-        return ProductGatingResponse(updated=False, error=str(e))
-
-
-@router.post("/tier-update")
-def update_tier(
-    tier_update_request: TierUpdateRequest,
-    _: None = Depends(control_plane_dep),
-) -> TierUpdateResponse:
-    try:
-        update_tenant_tier(
-            tier_update_request.tenant_id,
-            tier_update_request.customer_tier,
-            tier_update_request.trial_end,
-        )
-        return TierUpdateResponse(updated=True, error=None)
-    except Exception as e:
-        logger.exception("Failed to update tenant tier")
-        return TierUpdateResponse(updated=False, error=str(e))
 
 
 @router.get("/billing-information")
@@ -174,8 +114,8 @@ async def create_checkout_session(
     seats = request.seats if request else None
 
     try:
-        checkout_url = fetch_stripe_checkout_session(tenant_id, billing_period, seats)
-        return {"stripe_checkout_url": checkout_url}
+        result = fetch_stripe_checkout_session(tenant_id, billing_period, seats)
+        return {"stripe_checkout_url": result.url}
     except OnyxError:
         raise
     except Exception:
@@ -197,8 +137,12 @@ async def create_subscription_session(
             raise OnyxError(OnyxErrorCode.VALIDATION_ERROR, "Tenant ID not found")
 
         billing_period = request.billing_period if request else "monthly"
-        session_id = fetch_stripe_checkout_session(tenant_id, billing_period)
-        return SubscriptionSessionResponse(sessionId=session_id)
+        result = fetch_stripe_checkout_session(tenant_id, billing_period)
+        return SubscriptionSessionResponse(
+            sessionId=result.session_id,
+            url=result.url,
+            requires_payment_method_update=result.requires_payment_method_update,
+        )
 
     except OnyxError:
         raise

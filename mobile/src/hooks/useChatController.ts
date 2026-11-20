@@ -1,0 +1,703 @@
+// runChatStream is module-scope so the stream keeps writing by sessionId after the landing screen
+// unmounts navigating into /chat/[id].
+import { useCallback, useEffect, useMemo, useRef } from "react";
+import { router } from "expo-router";
+import { QueryClient, useQuery, useQueryClient } from "@tanstack/react-query";
+
+import { QUERY_KEYS } from "@/api/query-keys";
+import { postQuestionAnswers } from "@/api/chat/questions";
+import { getErrorMessage, isApiError } from "@/api/errors";
+import {
+  createChatSession,
+  getChatSession,
+  getChatSessionStatus,
+  renameChatSession,
+  stopChatSession,
+} from "@/api/chat/sessions";
+import {
+  ChatToolOptions,
+  isMessageIdInfo,
+  isPacket,
+  isStreamError,
+  SendMessageBody,
+  streamChatMessage,
+  StreamHttpError,
+} from "@/api/chat/stream";
+import { waitForSessionIdle } from "@/chat/sessionReadiness";
+import { DEFAULT_AGENT_ID } from "@/chat/agents";
+import { FLUSH_INTERVAL_MS } from "@/chat/constants";
+import { processRawChatHistory } from "@/chat/chatHistory";
+import { ChatState, ChatStream, FileDescriptor } from "@/chat/interfaces";
+import {
+  buildImmediateMessages,
+  getLatestMessageChain,
+  MessageTreeState,
+  SYSTEM_MESSAGE_ID,
+  SYSTEM_NODE_ID,
+  upsertMessages,
+} from "@/chat/messageTree";
+import {
+  Packet,
+  PacketType,
+  StopReason,
+  buildUserCancelledStopPacket,
+} from "@/chat/streamingModels";
+import {
+  APPROVAL_PENDING_ERROR_CODE,
+  readToolApprovals,
+  useToolApprovalUi,
+} from "@/chat/toolApprovals";
+import {
+  CLOSED_QUESTION,
+  readToolQuestions,
+  useToolQuestionUi,
+  waitingQuestionIds,
+} from "@/chat/toolQuestions";
+import { useChatSessionStore } from "@/state/chatSessionStore";
+import { useSession } from "@/state/session";
+import { followUserAnswer } from "@/hooks/followUserAnswer";
+import {
+  recoverChatSession,
+  watchBackgroundAgents,
+} from "@/hooks/useChatSessionController";
+import { toast } from "@/hooks/useToast";
+
+// the run can finish before the ChatSession row is committed; let it settle before naming (web too)
+const AUTO_NAME_DELAY_MS = 200;
+const STOP_ACK_TIMEOUT_MS = 10_000;
+
+// While the reply waits for the user, the server refuses a send; the draft stays.
+function showPendingWait(message: string): void {
+  useToolApprovalUi.getState().nudge();
+  toast.warning(message);
+}
+
+interface ServerContext {
+  serverUrl: string | null;
+  queryClient: QueryClient;
+}
+
+// While the selected reply waits on its questions, a sent message answers every one of them. It
+// shows in the chat as the user's message, and the response continues.
+async function answerQuestionsWithMessage(
+  sessionId: string,
+  questionRequestIds: string[],
+  text: string,
+  server: ServerContext,
+  onAccepted?: () => void,
+): Promise<void> {
+  const { recordStatuses } = useToolQuestionUi.getState();
+  let continuation: ChatStream | null = null;
+  try {
+    const response = await postQuestionAnswers(questionRequestIds[0]!, {
+      message: text,
+    });
+    continuation = response.continuation;
+  } catch (error) {
+    if (isApiError(error) && error.code === APPROVAL_PENDING_ERROR_CODE) {
+      showPendingWait("Approve or reject the pending tool calls first.");
+      return;
+    }
+    if (isApiError(error) && (error.status === 404 || error.status === 409)) {
+      // The questions no longer wait; the saved session shows how they ended. The draft stays.
+      recordStatuses(questionRequestIds, CLOSED_QUESTION);
+      toast.warning("The question no longer waits for an answer.");
+      followUserAnswer(sessionId, null, server.serverUrl, server.queryClient);
+      return;
+    }
+    console.warn("Could not send the answer", error);
+    toast.error(getErrorMessage(error, "Could not send your answer."));
+    return;
+  }
+  onAccepted?.();
+  recordStatuses(questionRequestIds, {
+    outcome: "answered",
+    answered_via: "message",
+    message: text,
+  });
+  followUserAnswer(
+    sessionId,
+    continuation,
+    server.serverUrl,
+    server.queryClient,
+  );
+}
+
+async function nameNewSession(
+  sessionId: string,
+  ctx: ServerContext,
+): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, AUTO_NAME_DELAY_MS));
+  try {
+    await renameChatSession(sessionId);
+  } catch {
+    // best-effort; the refresh below still surfaces the chat (as "New Chat")
+  } finally {
+    void ctx.queryClient.invalidateQueries({
+      queryKey: QUERY_KEYS.chatSessions(ctx.serverUrl),
+    });
+  }
+}
+
+function appendUserCancelledStop(sessionId: string, nodeId: number): void {
+  const store = useChatSessionStore.getState();
+  const node = store.sessions.get(sessionId)?.messageTree.get(nodeId);
+  if (!node || node.type !== "assistant") return;
+  if (node.packets.some((p) => p.obj.type === PacketType.STOP)) return;
+  store.patchNode(sessionId, nodeId, {
+    packets: [...node.packets, buildUserCancelledStopPacket(node.packets)],
+  });
+}
+
+// Delivery continues until the server confirms Stop. A failed Stop leaves the
+// response running, and its requests still wait for a decision.
+async function stopAcknowledgedStream(
+  sessionId: string,
+  streamId: number,
+  controller: AbortController,
+): Promise<void> {
+  try {
+    await stopChatSession(sessionId, streamId);
+  } catch (error) {
+    console.warn("Could not stop chat response", { sessionId, error });
+    const store = useChatSessionStore.getState();
+    if (store.sessions.get(sessionId)?.abortController === controller) {
+      store.setStopRequested(sessionId, false);
+      toast.error("Could not stop the response. Try again.");
+    }
+    return;
+  }
+  controller.abort();
+}
+
+async function runChatStream(
+  sessionId: string,
+  treeBeforeSend: MessageTreeState,
+  userNodeId: number,
+  agentNodeId: number,
+  body: SendMessageBody,
+  controller: AbortController,
+  server: ServerContext,
+  isNewSession: boolean,
+  onAccepted?: () => void,
+): Promise<void> {
+  const store = useChatSessionStore;
+  const signal = controller.signal;
+  const stillOurs = () =>
+    store.getState().sessions.get(sessionId)?.abortController === controller;
+  let pending: Packet[] = [];
+  let flushTimer: ReturnType<typeof setTimeout> | null = null;
+  let sawStreaming = false;
+  let hadError = false;
+  let accepted = false;
+  // Set when the server answered without saving the turn.
+  let rejection: string | null = null;
+  let approvalPending = false;
+  let streamId: number | null = null;
+  let sawStop = false;
+  // The response waits for approval decisions; the server continues it in a new stream.
+  let paused = false;
+
+  // Anchors the timeline's elapsed timer. Stamped here, not at node creation, so it measures the
+  // stream rather than the session-create round trip that can precede it.
+  store
+    .getState()
+    .patchNode(sessionId, agentNodeId, { streamingStartedAt: Date.now() });
+
+  function flush() {
+    if (!stillOurs() || pending.length === 0) return;
+    const data = store.getState().sessions.get(sessionId);
+    const node = data?.messageTree.get(agentNodeId);
+    if (!data || !node) {
+      pending = [];
+      return;
+    }
+    const updatedNode = { ...node, packets: [...node.packets, ...pending] };
+    pending = [];
+    store
+      .getState()
+      .updateSessionTree(
+        sessionId,
+        upsertMessages(data.messageTree, [updatedNode], false),
+      );
+  }
+
+  function scheduleFlush() {
+    if (flushTimer) return;
+    flushTimer = setTimeout(() => {
+      flushTimer = null;
+      flush();
+    }, FLUSH_INTERVAL_MS);
+  }
+
+  try {
+    for await (const event of streamChatMessage(body, signal)) {
+      if (signal.aborted || !stillOurs()) break;
+      if (isMessageIdInfo(event)) {
+        accepted = true;
+        streamId = event.reserved_assistant_message_id;
+        onAccepted?.();
+        onAccepted = undefined;
+        if (event.user_message_id != null) {
+          store.getState().patchNode(sessionId, userNodeId, {
+            messageId: event.user_message_id,
+          });
+        }
+        store.getState().patchNode(sessionId, agentNodeId, {
+          messageId: event.reserved_assistant_message_id,
+        });
+        store
+          .getState()
+          .setStreamId(sessionId, event.reserved_assistant_message_id);
+        if (store.getState().sessions.get(sessionId)?.stopRequested) {
+          void stopAcknowledgedStream(
+            sessionId,
+            event.reserved_assistant_message_id,
+            controller,
+          );
+        }
+        continue;
+      }
+      if (isStreamError(event)) {
+        // Backend errored mid-stream: convert the assistant turn to an error node instead of leaving the "…" placeholder stuck.
+        hadError = true;
+        console.warn("chat stream returned a backend error", {
+          sessionId,
+          errorCode: event.error_code ?? null,
+          error: event.error,
+        });
+        if (flushTimer) {
+          clearTimeout(flushTimer);
+          flushTimer = null;
+        }
+        if (!accepted) {
+          pending = [];
+          rejection = event.error;
+          break;
+        }
+        // Keep the partial answer that arrived before the error.
+        flush();
+        store.getState().patchNode(sessionId, agentNodeId, {
+          type: "error",
+          message: event.error,
+          errorCode: event.error_code ?? null,
+        });
+        break;
+      }
+      if (isPacket(event)) {
+        if (!sawStreaming) {
+          sawStreaming = true;
+          store.getState().updateChatState(sessionId, "streaming");
+        }
+        if (event.obj.type === PacketType.STOP) {
+          sawStop = true;
+          paused = event.obj.stop_reason === StopReason.AWAITING_USER;
+        }
+        pending.push(event);
+        scheduleFlush();
+      }
+    }
+  } catch (error) {
+    // Abort is the normal stop path. A lost connection does not end an accepted run, so the
+    // readiness check below decides whether to follow it; any other failure marks the node errored.
+    if (!signal.aborted && stillOurs() && !accepted) {
+      hadError = true;
+      const message =
+        error instanceof Error ? error.message : "Something went wrong.";
+      if (
+        error instanceof StreamHttpError &&
+        error.status < 500 &&
+        error.status !== 408
+      ) {
+        rejection = message;
+        approvalPending = error.code === APPROVAL_PENDING_ERROR_CODE;
+      } else {
+        store.getState().patchNode(sessionId, agentNodeId, {
+          type: "error",
+          message,
+        });
+      }
+    }
+  } finally {
+    if (flushTimer) clearTimeout(flushTimer);
+    flush();
+    if (stillOurs() && signal.aborted && !hadError) {
+      appendUserCancelledStop(sessionId, agentNodeId);
+    }
+  }
+  if (!stillOurs()) return;
+  // Delivery ended before the run's stop, and the run can go on without it.
+  const lost = accepted && !signal.aborted && !hadError && !sawStop;
+  // The cut stream of a stopped response does not deliver the resolutions of its requests and
+  // questions.
+  const stoppedPackets = signal.aborted
+    ? (store.getState().sessions.get(sessionId)?.messageTree.get(agentNodeId)
+        ?.packets ?? [])
+    : [];
+  const unresolvedAfterStop =
+    readToolApprovals(stoppedPackets).some((entry) => entry.outcome === null) ||
+    readToolQuestions(stoppedPackets).some((entry) => entry.resolved === null);
+  // The wait is not stream time; a continuation restarts the timer.
+  if (paused) {
+    store
+      .getState()
+      .patchNode(sessionId, agentNodeId, { streamingStartedAt: undefined });
+  }
+  if (rejection !== null) {
+    // The turn does not belong in the tree; the composer still holds its text.
+    store.getState().updateSessionTree(sessionId, treeBeforeSend);
+    if (approvalPending)
+      showPendingWait(
+        "Answer the questions or decide the tool calls that wait first.",
+      );
+    else toast.error(rejection);
+  }
+  store.getState().updateChatState(sessionId, "settling");
+  try {
+    // Follow a run this send lost, its continuation after approval decisions, or one that the
+    // server runs instead of it, such as a response whose approval refused this send.
+    const wait = await waitForSessionIdle(
+      sessionId,
+      stillOurs,
+      () => store.getState().updateChatState(sessionId, "unconfirmed"),
+      // A Stop the server confirms during the wait ends following.
+      (next) => !signal.aborted && (lost || next !== streamId),
+    );
+    // name a new session once it streamed output; skip stop/abort and thrown transport failures
+    if (
+      wait.kind === "idle" &&
+      isNewSession &&
+      !signal.aborted &&
+      sawStreaming &&
+      !hadError
+    ) {
+      void nameNewSession(sessionId, server);
+    }
+    // A decision made during this send names its continuation or needs another status read.
+    const queued =
+      wait.kind === "idle"
+        ? store.getState().takeQueuedFollow(sessionId)
+        : null;
+    // An idle server still reloads the saved session when this device lacks what the server
+    // saved: a lost send's answer, the requests that refused this send, the outcomes a Stop
+    // gave, or approvals and responses that the chat does not show.
+    if (
+      wait.kind === "stream" ||
+      queued !== null ||
+      (wait.kind === "idle" &&
+        (lost || approvalPending || unresolvedAfterStop || wait.stale))
+    ) {
+      store.getState().setAbortController(sessionId, null);
+      void recoverChatSession(
+        sessionId,
+        wait.kind === "stream" ? wait.stream : (queued?.stream ?? null),
+        server.serverUrl,
+        server.queryClient,
+        new AbortController(),
+      );
+      return;
+    }
+    if (wait.kind !== "idle" || !stillOurs()) return;
+    store.getState().updateChatState(sessionId, "input");
+    if (wait.backgroundWork)
+      void watchBackgroundAgents(
+        sessionId,
+        server.serverUrl,
+        server.queryClient,
+      );
+  } catch (error) {
+    if (!stillOurs()) return;
+    console.warn("Could not confirm chat readiness", error);
+    store.getState().updateChatState(sessionId, "unconfirmed");
+    toast.error(
+      error instanceof Error
+        ? error.message
+        : "This conversation is unavailable.",
+    );
+  } finally {
+    if (stillOurs()) store.getState().setAbortController(sessionId, null);
+  }
+}
+
+export interface ChatController {
+  messages: ReturnType<typeof getLatestMessageChain>;
+  chatState: ChatState;
+  // Clear the draft only after the server acknowledges the request.
+  // `toolOptions` carries the toolbar controls (deep research / preferred + allowed tools / sources);
+  // absent = backend defaults.
+  submit: (
+    text: string,
+    files?: FileDescriptor[],
+    onAccepted?: () => void,
+    toolOptions?: ChatToolOptions,
+    // Runs before navigation; onAccepted waits for the server's message ID.
+    onCreated?: () => void,
+  ) => void;
+  stop: () => void;
+  // The selected reply shows a waiting question card, so a sent message answers it.
+  answersQuestions: boolean;
+  isHydrating: boolean;
+  // The persona the backend says owns this session. The sessions list can't answer this for a
+  // project chat (it is fetched with only_non_project_chats=true), so the hydrated session is the
+  // only authority. null for a new chat, or before hydration lands.
+  conversationPersonaId: number | null;
+}
+
+// `personaId` binds the agent only when this send creates a new session (ignored for an existing
+// session). `projectId` scopes a new chat to a project.
+export function useChatController(
+  sessionId: string | null,
+  personaId: number = DEFAULT_AGENT_ID,
+  projectId: number | null = null,
+  // report a new session here instead of navigating, so a host can transition in place
+  onSessionCreated?: (sessionId: string) => void,
+): ChatController {
+  // Re-entry guard: without this, two rapid taps race through createChatSession (two sessions).
+  const submittingRef = useRef(false);
+  const serverUrl = useSession((state) => state.serverUrl);
+  const queryClient = useQueryClient();
+  const sessionData = useChatSessionStore((state) =>
+    sessionId ? state.sessions.get(sessionId) : undefined,
+  );
+
+  // No open chat on other screens ends the readers and watches of the last one.
+  useEffect(() => {
+    useChatSessionStore.getState().setCurrentSession(sessionId);
+  }, [sessionId]);
+
+  // Hydrate a session opened but not yet in the store (sidebar / relaunch).
+  const needsHydration = sessionId != null && sessionData === undefined;
+  const hydration = useQuery({
+    queryKey: QUERY_KEYS.chatSession(serverUrl, sessionId ?? "new"),
+    enabled: needsHydration && serverUrl != null,
+    queryFn: async () => {
+      const backend = await getChatSession(sessionId!);
+      // A live stream may have filled the store meanwhile — don't clobber it.
+      if (!useChatSessionStore.getState().sessions.has(sessionId!)) {
+        useChatSessionStore
+          .getState()
+          .hydrateSession(
+            sessionId!,
+            processRawChatHistory(backend.messages, backend.packets),
+            backend.approvals_version,
+          );
+      }
+      return backend;
+    },
+  });
+
+  const messages = useMemo(
+    () => (sessionData ? getLatestMessageChain(sessionData.messageTree) : []),
+    [sessionData],
+  );
+  const chatState: ChatState = sessionData?.chatState ?? "input";
+  const localQuestionStatuses = useToolQuestionUi(
+    (state) => state.localStatuses,
+  );
+  const answersQuestions = useMemo(
+    () => waitingQuestionIds(messages, localQuestionStatuses).length > 0,
+    [messages, localQuestionStatuses],
+  );
+
+  const submit = useCallback(
+    async (
+      overrideText: string,
+      files?: FileDescriptor[],
+      onAccepted?: () => void,
+      toolOptions?: ChatToolOptions,
+      onCreated?: () => void,
+    ) => {
+      const text = overrideText.trim();
+      if (!text) return;
+      const fileDescriptors = files ?? [];
+      if (submittingRef.current) return;
+      submittingRef.current = true;
+      try {
+        const isNewSession = sessionId == null;
+        let activeId = sessionId;
+        if (activeId != null) {
+          const current = useChatSessionStore.getState().sessions.get(activeId);
+          // While the selected reply shows a waiting question card, a sent message answers
+          // its questions instead of starting a turn.
+          const waiting = waitingQuestionIds(
+            getLatestMessageChain(current?.messageTree ?? new Map()),
+            useToolQuestionUi.getState().localStatuses,
+          );
+          if (waiting.length > 0) {
+            if (fileDescriptors.length > 0) {
+              toast.warning("Remove the attachments to answer the question.");
+              return;
+            }
+            await answerQuestionsWithMessage(
+              activeId,
+              waiting,
+              text,
+              { serverUrl, queryClient },
+              onAccepted,
+            );
+            return;
+          }
+          if (current && current.chatState !== "input") return; // a run is already active
+          try {
+            if (
+              (await getChatSessionStatus(activeId)).is_processing !== false
+            ) {
+              toast.info(
+                "This conversation is still processing. Try again shortly.",
+              );
+              return;
+            }
+          } catch {
+            toast.error(
+              "Could not confirm this conversation is ready. Try again.",
+            );
+            return;
+          }
+          if (
+            useChatSessionStore.getState().sessions.get(activeId)
+              ?.abortController
+          )
+            return;
+        }
+        if (activeId == null) {
+          activeId = await createChatSession(personaId, projectId);
+          // refresh the project (we've navigated away) so the new chat shows on reopen
+          if (projectId != null) {
+            void queryClient.invalidateQueries({
+              queryKey: QUERY_KEYS.userProject(serverUrl, projectId),
+            });
+            void queryClient.invalidateQueries({
+              queryKey: QUERY_KEYS.userProjects(serverUrl),
+            });
+          }
+        }
+        const store = useChatSessionStore.getState();
+        store.ensureSession(activeId);
+        // Re-read: the captured store.sessions snapshot predates ensureSession.
+        const tree =
+          useChatSessionStore.getState().sessions.get(activeId)?.messageTree ??
+          new Map();
+        // A failed turn the server saved stays in the conversation, so the
+        // next message continues after it. A turn the server rejected before
+        // saving has no row to continue from.
+        const parent = getLatestMessageChain(tree).findLast(
+          (message) => message.messageId !== undefined,
+        );
+        const parentNodeId = parent?.nodeId ?? SYSTEM_NODE_ID;
+        // -3 (synthetic root) → null; null = first message.
+        const parentMessageId =
+          parent?.messageId === undefined ||
+          parent.messageId === SYSTEM_MESSAGE_ID
+            ? null
+            : parent.messageId;
+
+        const { initialUserNode, initialAgentNode } = buildImmediateMessages(
+          parentNodeId,
+          text,
+          fileDescriptors,
+        );
+        store.updateSessionTree(
+          activeId,
+          upsertMessages(tree, [initialUserNode, initialAgentNode], true),
+        );
+        store.updateChatState(activeId, "loading");
+        store.setSubmittedMessage(activeId, text);
+
+        const controller = new AbortController();
+        store.setAbortController(activeId, controller);
+
+        const body: SendMessageBody = {
+          message: text,
+          chat_session_id: activeId,
+          parent_message_id: parentMessageId,
+          file_descriptors: fileDescriptors,
+          deep_research: toolOptions?.deepResearch ?? false,
+          origin: "mobile",
+          tool_options: {
+            allowed: toolOptions?.allowed ?? null,
+            preferred:
+              toolOptions?.preferredToolId != null
+                ? { type: "capability", tool_id: toolOptions.preferredToolId }
+                : null,
+            internal_search_filters: toolOptions?.internalSearchFilters ?? null,
+          },
+          llm_override: toolOptions?.llmOverride ?? null,
+        };
+
+        if (sessionId == null) {
+          onCreated?.();
+          if (onSessionCreated) {
+            onSessionCreated(activeId);
+          } else {
+            const dest = {
+              pathname: "/chat/[id]" as const,
+              params: { id: activeId },
+            };
+            // push from a project so Back returns to it; replace from the landing
+            // so Back skips the now-empty landing
+            if (projectId != null) router.navigate(dest);
+            else router.replace(dest);
+          }
+        }
+
+        void runChatStream(
+          activeId,
+          tree,
+          initialUserNode.nodeId,
+          initialAgentNode.nodeId,
+          body,
+          controller,
+          { serverUrl, queryClient },
+          isNewSession,
+          onAccepted,
+        );
+      } finally {
+        submittingRef.current = false;
+      }
+    },
+    [sessionId, personaId, projectId, onSessionCreated, serverUrl, queryClient],
+  );
+
+  const stop = useCallback(() => {
+    if (sessionId == null) return;
+    const store = useChatSessionStore.getState();
+    const current = store.sessions.get(sessionId);
+    if (!current?.abortController || current.stopRequested) return;
+    store.setStopRequested(sessionId, true);
+    // Keep reading until acknowledgement, so Stop cannot target a later request.
+    if (current.streamId !== null) {
+      void stopAcknowledgedStream(
+        sessionId,
+        current.streamId,
+        current.abortController,
+      );
+      return;
+    }
+    // A lost acknowledgement must not prevent Stop from reaching the readiness check.
+    // Once the acknowledgement arrives, the scoped Stop decides instead.
+    const controller = current.abortController;
+    const timeout = setTimeout(() => {
+      const session = useChatSessionStore.getState().sessions.get(sessionId);
+      if (
+        session?.abortController === controller &&
+        session.streamId === null
+      ) {
+        controller.abort();
+      }
+    }, STOP_ACK_TIMEOUT_MS);
+    controller.signal.addEventListener("abort", () => clearTimeout(timeout), {
+      once: true,
+    });
+  }, [sessionId]);
+
+  return {
+    messages,
+    chatState,
+    submit,
+    stop,
+    answersQuestions,
+    isHydrating: needsHydration && hydration.isLoading,
+    // Query keeps serving this once hydration is disabled, so it survives revisiting the chat.
+    conversationPersonaId: hydration.data?.persona_id ?? null,
+  };
+}

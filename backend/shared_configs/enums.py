@@ -8,6 +8,8 @@ class EmbeddingProvider(str, Enum):
     GOOGLE = "google"
     LITELLM = "litellm"
     AZURE = "azure"
+    BIFROST = "bifrost"
+    OPENAI_COMPATIBLE = "openai_compatible"
 
 
 class RerankerProvider(str, Enum):
@@ -27,9 +29,29 @@ class WebSearchProviderType(str, Enum):
     EXA = "exa"
     SEARXNG = "searxng"
     BRAVE = "brave"
+    TAVILY = "tavily"
+    FIRECRAWL = "firecrawl"
 
 
 class WebContentProviderType(str, Enum):
     ONYX_WEB_CRAWLER = "onyx_web_crawler"
     FIRECRAWL = "firecrawl"
     EXA = "exa"
+    TAVILY = "tavily"
+
+
+class TracingProviderType(str, Enum):
+    BRAINTRUST = "braintrust"
+    LANGFUSE = "langfuse"
+
+
+class UsageCredentialType(str, Enum):
+    """CRAFT_PAT is separate from PAT because Craft sandbox tokens are
+    agent-driven yet carry the owning human's user_id."""
+
+    SESSION = "session"
+    JWT = "jwt"
+    PAT = "pat"
+    CRAFT_PAT = "craft_pat"
+    OAUTH_PROVIDER = "oauth_provider"
+    API_KEY = "api_key"

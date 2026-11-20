@@ -4,9 +4,7 @@ Verifies that user-owned files (those with user_file_id) are never deleted
 during chat session cleanup — only chat-only files should be removed.
 """
 
-from unittest.mock import call
-from unittest.mock import MagicMock
-from unittest.mock import patch
+from unittest.mock import MagicMock, call, patch
 from uuid import uuid4
 
 from onyx.db.chat import delete_messages_and_files_from_chat_session
@@ -18,7 +16,7 @@ def _make_db_session(
     rows: list[tuple[int, list[dict[str, str]] | None]],
 ) -> MagicMock:
     db_session = MagicMock()
-    db_session.execute.return_value.tuples.return_value.all.return_value = rows
+    db_session.execute.return_value.tuples.return_value.yield_per.return_value = rows
     return db_session
 
 

@@ -4,25 +4,34 @@ from fastapi import FastAPI
 from fastapi.dependencies.models import Dependant
 from starlette.routing import BaseRoute
 
-from onyx.auth.users import current_chat_accessible_user
-from onyx.auth.users import current_curator_or_admin_user
-from onyx.auth.users import current_limited_user
-from onyx.auth.users import current_user
-from onyx.auth.users import current_user_from_websocket
-from onyx.auth.users import current_user_with_expired_token
+from onyx.auth.users import (
+    current_chat_accessible_user,
+    current_limited_user,
+    current_user,
+    current_user_from_websocket,
+    current_user_with_expired_token,
+)
 from onyx.configs.app_configs import APP_API_PREFIX
 from onyx.utils.variable_functionality import fetch_ee_implementation_or_noop
 
 PUBLIC_ENDPOINT_SPECS = [
-    # built-in documentation functions
+    # Tenant-scoped, expiring read-only capability; cookies do not authorize access.
+    ("/build/static-preview/{token}/{path:path}", {"GET"}),
+    # Built-in API docs / schema. These routes only exist when ENABLE_PUBLIC_DOCS
+    # is set (see get_application); they are gated off by default so the API
+    # surface is not exposed publicly. When the flag is off the routes are not
+    # registered, so these specs simply go unmatched. When on, they are served
+    # publicly with no session (the renderers never bypass per-route auth).
     ("/openapi.json", {"GET", "HEAD"}),
     ("/docs", {"GET", "HEAD"}),
     ("/docs/oauth2-redirect", {"GET", "HEAD"}),
     ("/redoc", {"GET", "HEAD"}),
     # should always be callable, will just return 401 if not authenticated
     ("/me", {"GET"}),
-    # just returns 200 to validate that the server is up
+    # liveness: just returns 200 to validate that the process is up
     ("/health", {"GET"}),
+    # readiness: 200 while the server can serve traffic, 503 when saturated
+    ("/health/ready", {"GET"}),
     # just returns auth type, needs to be accessible before the user is logged
     # in to determine what flow to give the user
     ("/auth/type", {"GET"}),
@@ -43,6 +52,17 @@ PUBLIC_ENDPOINT_SPECS = [
     ("/auth/reset-password", {"POST"}),
     ("/auth/request-verify-token", {"POST"}),
     ("/auth/verify", {"POST"}),
+    # native mobile bearer-token auth — mirrors the basic-auth routes above,
+    # but the session token is delivered as a Bearer instead of a cookie.
+    # (refresh/logout still enforce the token via their own dependencies;
+    # listing them here only satisfies the startup public-route assertion.)
+    ("/auth/mobile/login", {"POST"}),
+    ("/auth/mobile/refresh", {"POST"}),
+    ("/auth/mobile/logout", {"POST"}),
+    # swaps a one-time SSO code (+ PKCE verifier) for the session token; it has
+    # no user dependency by design (the code IS the credential), so it must be
+    # declared public to satisfy the startup public-route assertion.
+    ("/auth/mobile/sso/exchange", {"POST"}),
     ("/users/me", {"GET"}),
     ("/users/me", {"PATCH"}),
     ("/users/{id}", {"GET"}),
@@ -51,18 +71,43 @@ PUBLIC_ENDPOINT_SPECS = [
     # oauth
     ("/auth/oauth/authorize", {"GET"}),
     ("/auth/oauth/callback", {"GET"}),
+    ("/mcp/oauth/client-metadata", {"GET"}),
+    ("/oauth-provider/metadata", {"GET", "OPTIONS"}),
+    ("/oauth-provider/register", {"POST", "OPTIONS"}),
+    ("/oauth-provider/authorize", {"GET", "POST"}),
+    ("/oauth-provider/token", {"POST", "OPTIONS"}),
+    ("/oauth-provider/revoke", {"POST", "OPTIONS"}),
+    # dedicated mobile google oauth (callback routes to the api_server, not the web app)
+    ("/auth/mobile/oauth/authorize", {"GET"}),
+    ("/auth/mobile/oauth/callback", {"GET"}),
     # oidc
     ("/auth/oidc/authorize", {"GET"}),
     ("/auth/oidc/callback", {"GET"}),
-    # saml
+    # db-backed multi-provider oidc/google (oidc_multi router)
+    ("/auth/oidc/{provider_name}/authorize", {"GET"}),
+    ("/auth/oidc/{provider_name}/callback", {"GET"}),
+    # Resolves a workspace's SSO buttons before the user has any session. Public
+    # only because it answers uniformly for unknown, ambiguous, and SSO-less
+    # addresses, and is rate limited.
+    ("/auth/sso/discover", {"POST"}),
+    # saml (single router: legacy-compatible + parametric authorize, one
+    # issuer-resolved callback)
     ("/auth/saml/authorize", {"GET"}),
+    ("/auth/saml/{provider_name}/authorize", {"GET"}),
     ("/auth/saml/callback", {"POST"}),
-    ("/auth/saml/callback", {"GET"}),
+    ("/auth/saml/complete", {"GET"}),
     ("/auth/saml/logout", {"POST"}),
     ("/sub2api/exchange", {"GET"}),
+    ("/sub2api/launch", {"POST"}),
+    ("/sub2api/launch/finish", {"POST"}),
     # anonymous user on cloud
     ("/tenants/anonymous-user", {"POST"}),
     ("/metrics", {"GET"}),  # added by prometheus_fastapi_instrumentator
+    # Firecracker host agents; the handler checks the shared cluster credential.
+    ("/microvm/node/signing-key", {"PUT"}),
+    # Firecracker host agents; the handler checks a JWT from the node's key.
+    ("/microvm/node/state", {"POST"}),
+    ("/microvm/node/deregister", {"POST"}),
     # craft webapp proxy — access enforced per-session via sharing_scope in handler
     ("/build/sessions/{session_id}/webapp", {"GET"}),
     ("/build/sessions/{session_id}/webapp/{path:path}", {"GET"}),
@@ -96,7 +141,13 @@ def is_route_in_spec_list(
 
 def _is_require_permission_dependency(fn: object) -> bool:
     """Detect closures generated by ``require_permission()``."""
-    return bool(getattr(fn, "_is_require_permission", False))
+    return bool(getattr(fn, "_is_require_permission", False))  # ods: ignore[getattr]
+
+
+def _is_websocket_auth_dependency(fn: object) -> bool:
+    return bool(
+        getattr(fn, "_is_websocket_auth_dependency", False)  # ods: ignore[getattr]
+    )
 
 
 def check_router_auth(
@@ -130,11 +181,10 @@ def check_router_auth(
         )
         if route_dependant_obj:
             for dependency in route_dependant_obj.dependencies:
-                depends_fn = dependency.cache_key[0]
+                depends_fn = dependency.call
                 if (
                     depends_fn == current_limited_user
                     or depends_fn == current_user
-                    or depends_fn == current_curator_or_admin_user
                     or depends_fn == current_user_with_expired_token
                     or depends_fn == current_chat_accessible_user
                     or depends_fn == current_user_from_websocket
@@ -142,6 +192,7 @@ def check_router_auth(
                     or depends_fn == current_cloud_superuser
                     or depends_fn == verify_scim_token
                     or _is_require_permission_dependency(depends_fn)
+                    or _is_websocket_auth_dependency(depends_fn)
                 ):
                     found_auth = True
                     break

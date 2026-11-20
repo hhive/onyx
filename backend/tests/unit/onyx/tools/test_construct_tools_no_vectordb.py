@@ -2,18 +2,18 @@
 
 Verifies that:
 - SearchTool.is_available() returns False when vector DB is disabled
-- OpenURLTool.is_available() returns False when vector DB is disabled
+- OpenURLTool.is_available() returns True when vector DB is disabled (crawl-only)
 - The force-add SearchTool block is suppressed when DISABLE_VECTOR_DB
 - FileReaderTool.is_available() returns True when vector DB is disabled
 """
 
-from unittest.mock import MagicMock
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from onyx.tools.tool_implementations.file_reader.file_reader_tool import FileReaderTool
 
 APP_CONFIGS_MODULE = "onyx.configs.app_configs"
 FILE_READER_MODULE = "onyx.tools.tool_implementations.file_reader.file_reader_tool"
+OPEN_URL_MODULE = "onyx.tools.tool_implementations.open_url.open_url_tool"
 
 
 # ------------------------------------------------------------------
@@ -55,13 +55,13 @@ class TestSearchToolAvailability:
 
 
 class TestOpenURLToolAvailability:
-    @patch(f"{APP_CONFIGS_MODULE}.DISABLE_VECTOR_DB", True)
-    def test_unavailable_when_vector_db_disabled(self) -> None:
+    @patch(f"{OPEN_URL_MODULE}.DISABLE_VECTOR_DB", True)
+    def test_available_when_vector_db_disabled(self) -> None:
         from onyx.tools.tool_implementations.open_url.open_url_tool import OpenURLTool
 
-        assert OpenURLTool.is_available(MagicMock()) is False
+        assert OpenURLTool.is_available(MagicMock()) is True
 
-    @patch(f"{APP_CONFIGS_MODULE}.DISABLE_VECTOR_DB", False)
+    @patch(f"{OPEN_URL_MODULE}.DISABLE_VECTOR_DB", False)
     def test_available_when_vector_db_enabled(self) -> None:
         from onyx.tools.tool_implementations.open_url.open_url_tool import OpenURLTool
 
@@ -114,8 +114,7 @@ class TestValidateVectorDbKnowledge:
         True,
     )
     def test_rejects_document_set_ids(self) -> None:
-        from fastapi import HTTPException
-
+        from onyx.error_handling.exceptions import OnyxError
         from onyx.server.features.persona.api import _validate_vector_db_knowledge
 
         request = MagicMock()
@@ -123,7 +122,7 @@ class TestValidateVectorDbKnowledge:
         request.hierarchy_node_ids = []
         request.document_ids = []
 
-        with __import__("pytest").raises(HTTPException) as exc_info:
+        with __import__("pytest").raises(OnyxError) as exc_info:
             _validate_vector_db_knowledge(request)
         assert exc_info.value.status_code == 400
         assert "document sets" in exc_info.value.detail
@@ -133,8 +132,7 @@ class TestValidateVectorDbKnowledge:
         True,
     )
     def test_rejects_hierarchy_node_ids(self) -> None:
-        from fastapi import HTTPException
-
+        from onyx.error_handling.exceptions import OnyxError
         from onyx.server.features.persona.api import _validate_vector_db_knowledge
 
         request = MagicMock()
@@ -142,7 +140,7 @@ class TestValidateVectorDbKnowledge:
         request.hierarchy_node_ids = [1]
         request.document_ids = []
 
-        with __import__("pytest").raises(HTTPException) as exc_info:
+        with __import__("pytest").raises(OnyxError) as exc_info:
             _validate_vector_db_knowledge(request)
         assert exc_info.value.status_code == 400
         assert "hierarchy nodes" in exc_info.value.detail
@@ -152,8 +150,7 @@ class TestValidateVectorDbKnowledge:
         True,
     )
     def test_rejects_document_ids(self) -> None:
-        from fastapi import HTTPException
-
+        from onyx.error_handling.exceptions import OnyxError
         from onyx.server.features.persona.api import _validate_vector_db_knowledge
 
         request = MagicMock()
@@ -161,7 +158,7 @@ class TestValidateVectorDbKnowledge:
         request.hierarchy_node_ids = []
         request.document_ids = ["doc-abc"]
 
-        with __import__("pytest").raises(HTTPException) as exc_info:
+        with __import__("pytest").raises(OnyxError) as exc_info:
             _validate_vector_db_knowledge(request)
         assert exc_info.value.status_code == 400
         assert "documents" in exc_info.value.detail

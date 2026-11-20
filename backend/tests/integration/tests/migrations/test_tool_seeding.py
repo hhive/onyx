@@ -2,8 +2,7 @@ from pydantic import BaseModel
 from sqlalchemy import text
 
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
-from tests.integration.common_utils.reset import downgrade_postgres
-from tests.integration.common_utils.reset import upgrade_postgres
+from tests.integration.common_utils.reset import downgrade_postgres, upgrade_postgres
 
 
 class ToolSeedingExpectedResult(BaseModel):
@@ -40,7 +39,7 @@ EXPECTED_TOOLS = {
         user_id=None,
     ),
     "PythonTool": ToolSeedingExpectedResult(
-        name="python",
+        name="run_python",
         display_name="Code Interpreter",
         in_code_tool_id="PythonTool",
         user_id=None,
@@ -62,12 +61,6 @@ EXPECTED_TOOLS = {
         name="MemoryTool",
         display_name="Add Memory",
         in_code_tool_id="MemoryTool",
-        user_id=None,
-    ),
-    "CodingAgentTool": ToolSeedingExpectedResult(
-        name="coding_agent",
-        display_name="Coding Agent",
-        in_code_tool_id="CodingAgentTool",
         user_id=None,
     ),
 }
@@ -110,8 +103,8 @@ def test_tool_seeding_migration() -> None:
         )
         tools = result.fetchall()
 
-        assert len(tools) == 11, (
-            f"Should have created exactly 11 builtin tools, got {len(tools)}"
+        assert len(tools) == 10, (
+            f"Should have created exactly 10 builtin tools, got {len(tools)}"
         )
 
         def validate_tool(expected: ToolSeedingExpectedResult) -> None:
@@ -153,5 +146,3 @@ def test_tool_seeding_migration() -> None:
 
         # Check MemoryTool
         validate_tool(EXPECTED_TOOLS["MemoryTool"])
-
-        validate_tool(EXPECTED_TOOLS["CodingAgentTool"])

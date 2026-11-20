@@ -8,7 +8,7 @@ Parameters:
     Default: production
   VpcID:
     Type: String
-    Default: vpc-0f230ca52bb04c722 
+    Description: "The ID of the VPC to deploy into"
   SubnetIDs:
     Type: CommaDelimitedList
     Description: "Comma-delimited list of at least two subnet IDs in different Availability Zones"
@@ -29,6 +29,9 @@ Resources:
         ReplicationOverwriteProtection: ENABLED
       ThroughputMode: elastic
 
+  # Legacy Vespa access points. Onyx no longer uses Vespa. They are kept so
+  # that stacks which still import them (an old vespaengine service stack) can
+  # update. Delete that service stack before you remove these.
   VespaEngineTmpEfsAccessPoint:
     Type: AWS::EFS::AccessPoint
     Properties:

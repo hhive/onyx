@@ -6,46 +6,59 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from typing_extensions import override
 
-from onyx.chat.emitter import Emitter
-from onyx.context.search.models import IndexFilters
-from onyx.context.search.models import InferenceSection
-from onyx.context.search.models import SearchDocsResponse
+from onyx.access.access import censor_chunks_for_user
+from onyx.agents.tools import ToolInvocation, ToolProgress
+from onyx.configs.app_configs import DISABLE_VECTOR_DB
+from onyx.context.search.models import (
+    IndexFilters,
+    InferenceSection,
+    SearchDocsResponse,
+)
 from onyx.context.search.preprocessing.access_filters import (
     build_access_filters_for_user,
 )
-from onyx.context.search.utils import convert_inference_sections_to_search_docs
-from onyx.context.search.utils import inference_section_from_chunks
-from onyx.db.document import fetch_document_ids_by_links
-from onyx.db.document import filter_existing_document_ids
+from onyx.context.search.utils import (
+    convert_inference_sections_to_search_docs,
+    inference_section_from_chunks,
+)
+from onyx.db.document import fetch_document_ids_by_links, filter_existing_document_ids
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.models import User
-from onyx.document_index.interfaces_new import DocumentIndex
-from onyx.document_index.interfaces_new import DocumentSectionRequest
-from onyx.server.query_and_chat.placement import Placement
-from onyx.server.query_and_chat.streaming_models import OpenUrlDocuments
-from onyx.server.query_and_chat.streaming_models import OpenUrlStart
-from onyx.server.query_and_chat.streaming_models import OpenUrlUrls
-from onyx.server.query_and_chat.streaming_models import Packet
-from onyx.tools.interface import Tool
-from onyx.tools.models import OpenURLToolOverrideKwargs
-from onyx.tools.models import ToolCallException
-from onyx.tools.models import ToolResponse
-from onyx.tools.tool_implementations.open_url.models import FailedFetch
-from onyx.tools.tool_implementations.open_url.models import WebContentProvider
+from onyx.document_index.interfaces import DocumentIndex, DocumentSectionRequest
+from onyx.llm.models import ToolDefinition, ToolResult
+from onyx.tools.interface import (
+    CITATIONS_PER_TOOL_CALL,
+    Tool,
+    parse_tool_arguments,
+    tool_definition_from_arguments,
+)
+from onyx.tools.models import (
+    CodeModeExposure,
+    CodeModeResultSpec,
+    SearchResult,
+    SearchResults,
+    ToolContext,
+)
+from onyx.tools.tool_implementations.open_url.models import (
+    FailedFetch,
+    OpenURLArguments,
+    WebContentProvider,
+)
 from onyx.tools.tool_implementations.open_url.url_normalization import (
     _default_url_normalizer,
+    normalize_url_candidates,
 )
-from onyx.tools.tool_implementations.open_url.url_normalization import normalize_url
 from onyx.tools.tool_implementations.open_url.utils import (
     filter_web_contents_with_no_title_or_content,
 )
+from onyx.tools.tool_implementations.utils import SEARCH_RESULTS_CODE_MODE_RESULT
 from onyx.tools.tool_implementations.web_search.providers import (
     get_default_content_provider,
 )
 from onyx.tools.tool_implementations.web_search.utils import (
+    MAX_CHARS_PER_URL,
     inference_section_from_internet_page_scrape,
 )
-from onyx.tools.tool_implementations.web_search.utils import MAX_CHARS_PER_URL
 from onyx.utils.logger import setup_logger
 from onyx.utils.threadpool_concurrency import run_functions_tuples_in_parallel
 from onyx.utils.url import normalize_url as normalize_web_content_url
@@ -53,8 +66,6 @@ from shared_configs.configs import MULTI_TENANT
 from shared_configs.contextvars import get_current_tenant_id
 
 logger = setup_logger()
-
-URLS_FIELD = "urls"
 
 # 2 minute timeout for parallel URL fetching to prevent indefinite hangs
 OPEN_URL_TIMEOUT_SECONDS = 2 * 60
@@ -68,6 +79,13 @@ MAX_CHARS_ACROSS_URLS = 10 * MAX_CHARS_PER_URL
 # This is for truncation purposes, if a document is small (unless it goes into truncation flow),
 # it still gets included normally.
 MIN_CONTENT_CHARS = 200
+
+# LLM-facing reason used when the chat disabled web access (Web Search off) and
+# a URL couldn't be served from indexed documents.
+WEB_FETCH_DISABLED_REASON = (
+    "not fetched: web access is disabled for this conversation and this URL's "
+    "content is not in the connected knowledge sources"
+)
 
 
 class IndexedDocumentRequest(BaseModel):
@@ -118,33 +136,6 @@ def _build_failure_message(
     if not parts:
         return "Failed to fetch content from the requested resources."
     return "Failed to fetch content from " + " and ".join(parts)
-
-
-def _dedupe_preserve_order(values: list[str]) -> list[str]:
-    seen: set[str] = set()
-    ordered: list[str] = []
-    for value in values:
-        if not value:
-            continue
-        if value in seen:
-            continue
-        seen.add(value)
-        ordered.append(value)
-    return ordered
-
-
-def _normalize_string_list(value: str | list[str] | None) -> list[str]:
-    """Normalize a value that may be a string, list of strings, or None into a cleaned list.
-
-    Returns a deduplicated list of non-empty stripped strings.
-    """
-    if value is None:
-        return []
-    if isinstance(value, str):
-        value = [value]
-    return _dedupe_preserve_order(
-        [stripped for item in value if (stripped := str(item).strip())]
-    )
 
 
 def _url_lookup_variants(url: str) -> set[str]:
@@ -230,34 +221,35 @@ def _resolve_urls_to_document_ids(
     """
     matches: list[IndexedDocumentRequest] = []
     unresolved: list[str] = []
-    normalized_map: dict[str, set[str]] = {}
+    # Ordered by connector-defined candidate priority; the first indexed variant wins.
+    normalized_map: dict[str, list[str]] = {}
 
     for url in urls:
-        # Use connector-owned normalization (reuses connector's own logic)
-        normalized = normalize_url(url)
+        # A single URL may map to several candidate document IDs; match whichever is indexed.
+        candidates = normalize_url_candidates(url)
 
-        if normalized:
-            # Some connectors (e.g. Notion) normalize to a non-URL canonical document
-            # identifier (e.g. a UUID) rather than a URL. In those cases, we should
-            # treat the normalized value as a document_id directly.
-            if normalized.startswith(("http://", "https://")):
-                # Get URL variants (with/without trailing slash) for database lookup
-                variants = _url_lookup_variants(normalized)
-                # Defensive fallback: if variant generation fails, still try the
-                # normalized URL itself.
-                normalized_map[url] = variants or {normalized}
-            else:
-                normalized_map[url] = {normalized}
+        if candidates:
+            variants: list[str] = []
+            for candidate in candidates:
+                if candidate.startswith(("http://", "https://")):
+                    candidate_variants = list(_url_lookup_variants(candidate)) or [
+                        candidate
+                    ]
+                else:
+                    # Non-URL canonical id (e.g. a Notion UUID); use it directly.
+                    candidate_variants = [candidate]
+                variants.extend(v for v in candidate_variants if v not in variants)
+            normalized_map[url] = variants
         else:
             # No normalizer found - could be a non-URL document ID (e.g., FILE_CONNECTOR__...)
             if url and not url.startswith(("http://", "https://")):
                 # Likely a document ID, use it directly
-                normalized_map[url] = {url}
+                normalized_map[url] = [url]
             else:
                 # Try generic normalization as fallback
-                variants = _url_lookup_variants(url)
-                if variants:
-                    normalized_map[url] = variants
+                fallback_variants = list(_url_lookup_variants(url))
+                if fallback_variants:
+                    normalized_map[url] = fallback_variants
                 else:
                     unresolved.append(url)
 
@@ -289,13 +281,11 @@ def _resolve_urls_to_document_ids(
     return matches, unresolved
 
 
-def _estimate_result_chars(result: dict[str, Any]) -> int:
-    """Estimate character count from document fields in a result dict."""
-    total = 0
-    for key, value in result.items():
-        if value is not None:
-            total += len(str(value))
-    return total
+def _estimate_result_chars(result: SearchResult) -> int:
+    """Estimate character count from the document fields of a result."""
+    return sum(
+        len(str(value)) for value in result.model_dump(exclude_none=True).values()
+    )
 
 
 def _convert_sections_to_llm_string_with_citations(
@@ -342,40 +332,27 @@ def _convert_sections_to_llm_string_with_citations(
             next_citation_id += 1
 
     # Second pass: build results, respecting max_document_chars budget
-    results = []
+    results: list[SearchResult] = []
     total_chars = 0
 
     for section in sections:
         chunk = section.center_chunk
-        document_id = chunk.document_id
-        citation_id = document_id_to_citation_id[document_id]
-
-        # Format updated_at as ISO string if available
-        updated_at_str = None
-        if chunk.updated_at:
-            updated_at_str = chunk.updated_at.isoformat()
-
-        # Build result dict without content first to calculate metadata overhead
-        result: dict[str, Any] = {
-            "document": citation_id,
-            "title": chunk.semantic_identifier,
-        }
-        if updated_at_str is not None:
-            result["updated_at"] = updated_at_str
-        if chunk.source_links:
-            link = next(iter(chunk.source_links.values()), None)
-            if link:
-                result["url"] = link
-
-        if chunk.metadata:
-            result["metadata"] = json.dumps(chunk.metadata, ensure_ascii=False)
-
-        # Calculate chars used by metadata fields (everything except content)
-        metadata_chars = _estimate_result_chars(result)
+        # Built without content first to calculate the metadata overhead
+        result = SearchResult(
+            document=document_id_to_citation_id[chunk.document_id],
+            title=chunk.semantic_identifier,
+            updated_at=chunk.updated_at.isoformat() if chunk.updated_at else None,
+            url=next(iter((chunk.source_links or {}).values()), None) or None,
+            content="",
+            metadata=json.dumps(chunk.metadata, ensure_ascii=False)
+            if chunk.metadata
+            else None,
+        )
 
         # Calculate remaining budget for content
-        remaining_budget = max_document_chars - total_chars - metadata_chars
-        content = section.combined_content
+        remaining_budget = (
+            max_document_chars - total_chars - _estimate_result_chars(result)
+        )
 
         # Check if we have enough budget for meaningful content
         if remaining_budget < MIN_CONTENT_CHARS:
@@ -383,50 +360,62 @@ def _convert_sections_to_llm_string_with_citations(
             break
 
         # Truncate content if it exceeds remaining budget
-        if len(content) > remaining_budget:
-            content = content[:remaining_budget]
-
-        result["content"] = content
-
-        result_chars = _estimate_result_chars(result)
+        result.content = section.combined_content[:remaining_budget]
+        total_chars += _estimate_result_chars(result)
         results.append(result)
-        total_chars += result_chars
 
-    output = {"results": results}
-    return json.dumps(output, indent=2, ensure_ascii=False), citation_mapping
+    return SearchResults(results=results).model_dump_json(), citation_mapping
 
 
-class OpenURLTool(Tool[OpenURLToolOverrideKwargs]):
+MAX_URLS_PER_CALL = 10
+
+
+class OpenURLTool(Tool):
+    merge_list_argument = "urls"
+    merge_list_limit = MAX_URLS_PER_CALL
+
     NAME = "open_url"
     DESCRIPTION = "Open and read the content of one or more URLs."
+    DESCRIPTION_NO_WEB_FETCH = (
+        "Open and read the content of one or more URLs. Web access is "
+        "disabled for this conversation, so only URLs whose content already "
+        "exists in the connected knowledge sources can be read — nothing is "
+        "fetched from the live internet."
+    )
     DISPLAY_NAME = "Open URL"
 
     def __init__(
         self,
         tool_id: int,
-        emitter: Emitter,
         document_index: DocumentIndex,
         user: User,
         content_provider: WebContentProvider | None = None,
+        web_fetch_disabled: bool = False,
     ) -> None:
         """Initialize the OpenURLTool.
 
         Args:
             tool_id: Unique identifier for this tool instance.
-            emitter: Emitter for streaming packets to the client.
             document_index: Index handle for retrieving stored documents.
             user: User context for ACL filtering, anonymous users only see public docs.
             content_provider: Optional content provider. If not provided,
                 will use the default provider from the database or fall back
                 to the built-in Onyx web crawler.
+            web_fetch_disabled: When True (e.g. the user turned Web Search off
+                for the chat), URLs are only served from indexed documents —
+                the live-crawl path is never used.
         """
-        super().__init__(emitter=emitter)
         self._id = tool_id
         self._document_index = document_index
         self._user = user
+        self._web_fetch_disabled = web_fetch_disabled
 
+        self._provider: WebContentProvider | None
         if content_provider is not None:
             self._provider = content_provider
+        elif web_fetch_disabled:
+            # Indexed-only mode never crawls, so no provider is needed.
+            self._provider = None
         else:
             provider = get_default_content_provider()
             if provider is None:
@@ -442,139 +431,56 @@ class OpenURLTool(Tool[OpenURLToolOverrideKwargs]):
         return self._id
 
     @property
+    def code_mode_exposure(self) -> CodeModeExposure:
+        return CodeModeExposure.IMMEDIATE
+
+    @property
     def name(self) -> str:
         return self.NAME
 
     @property
     def description(self) -> str:
+        if self._web_fetch_disabled:
+            return self.DESCRIPTION_NO_WEB_FETCH
         return self.DESCRIPTION
 
     @property
     def display_name(self) -> str:
         return self.DISPLAY_NAME
 
+    @property
+    def code_mode_result(self) -> CodeModeResultSpec:
+        return SEARCH_RESULTS_CODE_MODE_RESULT
+
     @override
     @classmethod
     def is_available(cls, db_session: Session) -> bool:  # noqa: ARG003
-        """OpenURLTool is available unless the vector DB is disabled.
+        """Always available via the web content provider / built-in crawler.
 
-        The tool uses id_based_retrieval to match URLs to indexed documents,
-        which requires a vector database. When DISABLE_VECTOR_DB is set, the
-        tool is disabled entirely.
+        Full deployments also try indexed retrieval (+ link-based fallback).
+        Lite (DISABLE_VECTOR_DB) is crawl-only.
         """
-        from onyx.configs.app_configs import DISABLE_VECTOR_DB
-
-        if DISABLE_VECTOR_DB:
-            return False
-
-        # The tool can use either a configured provider or the built-in crawler,
-        # so it's always available when the vector DB is present
         return True
 
-    def tool_definition(self) -> dict:
-        return {
-            "type": "function",
-            "function": {
-                "name": self.name,
-                "description": self.description,
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        URLS_FIELD: {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": (
-                                "List of URLs to open and read, can be a single URL or multiple URLs. "
-                                "This will return the text content of the page(s)."
-                            ),
-                        },
-                    },
-                    "required": [URLS_FIELD],
-                },
-            },
-        }
-
-    def emit_start(self, placement: Placement) -> None:
-        """Emit start packet to signal tool has started."""
-        self.emitter.emit(
-            Packet(
-                placement=placement,
-                obj=OpenUrlStart(),
-            )
+    def tool_definition(self) -> ToolDefinition:
+        return tool_definition_from_arguments(
+            self.name, self.description, OpenURLArguments, strict=True
         )
 
-    def run(
-        self,
-        placement: Placement,
-        override_kwargs: OpenURLToolOverrideKwargs,
-        **llm_kwargs: Any,
-    ) -> ToolResponse:
-        """Execute the open URL tool to fetch content from the specified URLs.
+    def _run(self, invocation: ToolInvocation, context: ToolContext) -> ToolResult:
+        urls = parse_tool_arguments(OpenURLArguments, invocation.arguments).urls
 
-        Args:
-            placement: The placement info (turn_index and tab_index) for this tool call.
-            override_kwargs: Override arguments including starting citation number
-                and existing citation_mapping to reuse citations for already-cited URLs.
-            **llm_kwargs: Arguments provided by the LLM, including the 'urls' field.
-
-        Returns:
-                ToolResponse containing the fetched content and citation mapping.
-        """
-        urls = _normalize_string_list(llm_kwargs.get(URLS_FIELD))
-
-        if len(urls) > override_kwargs.max_urls:
+        if len(urls) > MAX_URLS_PER_CALL:
             logger.warning(
                 "OpenURL tool received %s URLs, but the max is %s.",
                 len(urls),
-                override_kwargs.max_urls,
+                MAX_URLS_PER_CALL,
             )
-            urls = urls[: override_kwargs.max_urls]
-
-        if not urls:
-            raise ToolCallException(
-                message=f"Missing required '{URLS_FIELD}' parameter in open_url tool call",
-                llm_facing_message=(
-                    f"The open_url tool requires a '{URLS_FIELD}' parameter "
-                    f"containing an array of URLs. Please provide "
-                    f'like: {{"urls": ["https://example.com"]}}'
-                ),
-            )
-
-        self.emitter.emit(
-            Packet(
-                placement=placement,
-                obj=OpenUrlUrls(urls=urls),
-            )
-        )
+            urls = urls[:MAX_URLS_PER_CALL]
 
         with get_session_with_current_tenant() as db_session:
-            # Resolve URLs to document IDs for indexed retrieval
-            # Handles both raw URLs and already-normalized document IDs
-            url_requests, unresolved_urls = _resolve_urls_to_document_ids(
-                urls, db_session
-            )
-
-            all_requests = _dedupe_document_requests(url_requests)
-
-            # Create mapping from URL to document_id for result merging
             url_to_doc_id: dict[str, str] = {}
-            for request in url_requests:
-                if request.original_url:
-                    url_to_doc_id[request.original_url] = request.document_id
-
-            # Build filters before parallel execution (session-safe)
-            filters = self._build_index_filters(db_session)
-
-            # Create wrapper function for parallel execution
-            # Filters are already built, so we just need to pass them
-            def _retrieve_indexed_with_filters(
-                requests: list[IndexedDocumentRequest],
-            ) -> IndexedRetrievalResult:
-                """Wrapper for parallel execution with pre-built filters."""
-                return self._retrieve_indexed_documents_with_filters(requests, filters)
-
-            # Track if timeout occurred for error reporting
-            timeout_occurred = [False]  # Using list for mutability in closure
+            timeout_occurred = [False]
 
             def _timeout_handler(
                 index: int,  # noqa: ARG001
@@ -584,49 +490,120 @@ class OpenURLTool(Tool[OpenURLToolOverrideKwargs]):
                 timeout_occurred[0] = True
                 return None
 
-            # Run indexed retrieval and crawling in parallel for all URLs
-            # This allows us to compare results and pick the best representation
-            # Note: allow_failures=True ensures we get partial results even if one
-            # task times out or fails - the other task's results will still be used
-            indexed_result, crawled_result = run_functions_tuples_in_parallel(
-                [
-                    (_retrieve_indexed_with_filters, (all_requests,)),
-                    (self._fetch_web_content, (urls, override_kwargs.url_snippet_map)),
-                ],
-                allow_failures=True,
-                timeout=OPEN_URL_TIMEOUT_SECONDS,
-                timeout_callback=_timeout_handler,
-            )
+            if DISABLE_VECTOR_DB:
+                if self._web_fetch_disabled:
+                    # No index to serve from and crawling is off — nothing to do.
+                    # (construct_tools normally drops the tool in this config;
+                    # this is a defensive fallback.)
+                    return ToolResult(content=WEB_FETCH_DISABLED_REASON, is_error=True)
+                # Crawl-only: no indexed retrieval / link-based fallback without a vector DB.
+                crawled_result = run_functions_tuples_in_parallel(
+                    [
+                        (
+                            self._fetch_web_content,
+                            (urls, context.url_snippet_map),
+                        )
+                    ],
+                    allow_failures=True,
+                    timeout=OPEN_URL_TIMEOUT_SECONDS,
+                    timeout_callback=_timeout_handler,
+                )[0]
+                indexed_result = IndexedRetrievalResult(
+                    sections=[], missing_document_ids=[]
+                )
+                crawled_sections, failed_web_fetches = crawled_result or ([], [])
 
-            indexed_result = indexed_result or IndexedRetrievalResult(
-                sections=[], missing_document_ids=[]
-            )
-            crawled_sections, failed_web_fetches = crawled_result or ([], [])
-
-            # If timeout occurred and we have no successful results from either path,
-            # return a timeout-specific error message
-            if (
-                timeout_occurred[0]
-                and not indexed_result.sections
-                and not crawled_sections
-            ):
-                return ToolResponse(
-                    rich_response=None,
-                    llm_facing_response="The call to open_url timed out",
+                if (
+                    timeout_occurred[0]
+                    and not indexed_result.sections
+                    and not crawled_sections
+                ):
+                    return ToolResult(
+                        content="The call to open_url timed out", is_error=True
+                    )
+            else:
+                url_requests, unresolved_urls = _resolve_urls_to_document_ids(
+                    urls, db_session
                 )
 
-            # Last-resort: attempt link-based lookup for URLs that failed both
-            # document-ID resolution and crawling.
-            failed_web_fetches = self._fallback_link_lookup(
-                unresolved_urls=unresolved_urls,
-                failed_web_fetches=failed_web_fetches,
-                db_session=db_session,
-                indexed_result=indexed_result,
-                url_to_doc_id=url_to_doc_id,
-                filters=filters,
-            )
+                all_requests = _dedupe_document_requests(url_requests)
 
-            # Merge results: prefer indexed when available, fallback to crawled
+                for request in url_requests:
+                    if request.original_url:
+                        url_to_doc_id[request.original_url] = request.document_id
+
+                # Build filters before parallel execution (session-safe)
+                filters = self._build_index_filters(db_session)
+
+                def _retrieve_indexed_with_filters(
+                    requests: list[IndexedDocumentRequest],
+                ) -> IndexedRetrievalResult:
+                    return self._retrieve_indexed_documents_with_filters(
+                        requests, filters
+                    )
+
+                if self._web_fetch_disabled:
+                    # Indexed-only: never crawl. Unresolved URLs are seeded as
+                    # failed (with the disabled reason) so the link-based
+                    # fallback below still gets a chance to serve them from the
+                    # index; whatever it can't rescue is reported as
+                    # unavailable rather than silently fetched from the web.
+                    indexed_result = run_functions_tuples_in_parallel(
+                        [(_retrieve_indexed_with_filters, (all_requests,))],
+                        allow_failures=True,
+                        timeout=OPEN_URL_TIMEOUT_SECONDS,
+                        timeout_callback=_timeout_handler,
+                    )[0]
+                    crawled_result = (
+                        [],
+                        [
+                            FailedFetch(
+                                url=url, failure_reason=WEB_FETCH_DISABLED_REASON
+                            )
+                            for url in unresolved_urls
+                        ],
+                    )
+                else:
+                    # Indexed + crawl in parallel; allow_failures keeps partial results.
+                    indexed_result, crawled_result = run_functions_tuples_in_parallel(
+                        [
+                            (_retrieve_indexed_with_filters, (all_requests,)),
+                            (
+                                self._fetch_web_content,
+                                (urls, context.url_snippet_map),
+                            ),
+                        ],
+                        allow_failures=True,
+                        timeout=OPEN_URL_TIMEOUT_SECONDS,
+                        timeout_callback=_timeout_handler,
+                    )
+
+                indexed_result = indexed_result or IndexedRetrievalResult(
+                    sections=[], missing_document_ids=[]
+                )
+                crawled_sections, failed_web_fetches = crawled_result or ([], [])
+
+                # Before link-based fallback (retries index retrieval with no timeout).
+                if (
+                    timeout_occurred[0]
+                    and not indexed_result.sections
+                    and not crawled_sections
+                ):
+                    return ToolResult(
+                        content="The call to open_url timed out", is_error=True
+                    )
+
+                # Last-resort: link-based lookup when doc-ID resolve + crawl both fail.
+                failed_web_fetches = self._fallback_link_lookup(
+                    unresolved_urls=unresolved_urls,
+                    failed_web_fetches=failed_web_fetches,
+                    db_session=db_session,
+                    indexed_result=indexed_result,
+                    url_to_doc_id=url_to_doc_id,
+                    filters=filters,
+                )
+
+            # Prefer indexed when available, else crawled
             inference_sections = self._merge_indexed_and_crawled_results(
                 indexed_result.sections,
                 crawled_sections,
@@ -641,7 +618,7 @@ class OpenURLTool(Tool[OpenURLToolOverrideKwargs]):
                 failed_web_fetches=failed_web_fetches,
             )
             logger.warning("OpenURL tool failed: %s", failure_msg)
-            return ToolResponse(rich_response=None, llm_facing_response=failure_msg)
+            return ToolResult(content=failure_msg, is_error=True)
 
         for section in inference_sections:
             chunk = section.center_chunk
@@ -652,11 +629,9 @@ class OpenURLTool(Tool[OpenURLToolOverrideKwargs]):
         search_docs = convert_inference_sections_to_search_docs(
             inference_sections, is_internet=False
         )
-
-        self.emitter.emit(
-            Packet(
-                placement=placement,
-                obj=OpenUrlDocuments(documents=search_docs),
+        invocation.update(
+            ToolProgress(
+                details=SearchDocsResponse(search_docs=search_docs, citation_mapping={})
             )
         )
 
@@ -665,16 +640,19 @@ class OpenURLTool(Tool[OpenURLToolOverrideKwargs]):
         # occasions only actually sees a subset.
         docs_str, citation_mapping = _convert_sections_to_llm_string_with_citations(
             sections=inference_sections,
-            existing_citation_mapping=override_kwargs.citation_mapping,
-            citation_start=override_kwargs.starting_citation_num,
+            existing_citation_mapping={
+                url: number for number, url in context.citation_mapping.items()
+            },
+            citation_start=context.next_citation_num
+            + CITATIONS_PER_TOOL_CALL * invocation.call_index,
         )
 
-        return ToolResponse(
-            rich_response=SearchDocsResponse(
+        return ToolResult(
+            details=SearchDocsResponse(
                 search_docs=search_docs,
                 citation_mapping=citation_mapping,
             ),
-            llm_facing_response=docs_str,
+            content=docs_str,
         )
 
     def _fallback_link_lookup(
@@ -748,10 +726,13 @@ class OpenURLTool(Tool[OpenURLToolOverrideKwargs]):
         ]
 
         try:
-            chunks = self._document_index.id_based_retrieval(
-                chunk_requests=chunk_requests,
-                filters=filters,
-                batch_retrieval=True,
+            chunks = censor_chunks_for_user(
+                self._document_index.id_based_retrieval(
+                    chunk_requests=chunk_requests,
+                    filters=filters,
+                    batch_retrieval=True,
+                ),
+                self._user,
             )
         except Exception as exc:
             logger.warning(
@@ -790,13 +771,13 @@ class OpenURLTool(Tool[OpenURLToolOverrideKwargs]):
         return IndexedRetrievalResult(sections=sections, missing_document_ids=missing)
 
     def _build_index_filters(self, db_session: Session) -> IndexFilters:
-        access_control_list = build_access_filters_for_user(self._user, db_session)
+        user_access_filters = build_access_filters_for_user(self._user, db_session)
         return IndexFilters(
             source_type=None,
             document_set=None,
-            time_cutoff=None,
             tags=None,
-            access_control_list=access_control_list,
+            access_control_list=user_access_filters.access_control_list,
+            cc_pair_access=user_access_filters.cc_pair_access,
             tenant_id=get_current_tenant_id() if MULTI_TENANT else None,
             project_id_filter=None,
         )
@@ -864,6 +845,13 @@ class OpenURLTool(Tool[OpenURLToolOverrideKwargs]):
     ) -> tuple[list[InferenceSection], list[FailedFetch]]:
         if not urls:
             return [], []
+
+        if self._provider is None:
+            # Only possible in web-fetch-disabled mode, which never routes here.
+            return [], [
+                FailedFetch(url=url, failure_reason=WEB_FETCH_DISABLED_REASON)
+                for url in urls
+            ]
 
         raw_web_contents = self._provider.contents(urls)
         # Track per-URL failure reasons (preferred) but de-dupe by URL since the

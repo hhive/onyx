@@ -14,26 +14,27 @@ can key on ``riskAnalysis.reasons`` rather than a raw 0-1 score.
 the OAuth cookie.
 """
 
+import asyncio
 import hashlib
 import hmac
 import time
-from datetime import datetime
-from datetime import timezone
+from datetime import datetime, timezone
 from enum import StrEnum
 
 import httpx
-from pydantic import BaseModel
-from pydantic import Field
+from pydantic import BaseModel, Field
 
-from onyx.configs.app_configs import CAPTCHA_COOKIE_TTL_SECONDS
-from onyx.configs.app_configs import CAPTCHA_ENABLED
-from onyx.configs.app_configs import RECAPTCHA_ENTERPRISE_API_KEY
-from onyx.configs.app_configs import RECAPTCHA_ENTERPRISE_PROJECT_ID
-from onyx.configs.app_configs import RECAPTCHA_HOSTNAME_ALLOWLIST
-from onyx.configs.app_configs import RECAPTCHA_SCORE_THRESHOLD
-from onyx.configs.app_configs import RECAPTCHA_SITE_KEY
-from onyx.configs.app_configs import USER_AUTH_SECRET
-from onyx.redis.redis_pool import get_async_redis_connection
+from onyx.cache.factory import get_shared_cache_backend
+from onyx.configs.app_configs import (
+    CAPTCHA_COOKIE_TTL_SECONDS,
+    CAPTCHA_ENABLED,
+    RECAPTCHA_ENTERPRISE_API_KEY,
+    RECAPTCHA_ENTERPRISE_PROJECT_ID,
+    RECAPTCHA_HOSTNAME_ALLOWLIST,
+    RECAPTCHA_SCORE_THRESHOLD,
+    RECAPTCHA_SITE_KEY,
+    USER_AUTH_SECRET,
+)
 from onyx.utils.logger import setup_logger
 
 logger = setup_logger()
@@ -113,16 +114,15 @@ def _replay_cache_key(token: str) -> str:
 
 
 async def _reserve_token_or_raise(token: str) -> None:
-    """Claim a token fingerprint via ``SETNX``. A concurrent replay within
-    the TTL returns False → raise. Redis errors fail open so a blip does
+    """Claim a token fingerprint with set-if-absent. A concurrent replay within
+    the TTL returns False → raise. Cache errors fail open so a blip does
     not block legitimate signups."""
     try:
-        redis = await get_async_redis_connection()
-        claimed = await redis.set(
+        claimed = await asyncio.to_thread(
+            get_shared_cache_backend().set_if_absent,
             _replay_cache_key(token),
             "1",
-            nx=True,
-            ex=_REPLAY_CACHE_TTL_SECONDS,
+            _REPLAY_CACHE_TTL_SECONDS,
         )
         if not claimed:
             logger.warning("Captcha replay detected: token already used")
@@ -140,8 +140,9 @@ async def _release_token(token: str) -> None:
     not Google's. Google-rejected tokens stay claimed — they are dead for
     their whole TTL regardless."""
     try:
-        redis = await get_async_redis_connection()
-        await redis.delete(_replay_cache_key(token))
+        await asyncio.to_thread(
+            get_shared_cache_backend().delete, _replay_cache_key(token)
+        )
     except Exception as e:
         logger.error("Captcha replay cache release error (ignored): %s", e)
 
@@ -152,7 +153,7 @@ def _check_token_freshness(create_time: str | None) -> None:
             "Captcha verification failed: missing createTime"
         )
     try:
-        ts = datetime.fromisoformat(create_time.replace("Z", "+00:00"))
+        ts = datetime.fromisoformat(create_time)
     except ValueError:
         logger.warning("Captcha createTime unparseable: %r", create_time)
         raise CaptchaVerificationError(

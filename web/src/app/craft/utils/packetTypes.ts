@@ -1,19 +1,14 @@
 /**
  * Packet Types
  *
- * Type definitions for raw and parsed ACP packets.
+ * Type definitions for raw and parsed sandbox event packets.
  * Centralizes all snake_case / camelCase field resolution.
  * Defines the ParsedPacket discriminated union consumed by both
  * useBuildStreaming (live SSE) and useBuildSessionStore (DB reload).
  */
 
-import type { TodoItem } from "../types/displayTypes";
-
-// Re-export from displayTypes — single source of truth
-export type {
-  ToolCallKind as ToolKind,
-  ToolCallStatus as ToolStatus,
-} from "../types/displayTypes";
+import type { TodoItem } from "@/app/craft/types/displayTypes";
+import type { CompletedInteractiveTurn } from "@/app/craft/types/streamingTypes";
 
 // ─── Raw Packet Field Access ─────────────────────────────────────────
 // Every backend field name variant is listed ONCE here.
@@ -42,6 +37,15 @@ export function getToolNameRaw(p: Record<string, unknown>): string {
   const explicit = (p.tool_name ?? p.toolName ?? "") as string;
   if (explicit) return explicit.toLowerCase();
 
+  // ACP _meta is the extensibility slot. The opencode-serve translator
+  // stuffs the raw opencode tool name in here (since ACP's strict pydantic
+  // schema drops unknown top-level fields).
+  const meta = p._meta as Record<string, unknown> | undefined;
+  if (meta && typeof meta === "object") {
+    const fromMeta = (meta.toolName ?? meta.tool_name ?? "") as string;
+    if (fromMeta) return fromMeta.toLowerCase();
+  }
+
   // Fall back to title only if it looks like a simple tool name
   // (no spaces or newlines — otherwise it's a human-readable description)
   const title = (p.title ?? "") as string;
@@ -65,16 +69,38 @@ export type ToolName =
   | "todowrite"
   | "webfetch"
   | "websearch"
+  // opencode 1.15.x additions:
+  | "lsp"
+  | "apply_patch"
+  | "skill"
+  | "list"
+  | "question"
+  | "invalid"
   | "unknown";
+
+export interface TextPartUpdate {
+  partId: string;
+  snapshotText?: string;
+}
 
 export interface ParsedTextChunk {
   type: "text_chunk";
   text: string;
+  part?: TextPartUpdate;
+  /** Opencode session this event was emitted on — child's id for subagent child events, else null. */
+  sessionId: string | null;
+  /** Non-null only for subagent child events — the parent opencode session. */
+  parentSessionId: string | null;
 }
 
 export interface ParsedThinkingChunk {
   type: "thinking_chunk";
   text: string;
+  part?: TextPartUpdate;
+  /** Opencode session this event was emitted on — child's id for subagent child events, else null. */
+  sessionId: string | null;
+  /** Non-null only for subagent child events — the parent opencode session. */
+  parentSessionId: string | null;
 }
 
 export interface ParsedToolCallStart {
@@ -83,6 +109,21 @@ export interface ParsedToolCallStart {
   toolName: ToolName;
   kind: import("../types/displayTypes").ToolCallKind;
   isTodo: boolean;
+  /** Best-effort title resolved from toolName/kind, shown until progress arrives. */
+  title: string;
+  /** Display description resolved from rawInput, used before progress arrives. */
+  description: string;
+  /** Command or task prompt resolved from rawInput, used before progress arrives. */
+  command: string;
+  skillName: string | null;
+  /** For task tool calls: the subagent type, when provided. */
+  subagentType: string | null;
+  /** Opencode session this event was emitted on — child's id for subagent child events, else null. */
+  sessionId: string | null;
+  /** Non-null only for subagent child events — the parent opencode session. */
+  parentSessionId: string | null;
+  /** On a parent `task` event, the child session it spawned; else null. */
+  subagentSessionId: string | null;
 }
 
 export interface ParsedToolCallProgress {
@@ -99,6 +140,7 @@ export interface ParsedToolCallProgress {
   rawOutput: string;
   filePath: string; // Session-relative
   subagentType: string | null;
+  skillName: string | null;
   // Edit-specific
   isNewFile: boolean;
   oldContent: string;
@@ -107,10 +149,21 @@ export interface ParsedToolCallProgress {
   todos: TodoItem[];
   // Task-specific
   taskOutput: string | null;
+  /** Opencode session this event was emitted on — child's id for subagent child events, else null. */
+  sessionId: string | null;
+  /** Non-null only for subagent child events — the parent opencode session. */
+  parentSessionId: string | null;
+  /** On a parent `task` event, the child session it spawned; else null. */
+  subagentSessionId: string | null;
 }
 
 export interface ParsedPromptResponse {
   type: "prompt_response";
+}
+
+export interface ParsedTurnCompleted {
+  type: "turn_completed";
+  turn: CompletedInteractiveTurn;
 }
 
 export interface ParsedArtifact {
@@ -135,6 +188,29 @@ export interface ParsedApprovalRequested {
   sessionId: string;
 }
 
+export interface ParsedSubagentStarted {
+  type: "subagent_started";
+  subagentSessionId: string;
+  parentSessionId: string | null;
+}
+
+export interface ParsedConnectAppRequest {
+  type: "connect_app_request";
+  requestId: string;
+  externalAppId: number;
+  reason: string | null;
+}
+
+export interface ParsedContextUsage {
+  type: "context_usage";
+  usedTokens: number;
+}
+
+export interface ParsedCompaction {
+  type: "compaction";
+  summary: string | null;
+}
+
 export interface ParsedUnknown {
   type: "unknown";
 }
@@ -145,7 +221,12 @@ export type ParsedPacket =
   | ParsedToolCallStart
   | ParsedToolCallProgress
   | ParsedPromptResponse
+  | ParsedTurnCompleted
   | ParsedArtifact
   | ParsedApprovalRequested
+  | ParsedSubagentStarted
+  | ParsedConnectAppRequest
+  | ParsedContextUsage
+  | ParsedCompaction
   | ParsedError
   | ParsedUnknown;

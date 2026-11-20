@@ -51,8 +51,7 @@ of the connector is stored in the credential/token, then there may be no require
 `load_credentials` should take a dictionary which provides all the access information that the connector might need.
 For example this could be the user's username and access token.
 
-Refer to the existing connectors for `load_from_state` and `poll_source` examples. There is not yet a process to listen
-for EventConnector events, this will come down the line.
+Refer to the existing connectors for `load_from_state` and `poll_source` examples.
 
 #### Development Tip
 
@@ -76,6 +75,29 @@ if __name__ == "__main__":
 
 > Note: Be sure to set PYTHONPATH to onyx/backend before running the above main.
 
+#### Supporting "Include Attachments"
+
+If the source has attachments (files attached to pages, tickets, etc.), let admins opt out of
+indexing them by following the shared convention:
+
+- Accept an `include_attachments: bool` kwarg in the connector's `__init__`. The value flows in
+  automatically from `connector_specific_config`; no factory or API changes are needed.
+  - New connectors should default it to `False`.
+  - When retrofitting a connector that already indexes attachments unconditionally, default it to
+    `True` — existing connector rows have no `include_attachments` key stored, so the constructor
+    default is what they get and their behavior must not change.
+- Gate **every** attachment enumeration path on the flag: the main indexing pass **and** the
+  slim-doc pass (pruning / permission sync) if the connector has one. The slim pass must admit
+  exactly the same documents as the main pass — emitting attachment slim docs the main pass
+  skipped leaves permanent `chunk_count IS NULL` rows, while correctly omitting them lets pruning
+  clean up previously indexed attachments after an admin turns the setting off.
+- In the frontend form, add `buildIncludeAttachmentsOption(<default>)` from
+  `web/src/lib/connectors/connectors.tsx` to the connector's `connectorConfigs` entry (use the
+  same default as the backend), and add `include_attachments?: boolean` to the connector's config
+  interface in that file.
+
+`ConfluenceConnector` and `DrupalWikiConnector` are reference implementations.
+
 ### Additional Required Changes:
 
 #### Backend Changes
@@ -87,13 +109,14 @@ if __name__ == "__main__":
 
 #### Frontend Changes
 
-- Add the new Connector definition to the `SOURCE_METADATA_MAP` [here](https://github.com/onyx-dot-app/onyx/blob/main/web/src/lib/sources.ts#L59).
+- Add the new Connector definition to the `SOURCE_METADATA_MAP` in [`web/src/lib/connectors/constants.ts`](https://github.com/onyx-dot-app/onyx/blob/main/web/src/lib/connectors/constants.ts).
 - Add the definition for the new Form to the `connectorConfigs` object [here](https://github.com/onyx-dot-app/onyx/blob/main/web/src/lib/connectors/connectors.ts#L79).
 
 #### Docs Changes
 
 Create the new connector page (with guiding images!) with how to get the connector credentials and how to set up the
-connector in Onyx. Then create a Pull Request in [https://github.com/onyx-dot-app/documentation](https://github.com/onyx-dot-app/documentation).
+connector in Onyx. Add it under `documentation/admins/connectors/official/` in the same PR as the connector, list it in
+`documentation/docs.json`, and map its logo in `documentation/scripts/generated_assets.json`. See `documentation/AGENTS.md`.
 
 ### Before opening PR
 

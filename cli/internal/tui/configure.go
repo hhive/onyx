@@ -5,10 +5,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/bubbles/spinner"
-	"github.com/charmbracelet/bubbles/textinput"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/bubbles/v2/spinner"
+	"charm.land/bubbles/v2/textinput"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/onyx-dot-app/onyx/cli/internal/api"
 	"github.com/onyx-dot-app/onyx/cli/internal/config"
 )
@@ -16,7 +16,7 @@ import (
 type startMode int
 
 const (
-	startNormal   startMode = iota
+	startNormal startMode = iota
 	startFirstRun
 )
 
@@ -39,6 +39,10 @@ type configState struct {
 }
 
 func enterConfigureMode(m Model) (Model, tea.Cmd) {
+	if RemoteMode {
+		m.viewport.addWarning("/configure is disabled over SSH: it would change the server host's config.")
+		return m, nil
+	}
 	if m.isStreaming {
 		m.viewport.addWarning("Cannot configure while streaming. Press Esc to cancel generation first.")
 		return m, nil

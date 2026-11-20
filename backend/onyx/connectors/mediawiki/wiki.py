@@ -3,27 +3,24 @@ from __future__ import annotations
 import datetime
 import itertools
 import tempfile
+import time
 from collections.abc import Iterator
-from typing import Any
-from typing import cast
-from typing import ClassVar
+from typing import Any, ClassVar, cast
 
 import pywikibot.config
 import pywikibot.time
-from pywikibot import pagegenerators
-from pywikibot import textlib
+from pywikibot import pagegenerators, textlib
 
 from onyx.configs.app_configs import INDEX_BATCH_SIZE
 from onyx.configs.constants import DocumentSource
-from onyx.connectors.interfaces import GenerateDocumentsOutput
-from onyx.connectors.interfaces import LoadConnector
-from onyx.connectors.interfaces import PollConnector
-from onyx.connectors.interfaces import SecondsSinceUnixEpoch
+from onyx.connectors.interfaces import (
+    GenerateDocumentsOutput,
+    LoadConnector,
+    PollConnector,
+    SecondsSinceUnixEpoch,
+)
 from onyx.connectors.mediawiki.family import family_class_dispatch
-from onyx.connectors.models import Document
-from onyx.connectors.models import HierarchyNode
-from onyx.connectors.models import ImageSection
-from onyx.connectors.models import TextSection
+from onyx.connectors.models import Document, HierarchyNode, ImageSection, TextSection
 from onyx.utils.logger import setup_logger
 
 logger = setup_logger()
@@ -184,10 +181,19 @@ class MediaWikiConnector(LoadConnector, PollConnector):
                     pagegenerators.CategorizedPageGenerator(
                         category, recurse=self.recurse_depth
                     ),
+                    # Pywikibot compares against naive UTC revision timestamps.
                     last_edit_start=(
-                        datetime.datetime.fromtimestamp(start) if start else None
+                        datetime.datetime.fromtimestamp(start, tz=datetime.UTC).replace(
+                            tzinfo=None
+                        )
+                        if start
+                        else None
                     ),
-                    last_edit_end=datetime.datetime.fromtimestamp(end) if end else None,
+                    last_edit_end=datetime.datetime.fromtimestamp(
+                        end, tz=datetime.UTC
+                    ).replace(tzinfo=None)
+                    if end
+                    else None,
                 ),
                 groupsize=self.batch_size,
             )
@@ -245,7 +251,7 @@ if __name__ == "__main__":
 
     all_docs = list(test_connector.load_from_state())
     print("All docs", all_docs)
-    current = datetime.datetime.now().timestamp()
+    current = time.time()
     one_day_ago = current - 30 * 24 * 60 * 60  # 30 days
 
     latest_docs = list(test_connector.poll_source(one_day_ago, current))

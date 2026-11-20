@@ -2,7 +2,6 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from onyx.connectors.google_utils.resources import GoogleDocsService
 from onyx.connectors.models import TextSection
 
 HEADING_DELIMITER = "\n"
@@ -79,27 +78,8 @@ def _extract_text_from_table(table: dict[str, Any]) -> str:
     return "\n".join(row_strs)
 
 
-def get_document_sections(
-    docs_service: GoogleDocsService,
-    doc_id: str,
-) -> list[TextSection]:
-    """Extracts sections from a Google Doc, including their headings and content"""
-    # Fetch the document structure
-    http_request = docs_service.documents().get(  # ty: ignore[unresolved-attribute]
-        documentId=doc_id
-    )
-
-    # Google has poor support for tabs in the docs api, see
-    # https://cloud.google.com/python/docs/reference/cloudtasks/
-    # latest/google.cloud.tasks_v2.types.HttpRequest
-    # https://developers.google.com/workspace/docs/api/how-tos/tabs
-    # https://developers.google.com/workspace/docs/api/reference/rest/v1/documents/get
-    # this is a hack to use the param mentioned in the rest api docs
-    # TODO: check if it can be specified i.e. in documents()
-    http_request.uri += "&includeTabsContent=true"
-    doc = http_request.execute()
-
-    # Get the content
+def get_document_sections(doc: dict[str, Any], doc_id: str) -> list[TextSection]:
+    """Extract heading-aware sections from a Docs API document."""
     tabs = doc.get("tabs", {})
     sections: list[TextSection] = []
     for tab in tabs:

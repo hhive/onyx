@@ -1,7 +1,7 @@
-import { buildLlmOptions, groupLlmOptions } from "./LLMPopover";
-import { LLMOption } from "./interfaces";
+import { buildLlmOptions, groupLlmOptions } from "@/lib/languageModels/options";
 import { LLMProviderDescriptor } from "@/lib/languageModels/types";
 import { makeProvider } from "@tests/setup/llmProviderTestUtils";
+import type { LLMOption } from "@/lib/languageModels/types";
 
 describe("LLMPopover helpers", () => {
   test("deduplicates identical provider+model combinations across provider entries", () => {
@@ -16,6 +16,7 @@ describe("LLMPopover helpers", () => {
             max_input_tokens: null,
             supports_image_input: false,
             supports_reasoning: false,
+            effectiveDisplayName: "shared-model",
           },
         ],
       }),
@@ -29,6 +30,7 @@ describe("LLMPopover helpers", () => {
             max_input_tokens: null,
             supports_image_input: false,
             supports_reasoning: false,
+            effectiveDisplayName: "shared-model",
           },
         ],
       }),
@@ -42,6 +44,7 @@ describe("LLMPopover helpers", () => {
             max_input_tokens: null,
             supports_image_input: false,
             supports_reasoning: false,
+            effectiveDisplayName: "shared-model",
           },
         ],
       }),
@@ -71,6 +74,7 @@ describe("LLMPopover helpers", () => {
             max_input_tokens: null,
             supports_image_input: false,
             supports_reasoning: false,
+            effectiveDisplayName: "shared-model",
           },
         ],
       }),
@@ -88,14 +92,14 @@ describe("LLMPopover helpers", () => {
         providerDisplayName: "Amazon Bedrock",
         modelName: "claude-3-5-sonnet",
         displayName: "Claude 3.5 Sonnet",
-        vendor: "anthropic",
+        vendor: "Anthropic",
       },
       {
         name: "OpenAI Provider",
         provider: "openai",
         providerDisplayName: "ChatGPT (OpenAI)",
-        modelName: "gpt-4o-mini",
-        displayName: "GPT-4o Mini",
+        modelName: "gpt-6-luna",
+        displayName: "GPT-6 Luna",
         vendor: null,
       },
     ];
@@ -103,8 +107,8 @@ describe("LLMPopover helpers", () => {
     const grouped = groupLlmOptions(options);
 
     expect(grouped.map((group) => group.key)).toEqual([
-      "bedrock/anthropic",
-      "openai",
+      "bedrock provider/anthropic",
+      "openai provider",
     ]);
     expect(grouped[0]?.displayName).toBe("Amazon Bedrock/Anthropic");
     expect(grouped[1]?.displayName).toBe("ChatGPT (OpenAI)");

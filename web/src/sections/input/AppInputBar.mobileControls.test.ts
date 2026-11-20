@@ -9,10 +9,11 @@ describe("AppInputBar mobile controls layout", () => {
     );
 
     expect(source).toContain(
-      '"flex justify-between items-center w-full min-w-0 gap-1 overflow-hidden"'
+      '"relative flex justify-between items-center w-full min-w-0 gap-1"'
     );
-    expect(source).toContain('"flex min-w-0 flex-1 flex-row items-center"');
-    expect(source).toContain('"flex min-w-0 flex-row items-center overflow-hidden"');
+    expect(source).toContain(
+      '"flex min-w-0 flex-1 flex-row items-center overflow-hidden"'
+    );
     expect(source).toContain('"flex shrink-0 flex-row items-center gap-1"');
   });
 
@@ -23,6 +24,8 @@ describe("AppInputBar mobile controls layout", () => {
     );
 
     expect(source).toContain('"flex flex-row items-center w-full min-w-0"');
-    expect(source).toContain('"px-3 py-2 flex-1 min-w-0 flex h-[2.75rem]"');
+    expect(source).toContain(
+      '"px-3 py-2 flex-1 min-w-0 flex h-11 overflow-hidden"'
+    );
   });
 });

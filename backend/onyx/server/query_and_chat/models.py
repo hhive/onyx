@@ -1,29 +1,44 @@
 from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel
-from pydantic import model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    field_validator,
+    model_validator,
+)
 
-from onyx.configs.constants import DocumentSource
-from onyx.configs.constants import MessageType
-from onyx.configs.constants import SessionType
-from onyx.context.search.models import BaseFilters
-from onyx.context.search.models import SavedSearchDoc
-from onyx.context.search.models import SearchDoc
-from onyx.context.search.models import Tag
-from onyx.db.enums import ChatSessionSharedStatus
+from onyx.agents.models import MessageDelivery, RunStatus
+from onyx.chat.mention_models import Mentions, RecordedMention
+from onyx.configs.constants import DocumentSource, MessageType, SessionType
+from onyx.context.search.models import BaseFilters, SavedSearchDoc, SearchDoc, Tag
+from onyx.db.enums import (
+    ApprovalDecidedVia,
+    ApprovalDecision,
+    ChatSessionSharedStatus,
+)
 from onyx.db.models import ChatSession
 from onyx.file_store.models import FileDescriptor
+from onyx.llm.interfaces import LLM
+from onyx.llm.models import GenerationRequestParams
 from onyx.llm.override_models import LLMOverride
-from onyx.server.query_and_chat.streaming_models import Packet
+from onyx.server.features.action_policies.models import DecisionBody
+from onyx.server.query_and_chat.streaming_models import Packet, StreamingError
+from onyx.server.sub2api.models import Sub2APISelection
+from onyx.tools.models import ToolOptions
+from onyx.tools.tool_implementations.question.models import ToolQuestionAnswer
+from onyx.utils.postgres_sanitization import sanitize_string
 
 AUTO_PLACE_AFTER_LATEST_MESSAGE = -1
 
 
 class MessageOrigin(str, Enum):
-    """Origin of a chat message for telemetry tracking."""
+    """Origin of a chat message, for telemetry. The Slack and Discord bot
+    origins also keep the sandbox tools out of the turn."""
 
     WEBAPP = "webapp"
     CHROME_EXTENSION = "chrome_extension"
@@ -31,6 +46,7 @@ class MessageOrigin(str, Enum):
     SLACKBOT = "slackbot"
     WIDGET = "widget"
     DISCORDBOT = "discordbot"
+    MOBILE = "mobile"
     UNKNOWN = "unknown"
     UNSET = "unset"
 
@@ -38,6 +54,8 @@ class MessageOrigin(str, Enum):
 class MessageResponseIDInfo(BaseModel):
     user_message_id: int | None
     reserved_assistant_message_id: int
+    # What the question tagged, as its turn accepted it.
+    mentions: list[RecordedMention]
 
 
 class ModelResponseSlot(BaseModel):
@@ -53,6 +71,26 @@ class MultiModelMessageResponseIDInfo(BaseModel):
 
     user_message_id: int | None
     responses: list[ModelResponseSlot]
+    mentions: list[RecordedMention]
+
+
+def response_id_info(
+    user_message_id: int | None,
+    responses: list[ModelResponseSlot],
+    mentions: list[RecordedMention],
+) -> "MessageResponseIDInfo | MultiModelMessageResponseIDInfo":
+    """The packet that names a turn's saved question and reserved responses."""
+    if len(responses) > 1:
+        return MultiModelMessageResponseIDInfo(
+            user_message_id=user_message_id,
+            responses=responses,
+            mentions=mentions,
+        )
+    return MessageResponseIDInfo(
+        user_message_id=user_message_id,
+        reserved_assistant_message_id=responses[0].message_id,
+        mentions=mentions,
+    )
 
 
 class SourceTag(Tag):
@@ -74,11 +112,22 @@ class UpdateChatSessionTemperatureRequest(BaseModel):
     temperature_override: float
 
 
+class UpdateChatSessionReasoningRequest(BaseModel):
+    chat_session_id: UUID
+    reasoning_effort_override: str | None = None
+
+
 class ChatSessionCreationRequest(BaseModel):
     # If not specified, use Onyx default persona
     persona_id: int = 0
     description: str | None = None
     project_id: int | None = None
+    # Start the session incognito. Refused with an error when incognito is
+    # unavailable, never silently downgraded to an ordinary chat.
+    incognito: bool = False
+    # The id the client already used when uploading, so this session owns those
+    # files. Ignored unless incognito.
+    incognito_session_id: UUID | None = None
 
 
 class ChatFeedbackRequest(BaseModel):
@@ -99,19 +148,30 @@ class ChatFeedbackRequest(BaseModel):
 class SendMessageRequest(BaseModel):
     message: str
 
+    sub2api_selection: Sub2APISelection | None = None
+    _sub2api_llm: LLM | None = PrivateAttr(default=None)
+
     llm_override: LLMOverride | None = None
     # For multi-model mode: up to 3 LLM overrides to run in parallel.
     # When provided with >1 entry, triggers multi-model streaming.
     llm_overrides: list[LLMOverride] | None = None
-    # Test-only override for deterministic LiteLLM mock responses.
-    mock_llm_response: str | None = None
 
-    allowed_tool_ids: list[int] | None = None
-    forced_tool_id: int | None = None
+    # The tools, plugins and search filters for this turn; None uses each
+    # tool and plugin of the agent.
+    tool_options: ToolOptions | None = None
 
     file_descriptors: list[FileDescriptor] = []
 
-    internal_search_filters: BaseFilters | None = None
+    mentions: Mentions = Field(
+        default_factory=list,
+        description=(
+            "What the user tagged in this message with `@`. A `skill` mention "
+            "names a chat skill; its SKILL.md, as it is when the question is "
+            "accepted, goes to the model after the question in this turn and "
+            "later ones. Skills the user cannot use are ignored, and the "
+            "message text never tags anything."
+        ),
+    )
 
     deep_research: bool = False
 
@@ -121,6 +181,15 @@ class SendMessageRequest(BaseModel):
 
     # Origin of the message for telemetry tracking
     origin: MessageOrigin = MessageOrigin.UNSET
+
+    accepts_follow_ups: bool = Field(
+        default=False,
+        description=(
+            "Set to true if the client can receive automatic follow-up answers "
+            "after the stream ends. This enables background agents for the "
+            "turn. Clients that only read the streamed answer leave it false."
+        ),
+    )
 
     # Placement information for the message in the conversation tree:
     # - -1: auto-place after latest message in chain
@@ -137,6 +206,10 @@ class SendMessageRequest(BaseModel):
     # When False, returns ChatFullResponse with complete data
     stream: bool = True
 
+    # The streamed wire format. 1 (default): chat's packets. 2: ACP updates
+    # (see acp_stream.py). Single-model streams only; others stay on 1.
+    protocol_version: Literal[1, 2] = 1
+
     # When False, disables citation generation:
     # - Citation markers like [1], [2] are removed from response text
     # - No CitationInfo packets are emitted during streaming
@@ -146,6 +219,59 @@ class SendMessageRequest(BaseModel):
     # (not shown in chat history). Used e.g. by the Chrome extension to pass
     # the current tab URL when "Read this tab" is enabled.
     additional_context: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_removed_tool_fields(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        if data.get("forced_tool_id") is not None:
+            raise ValueError(
+                "forced_tool_id is no longer supported. Use tool_options.preferred "
+                "for an optional Action preference; invocation is not guaranteed."
+            )
+        for field in ("allowed_tool_ids", "preferred_tool_id"):
+            if data.get(field) is not None:
+                raise ValueError(
+                    f"{field} is no longer supported. Use tool_options: "
+                    "tool_options.allowed narrows the Actions and "
+                    "tool_options.preferred sets an optional preference."
+                )
+        # The filters were a field of their own before tool_options.
+        if "internal_search_filters" not in data:
+            return data
+        data = dict(data)
+        filters = data.pop("internal_search_filters")
+        if filters is None:
+            return data
+        options = data.get("tool_options") or {}
+        if isinstance(options, ToolOptions):
+            options = options.model_dump()
+        if not isinstance(options, dict):
+            raise ValueError("tool_options must be an object")
+        if options.get("internal_search_filters") is not None:
+            raise ValueError(
+                "Send internal_search_filters in tool_options or at the top "
+                "level, not in both"
+            )
+        data["tool_options"] = {**options, "internal_search_filters": filters}
+        return data
+
+    @property
+    def internal_search_filters(self) -> BaseFilters | None:
+        return self.tool_options.internal_search_filters if self.tool_options else None
+
+    @model_validator(mode="after")
+    def check_preference_supported(self) -> "SendMessageRequest":
+        if (
+            self.deep_research
+            and self.tool_options is not None
+            and self.tool_options.preferred is not None
+        ):
+            raise ValueError(
+                "tool_options.preferred is not supported with deep_research"
+            )
+        return self
 
     @model_validator(mode="after")
     def check_chat_session_id_or_info(self) -> "SendMessageRequest":
@@ -166,6 +292,57 @@ class ChatMessageIdentifier(BaseModel):
     message_id: int
 
 
+class PendingChatMessageRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    message: str
+    delivery: MessageDelivery = Field(
+        description=(
+            "send adds input at the next step; queue waits for normal completion; "
+            "interrupt stops current work and starts a new turn."
+        )
+    )
+    target_response_id: int | None = Field(
+        default=None,
+        gt=0,
+        description=(
+            "The response that receives a send. Omit to use the current response."
+        ),
+    )
+    deep_research: bool = Field(
+        default=False,
+        description=(
+            "Start the message's turn as Deep Research when it is queued or "
+            "interrupts. A send into a running response ignores it."
+        ),
+    )
+    llm_override: LLMOverride | None = Field(
+        default=None,
+        description=(
+            "The model that a queued or interrupting message's turn uses. Omit it "
+            "to use the chat's saved model. A send into a running response "
+            "ignores it."
+        ),
+    )
+    mentions: Mentions = Field(
+        default_factory=list,
+        description=(
+            "What the user tagged in this message with `@`. A `skill` mention "
+            "names a chat skill; its SKILL.md, as it is when the message is "
+            "accepted, goes to the model after the message, both when a turn "
+            "starts with it and when a running response accepts a send. Skills "
+            "the user cannot use are ignored."
+        ),
+    )
+
+    @field_validator("message")
+    @classmethod
+    def require_message_text(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("A pending message must contain text")
+        return value
+
+
 class ChatRenameRequest(BaseModel):
     chat_session_id: UUID
     name: str | None = None
@@ -183,6 +360,70 @@ class RenameChatSessionResponse(BaseModel):
     new_name: str  # This is only really useful if the name is generated
 
 
+class StopChatResponse(BaseModel):
+    message: str
+
+
+class ChatApprovalDecisionRequest(DecisionBody):
+    # Headers for the MCP servers that the response's continuation calls;
+    # they are not saved.
+    mcp_headers: dict[str, str] | None = None
+
+
+class CurrentStreamInfo(BaseModel):
+    """Unfinished response available for stream reconnection."""
+
+    stream_id: int
+    # The responses that the stream writes. A stream that continues a response
+    # after its approvals has an ID that no message has.
+    response_ids: list[int] = Field(default_factory=list)
+
+
+class ApprovalDecisionResponse(BaseModel):
+    approval_id: UUID
+    decision: Literal[ApprovalDecision.APPROVED, ApprovalDecision.REJECTED]
+    decided_via: ApprovalDecidedVia
+    # The stream that continues the request's response, when the decision
+    # started it or found it running; None while the response still waits, or
+    # for a background agent's request, which continues without a stream.
+    continuation: CurrentStreamInfo | None = None
+
+
+class ChatQuestionAnswersRequest(BaseModel):
+    """The user's answers to a question request's questions, from its card, or
+    a message that the user typed in the chat instead, which answers every
+    question of the response that waits."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    answers: list[ToolQuestionAnswer] | None = None
+    message: str | None = None
+    # Headers for the MCP servers that the response's continuation calls;
+    # they are not saved.
+    mcp_headers: dict[str, str] | None = None
+
+    @model_validator(mode="after")
+    def require_one_answer(self) -> "ChatQuestionAnswersRequest":
+        if (self.answers is None) == (self.message is None):
+            raise ValueError("Give either answers or a message")
+        # The message counts by the text that the answer saves.
+        if self.message is not None and not sanitize_string(self.message).strip():
+            raise ValueError("A message must contain text")
+        return self
+
+
+class QuestionAnswersResponse(BaseModel):
+    question_request_id: UUID
+    # The stream that continues the question's response, when the answer
+    # started it or found it running; None while the response still waits.
+    continuation: CurrentStreamInfo | None = None
+
+
+class StopSubagentsResponse(BaseModel):
+    # The running agent runs that were interrupted.
+    stopped_count: int
+
+
 class ChatSessionDetails(BaseModel):
     id: UUID
     name: str | None
@@ -192,6 +433,7 @@ class ChatSessionDetails(BaseModel):
     shared_status: ChatSessionSharedStatus
     current_alternate_model: str | None = None
     current_temperature_override: float | None = None
+    current_reasoning_effort_override: str | None = None
 
     @classmethod
     def from_model(cls, model: ChatSession) -> "ChatSessionDetails":
@@ -204,6 +446,7 @@ class ChatSessionDetails(BaseModel):
             shared_status=model.shared_status,
             current_alternate_model=model.current_alternate_model,
             current_temperature_override=model.temperature_override,
+            current_reasoning_effort_override=model.reasoning_effort_override,
         )
 
 
@@ -225,18 +468,24 @@ class ChatMessageDetail(BaseModel):
     citations: dict[int, str] | None = None
     time_sent: datetime
     files: list[FileDescriptor]
+    # What a question tagged, as its turn resolved it.
+    mentions: list[RecordedMention]
     error: str | None = None
+    error_info: StreamingError | None = None
+    response_status: RunStatus | None = None
     current_feedback: str | None = None  # "like" | "dislike" | null
     processing_duration_seconds: float | None = None
     preferred_response_id: int | None = None
     model_display_name: str | None = None
+    # Absent on messages written before this was captured.
+    request_params: GenerationRequestParams | None = None
 
     def model_dump(  # ty: ignore[invalid-method-override]
         self, *args: list, **kwargs: dict[str, Any]
     ) -> dict[str, Any]:
         initial_dict = super().model_dump(
-            mode="json",
             *args,
+            mode="json",
             **kwargs,  # ty: ignore[invalid-argument-type]
         )
         initial_dict["time_sent"] = self.time_sent.isoformat()
@@ -246,6 +495,22 @@ class ChatMessageDetail(BaseModel):
 class SetPreferredResponseRequest(BaseModel):
     user_message_id: int
     preferred_response_id: int
+
+
+class ChatSessionProcessingStatus(BaseModel):
+    is_processing: bool
+    # Background agents are active on the selected branch, or their queued work waits.
+    has_active_subagents: bool = False
+    # Queued input or unread root results can start a turn now; a paused queue cannot.
+    has_startable_input: bool = False
+    # The newest response on the selected branch.
+    latest_response_id: int | None = None
+    current_stream: CurrentStreamInfo | None = None
+    # Changes when an approval request of the chat opens, is decided or is
+    # removed; reload the session to show the requests. Opaque, and empty
+    # while the chat has no request: a client that loaded nothing compares
+    # against the empty version.
+    approvals_version: str = ""
 
 
 class ChatSessionDetailResponse(BaseModel):
@@ -259,9 +524,23 @@ class ChatSessionDetailResponse(BaseModel):
     shared_status: ChatSessionSharedStatus
     current_alternate_model: str | None
     current_temperature_override: float | None
+    current_reasoning_effort_override: str | None
     deleted: bool = False
     owner_name: str | None = None
     packets: list[list[Packet]]
+    # The buffer also retains interrupted work until its cache TTL expires.
+    current_stream: CurrentStreamInfo | None = None
+    # Readiness is independent of whether a stream can be replayed.
+    is_processing: bool = False
+    # True for sessions pinned to an incognito record mode, so a reload can
+    # restore the incognito UI state.
+    incognito: bool = False
+    # Set on a paged load when the current branch has messages before the page.
+    has_older_messages: bool = False
+    # The owner's saved tool options; NULL means the agent's tools.
+    tool_options: ToolOptions | None = None
+    # The status route's `approvals_version` for the requests this load shows.
+    approvals_version: str = ""
 
 
 class AdminSearchRequest(BaseModel):
@@ -281,6 +560,7 @@ class ChatSessionSummary(BaseModel):
     shared_status: ChatSessionSharedStatus
     current_alternate_model: str | None = None
     current_temperature_override: float | None = None
+    current_reasoning_effort_override: str | None = None
 
 
 class ChatSessionGroup(BaseModel):

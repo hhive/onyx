@@ -9,17 +9,30 @@ import multiprocessing as mp
 import sys
 import traceback
 from collections.abc import Callable
-from dataclasses import dataclass
 from multiprocessing.context import SpawnProcess
-from typing import Any
-from typing import Literal
-from typing import Optional
+from multiprocessing.queues import Queue
+from typing import Any, Literal, Optional
+
+from pydantic import BaseModel, ConfigDict, PrivateAttr
 
 from onyx.configs.constants import POSTGRES_CELERY_WORKER_INDEXING_CHILD_APP_NAME
 from onyx.db.engine.sql_engine import SqlEngine
+from onyx.server.metrics.child_process_relay import (
+    start_relay_writer,
+    stop_relay_writer,
+)
+from onyx.utils.fleet_telemetry import (
+    EXIT_FLUSH_SECONDS,
+    start_telemetry,
+    stop_telemetry,
+)
 from onyx.utils.logger import setup_logger
-from shared_configs.configs import POSTGRES_DEFAULT_SCHEMA
-from shared_configs.configs import TENANT_ID_PREFIX
+from onyx.utils.os_reaper import (
+    become_child_subreaper,
+    install_sigterm_drain,
+    reap_children_before_exit,
+)
+from shared_configs.configs import POSTGRES_DEFAULT_SCHEMA, TENANT_ID_PREFIX
 from shared_configs.contextvars import CURRENT_TENANT_ID_CONTEXTVAR
 
 logger = setup_logger()
@@ -58,6 +71,12 @@ def _initializer(
         kwargs = {}
 
     logger.info("Initializing spawned worker child process.")
+
+    # adopt orphans (e.g. Chromium helpers) instead of leaking zombies to PID 1,
+    # and drain them even when a watchdog cancels this child with SIGTERM
+    become_child_subreaper()
+    install_sigterm_drain()
+
     # 1. Get tenant_id from args or fallback to default
     tenant_id = POSTGRES_DEFAULT_SCHEMA
     for arg in reversed(args):
@@ -79,6 +98,11 @@ def _initializer(
         pool_size=4, max_overflow=12, pool_recycle=60, pool_pre_ping=True
     )
 
+    # The parent worker reports this container; the child only delivers its counters.
+    start_telemetry("indexing", report_process=False)
+    # Nothing scrapes this process: the worker serves its metrics.
+    start_relay_writer()
+
     # Proceed with executing the target function
     try:
         return func(*args, **kwargs)
@@ -95,7 +119,15 @@ def _initializer(
 
         sys.exit(255)  # use 255 to indicate a generic exception
     finally:
+        stop_relay_writer()
+        # Bounded: the child exits after at most this wait, delivered or not.
+        stop_telemetry(flush_timeout=EXIT_FLUSH_SECONDS)
         CURRENT_TENANT_ID_CONTEXTVAR.reset(token)
+
+        # os._exit entrypoints skip this finally and drain themselves
+        reaped = reap_children_before_exit()
+        if reaped:
+            logger.info("Spawned worker child reaped %s orphaned processes.", reaped)
 
 
 def _run_in_process(
@@ -107,14 +139,15 @@ def _run_in_process(
     _initializer(func, queue, args, kwargs)
 
 
-@dataclass
-class SimpleJob:
+class SimpleJob(BaseModel):
     """Drop in replacement for `dask.distributed.Future`"""
+
+    model_config = ConfigDict(strict=True, arbitrary_types_allowed=True)
 
     id: int
     process: Optional["SpawnProcess"] = None
-    queue: Optional[mp.Queue] = None
-    _exception: Optional[str] = None
+    queue: Queue | None = None
+    _exception: Optional[str] = PrivateAttr(default=None)
 
     def cancel(self) -> bool:
         return self.release()

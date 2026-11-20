@@ -30,14 +30,15 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from onyx.background.celery.tasks.beat_schedule import BEAT_EXPIRES_DEFAULT
 from onyx.background.celery.versioned_apps.client import app as client_app
-from onyx.configs.constants import OnyxCeleryPriority
-from onyx.configs.constants import OnyxCeleryTask
-from onyx.db.connector_credential_pair import get_connector_credential_pair_from_id
-from onyx.db.connector_credential_pair import get_connector_credential_pairs
-from onyx.db.connector_credential_pair import update_connector_credential_pair_from_id
-from onyx.db.engine.sql_engine import get_session_with_tenant
-from onyx.db.engine.sql_engine import SqlEngine
+from onyx.configs.constants import OnyxCeleryPriority, OnyxCeleryTask
+from onyx.db.connector_credential_pair import (
+    get_connector_credential_pair_from_id,
+    get_connector_credential_pairs,
+    update_connector_credential_pair_from_id,
+)
+from onyx.db.engine.sql_engine import SqlEngine, get_session_with_tenant
 from onyx.db.enums import ConnectorCredentialPairStatus
 from onyx.db.index_attempt import cancel_indexing_attempts_for_ccpair
 
@@ -133,6 +134,7 @@ def mark_connector_for_deletion(
             OnyxCeleryTask.CHECK_FOR_CONNECTOR_DELETION,
             priority=OnyxCeleryPriority.HIGH,
             kwargs={"tenant_id": tenant_id},
+            expires=BEAT_EXPIRES_DEFAULT,
         )
         timing["send_task_seconds"] = time.time() - task_start
         timing["total_seconds"] = time.time() - start_time
@@ -255,6 +257,7 @@ def mark_all_connectors_for_deletion(tenant_id: str) -> dict[str, Any]:
             OnyxCeleryTask.CHECK_FOR_CONNECTOR_DELETION,
             priority=OnyxCeleryPriority.HIGH,
             kwargs={"tenant_id": tenant_id},
+            expires=BEAT_EXPIRES_DEFAULT,
         )
         task_time: float = time.time() - task_start
 

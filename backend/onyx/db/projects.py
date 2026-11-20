@@ -3,31 +3,22 @@ import uuid
 from typing import List
 from uuid import UUID
 
-from fastapi import HTTPException
 from fastapi import UploadFile
-from pydantic import BaseModel
-from pydantic import ConfigDict
-from pydantic import Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func
 from sqlalchemy.orm import Session
-from starlette.background import BackgroundTasks
 
-from onyx.configs.app_configs import DISABLE_VECTOR_DB
-from onyx.configs.constants import CELERY_USER_FILE_PROCESSING_TASK_EXPIRES
-from onyx.configs.constants import FileOrigin
-from onyx.configs.constants import OnyxCeleryPriority
-from onyx.configs.constants import OnyxCeleryQueues
-from onyx.configs.constants import OnyxCeleryTask
+from onyx.configs.constants import (
+    FileOrigin,
+)
 from onyx.db.enums import UserFileStatus
-from onyx.db.models import Project__UserFile
-from onyx.db.models import User
-from onyx.db.models import UserFile
-from onyx.db.models import UserProject
+from onyx.db.models import Project__UserFile, User, UserFile, UserProject
 from onyx.server.documents.connector import upload_files
-from onyx.server.features.projects.projects_file_utils import categorize_uploaded_files
-from onyx.server.features.projects.projects_file_utils import RejectedFile
+from onyx.server.features.projects.projects_file_utils import (
+    RejectedFile,
+    categorize_uploaded_files,
+)
 from onyx.utils.logger import setup_logger
-from shared_configs.contextvars import get_current_tenant_id
 
 logger = setup_logger()
 
@@ -62,6 +53,7 @@ def create_user_files(
     db_session: Session,
     link_url: str | None = None,
     temp_id_map: dict[str, str] | None = None,
+    incognito_session_id: UUID | None = None,
 ) -> CategorizedFilesResult:
     # Categorize the files
     categorized_files = categorize_uploaded_files(files, db_session)
@@ -73,7 +65,7 @@ def create_user_files(
     id_to_temp_id: dict[str, str] = {}
     # Pair returned storage paths with the same set of acceptable files we uploaded
     for file_path, file in zip(
-        upload_response.file_paths, categorized_files.acceptable
+        upload_response.file_paths, categorized_files.acceptable, strict=True
     ):
         new_id = uuid.uuid4()
         new_temp_id = (
@@ -94,12 +86,15 @@ def create_user_files(
             content_type=file.content_type,
             file_type=file.content_type,
             status=UserFileStatus.SKIPPED if should_skip else UserFileStatus.PROCESSING,
+            incognito=incognito_session_id is not None,
+            incognito_session_id=incognito_session_id,
             last_accessed_at=datetime.datetime.now(datetime.timezone.utc),
         )
         # Persist the UserFile first to satisfy FK constraints for association table
         db_session.add(new_file)
         db_session.flush()
-        if project_id:
+        # Incognito uploads may use a project as context but never join it.
+        if project_id and incognito_session_id is None:
             project_to_user_file = Project__UserFile(
                 project_id=project_id,
                 user_file_id=new_file.id,
@@ -112,69 +107,6 @@ def create_user_files(
         rejected_files=rejected_files,
         id_to_temp_id=id_to_temp_id,
         skip_indexing_filenames=categorized_files.skip_indexing,
-    )
-
-
-def upload_files_to_user_files_with_indexing(
-    files: List[UploadFile],
-    project_id: int | None,
-    user: User,
-    temp_id_map: dict[str, str] | None,
-    db_session: Session,
-    background_tasks: BackgroundTasks | None = None,
-) -> CategorizedFilesResult:
-    if project_id is not None and user is not None:
-        if not check_project_ownership(project_id, user.id, db_session):
-            raise HTTPException(status_code=404, detail="Project not found")
-
-    categorized_files_result = create_user_files(
-        files,
-        project_id,
-        user,
-        db_session,
-        temp_id_map=temp_id_map,
-    )
-    user_files = categorized_files_result.user_files
-    rejected_files = categorized_files_result.rejected_files
-    id_to_temp_id = categorized_files_result.id_to_temp_id
-    indexable_files = categorized_files_result.indexable_files
-    # Trigger per-file processing immediately for the current tenant
-    tenant_id = get_current_tenant_id()
-    for rejected_file in rejected_files:
-        logger.warning(
-            "File %s rejected for %s", rejected_file.filename, rejected_file.reason
-        )
-
-    if DISABLE_VECTOR_DB and background_tasks is not None:
-        from onyx.background.task_utils import drain_processing_loop
-
-        background_tasks.add_task(drain_processing_loop, tenant_id)
-        for user_file in indexable_files:
-            logger.info(
-                "Queued in-process processing for user_file_id=%s", user_file.id
-            )
-    else:
-        from onyx.background.celery.versioned_apps.client import app as client_app
-
-        for user_file in indexable_files:
-            task = client_app.send_task(
-                OnyxCeleryTask.PROCESS_SINGLE_USER_FILE,
-                kwargs={"user_file_id": user_file.id, "tenant_id": tenant_id},
-                queue=OnyxCeleryQueues.USER_FILE_PROCESSING,
-                priority=OnyxCeleryPriority.HIGH,
-                expires=CELERY_USER_FILE_PROCESSING_TASK_EXPIRES,
-            )
-            logger.info(
-                "Triggered indexing for user_file_id=%s with task_id=%s",
-                user_file.id,
-                task.id,
-            )
-
-    return CategorizedFilesResult(
-        user_files=user_files,
-        rejected_files=rejected_files,
-        id_to_temp_id=id_to_temp_id,
-        skip_indexing_filenames=categorized_files_result.skip_indexing_filenames,
     )
 
 
@@ -208,6 +140,21 @@ def get_user_files_from_project(
         db_session.query(UserFile)
         .join(Project__UserFile)
         .filter(Project__UserFile.project_id == project_id)
+        .all()
+    )
+
+
+def get_project_user_files_by_file_ids(
+    project_id: int, file_ids: list[str], db_session: Session
+) -> list[UserFile]:
+    """The project's user files whose file_id is in file_ids."""
+    return (
+        db_session.query(UserFile)
+        .join(Project__UserFile)
+        .filter(
+            Project__UserFile.project_id == project_id,
+            UserFile.file_id.in_(file_ids),
+        )
         .all()
     )
 
@@ -256,3 +203,95 @@ def get_project_token_count(
     )
 
     return int(total_tokens)
+
+
+def get_user_projects(user_id: UUID, db_session: Session) -> list[UserProject]:
+    return db_session.query(UserProject).filter(UserProject.user_id == user_id).all()
+
+
+def get_owned_user_project(
+    project_id: int, user_id: UUID, db_session: Session
+) -> UserProject | None:
+    return (
+        db_session.query(UserProject)
+        .filter(UserProject.id == project_id, UserProject.user_id == user_id)
+        .one_or_none()
+    )
+
+
+def create_user_project__no_commit(
+    name: str, user_id: UUID, db_session: Session
+) -> UserProject:
+    project = UserProject(name=name, user_id=user_id)
+    db_session.add(project)
+    return project
+
+
+def delete_user_project__no_commit(project: UserProject, db_session: Session) -> None:
+    db_session.delete(project)
+
+
+def get_owned_user_file(
+    file_id: UUID, user_id: UUID, db_session: Session
+) -> UserFile | None:
+    return (
+        db_session.query(UserFile)
+        .filter(UserFile.id == file_id, UserFile.user_id == user_id)
+        .one_or_none()
+    )
+
+
+def get_owned_user_file_not_deleting(
+    file_id: UUID, user_id: UUID, db_session: Session
+) -> UserFile | None:
+    return (
+        db_session.query(UserFile)
+        .filter(UserFile.id == file_id, UserFile.user_id == user_id)
+        .filter(UserFile.status != UserFileStatus.DELETING)
+        .one_or_none()
+    )
+
+
+def get_owned_user_files_not_deleting_by_ids(
+    file_ids: list[UUID], user_id: UUID, db_session: Session
+) -> list[UserFile]:
+    return (
+        db_session.query(UserFile)
+        .filter(UserFile.user_id == user_id)
+        .filter(UserFile.id.in_(file_ids))
+        .filter(UserFile.status != UserFileStatus.DELETING)
+        .all()
+    )
+
+
+def get_owned_project_user_files_by_link_date(
+    project_id: int, user_id: UUID, db_session: Session
+) -> list[UserFile]:
+    """The user's non-FAILED files in the project, most recently linked first."""
+    return (
+        db_session.query(UserFile)
+        .join(Project__UserFile, UserFile.id == Project__UserFile.user_file_id)
+        .filter(
+            Project__UserFile.project_id == project_id,
+            UserFile.user_id == user_id,
+            UserFile.status != UserFileStatus.FAILED,
+        )
+        .order_by(Project__UserFile.created_at.desc())
+        .all()
+    )
+
+
+def get_owned_project_user_files_by_upload_date(
+    project_id: int, user_id: UUID, db_session: Session
+) -> list[UserFile]:
+    """The user's non-FAILED files in the project, most recently created first."""
+    return (
+        db_session.query(UserFile)
+        .filter(
+            UserFile.projects.any(id=project_id),
+            UserFile.user_id == user_id,
+            UserFile.status != UserFileStatus.FAILED,
+        )
+        .order_by(UserFile.created_at.desc())
+        .all()
+    )

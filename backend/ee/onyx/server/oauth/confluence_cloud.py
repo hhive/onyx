@@ -1,34 +1,38 @@
 import base64
 import uuid
-from datetime import datetime
-from datetime import timedelta
-from datetime import timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
-from typing import cast
 
 import requests
 from fastapi import Depends
-from fastapi import HTTPException
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 from sqlalchemy.orm import Session
 
 from ee.onyx.server.oauth.api_router import router
 from onyx.auth.permissions import require_permission
-from onyx.configs.app_configs import DEV_MODE
-from onyx.configs.app_configs import OAUTH_CONFLUENCE_CLOUD_CLIENT_ID
-from onyx.configs.app_configs import OAUTH_CONFLUENCE_CLOUD_CLIENT_SECRET
-from onyx.configs.app_configs import WEB_DOMAIN
+from onyx.cache.factory import get_cache_backend
+from onyx.configs.app_configs import (
+    DEV_MODE,
+    OAUTH_CONFLUENCE_CLOUD_CLIENT_ID,
+    OAUTH_CONFLUENCE_CLOUD_CLIENT_SECRET,
+    REQUEST_TIMEOUT_SECONDS,
+    WEB_DOMAIN,
+)
 from onyx.configs.constants import DocumentSource
 from onyx.connectors.confluence.utils import CONFLUENCE_OAUTH_TOKEN_URL
-from onyx.db.credentials import create_credential
-from onyx.db.credentials import fetch_credential_by_id_for_user
-from onyx.db.credentials import update_credential_json
+from onyx.connectors.credential_families import to_source_credential_json
+from onyx.db.credentials import (
+    CredentialAccessLevel,
+    create_credential,
+    fetch_credential_by_id_for_user,
+    update_credential_json,
+)
 from onyx.db.engine.sql_engine import get_session
 from onyx.db.enums import Permission
 from onyx.db.models import User
-from onyx.redis.redis_pool import get_redis_client
+from onyx.error_handling.error_codes import OnyxErrorCode
+from onyx.error_handling.exceptions import OnyxError
 from onyx.server.documents.models import CredentialBase
 from onyx.utils.logger import setup_logger
 from shared_configs.contextvars import get_current_tenant_id
@@ -43,6 +47,7 @@ class ConfluenceCloudOAuth:
         """Stored in redis to be looked up on callback"""
 
         email: str
+        user_id: uuid.UUID | None = None
         redirect_on_success: str | None  # Where to send the user if OAuth flow succeeds
 
     class TokenResponse(BaseModel):
@@ -124,12 +129,14 @@ class ConfluenceCloudOAuth:
         return url
 
     @classmethod
-    def session_dump_json(cls, email: str, redirect_on_success: str | None) -> str:
+    def session_dump_json(
+        cls, email: str, redirect_on_success: str | None, user_id: uuid.UUID
+    ) -> str:
         """Temporary state to store in redis. to be looked up on auth response.
         Returns a json string.
         """
         session = ConfluenceCloudOAuth.OAuthSession(
-            email=email, redirect_on_success=redirect_on_success
+            email=email, redirect_on_success=redirect_on_success, user_id=user_id
         )
         return session.model_dump_json()
 
@@ -147,7 +154,7 @@ class ConfluenceCloudOAuth:
 def confluence_oauth_callback(
     code: str,
     state: str,
-    user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    user: User = Depends(require_permission(Permission.MANAGE_CONNECTORS)),
     db_session: Session = Depends(get_session),
     tenant_id: str | None = Depends(get_current_tenant_id),
 ) -> JSONResponse:
@@ -155,12 +162,12 @@ def confluence_oauth_callback(
     after visiting the oauth authorization url."""
 
     if not ConfluenceCloudOAuth.CLIENT_ID or not ConfluenceCloudOAuth.CLIENT_SECRET:
-        raise HTTPException(
-            status_code=500,
-            detail="Confluence Cloud client ID or client secret is not configured.",
+        raise OnyxError(
+            OnyxErrorCode.INTERNAL_ERROR,
+            "Confluence Cloud client ID or client secret is not configured.",
         )
 
-    r = get_redis_client(tenant_id=tenant_id)
+    cache = get_cache_backend(tenant_id=tenant_id)
 
     # recover the state
     padded_state = state + "=" * (
@@ -176,17 +183,23 @@ def confluence_oauth_callback(
 
     r_key = f"da_oauth:{oauth_uuid_str}"
 
-    session_json_bytes = cast(bytes, r.get(r_key))
+    session_json_bytes = cache.get(r_key)
     if not session_json_bytes:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Confluence Cloud OAuth failed - OAuth state key not found: key={r_key}",
+        raise OnyxError(
+            OnyxErrorCode.BAD_REQUEST,
+            f"Confluence Cloud OAuth failed - OAuth state key not found: key={r_key}",
         )
 
     session_json = session_json_bytes.decode("utf-8")
-    try:
-        session = ConfluenceCloudOAuth.parse_session(session_json)
+    session = ConfluenceCloudOAuth.parse_session(session_json)
 
+    if session.user_id is None or session.user_id != user.id:
+        raise OnyxError(
+            OnyxErrorCode.INSUFFICIENT_PERMISSIONS,
+            "Confluence Cloud OAuth failed - the OAuth state was started by another user.",
+        )
+
+    try:
         if not DEV_MODE:
             redirect_uri = ConfluenceCloudOAuth.REDIRECT_URI
         else:
@@ -203,6 +216,7 @@ def confluence_oauth_callback(
                 "redirect_uri": redirect_uri,
                 "grant_type": "authorization_code",
             },
+            timeout=REQUEST_TIMEOUT_SECONDS,
         )
 
         token_response: ConfluenceCloudOAuth.TokenResponse | None = None
@@ -243,7 +257,7 @@ def confluence_oauth_callback(
             },
         )
     finally:
-        r.delete(r_key)
+        cache.delete(r_key)
 
     # return the result
     return JSONResponse(
@@ -259,7 +273,7 @@ def confluence_oauth_callback(
 @router.get("/connector/confluence/accessible-resources")
 def confluence_oauth_accessible_resources(
     credential_id: int,
-    user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    user: User = Depends(require_permission(Permission.MANAGE_CONNECTORS)),
     db_session: Session = Depends(get_session),
     tenant_id: str | None = Depends(get_current_tenant_id),  # noqa: ARG001
 ) -> JSONResponse:
@@ -267,14 +281,21 @@ def confluence_oauth_accessible_resources(
     usable state after authorizing.  All API's require a cloud id. We have to list
     the accessible resources/sites and let the user choose which site to use."""
 
-    credential = fetch_credential_by_id_for_user(credential_id, user, db_session)
+    credential = fetch_credential_by_id_for_user(
+        credential_id, user, db_session, access_level=CredentialAccessLevel.EDIT
+    )
     if not credential:
-        raise HTTPException(400, f"Credential {credential_id} not found.")
+        raise OnyxError(
+            OnyxErrorCode.BAD_REQUEST, f"Credential {credential_id} not found."
+        )
 
-    credential_dict = (
-        credential.credential_json.get_value(apply_mask=False)
-        if credential.credential_json
-        else {}
+    credential_dict = to_source_credential_json(
+        DocumentSource.CONFLUENCE,
+        (
+            credential.credential_json.get_value(apply_mask=False)
+            if credential.credential_json
+            else {}
+        ),
     )
     access_token = credential_dict["confluence_access_token"]
 
@@ -286,6 +307,7 @@ def confluence_oauth_accessible_resources(
                 "Authorization": f"Bearer {access_token}",
                 "Accept": "application/json",
             },
+            timeout=REQUEST_TIMEOUT_SECONDS,
         )
 
         response.raise_for_status()
@@ -326,7 +348,7 @@ def confluence_oauth_finalize(
     cloud_id: str,
     cloud_name: str,
     cloud_url: str,
-    user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    user: User = Depends(require_permission(Permission.MANAGE_CONNECTORS)),
     db_session: Session = Depends(get_session),
     tenant_id: str | None = Depends(get_current_tenant_id),  # noqa: ARG001
 ) -> JSONResponse:
@@ -335,17 +357,22 @@ def confluence_oauth_finalize(
     OAuth process, the user has to select a site to associate with the credentials.
     After this, the credential is usable."""
 
-    credential = fetch_credential_by_id_for_user(credential_id, user, db_session)
+    credential = fetch_credential_by_id_for_user(
+        credential_id, user, db_session, access_level=CredentialAccessLevel.EDIT
+    )
     if not credential:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Confluence Cloud OAuth failed - credential {credential_id} not found.",
+        raise OnyxError(
+            OnyxErrorCode.BAD_REQUEST,
+            f"Confluence Cloud OAuth failed - credential {credential_id} not found.",
         )
 
-    existing_credential_json = (
-        credential.credential_json.get_value(apply_mask=False)
-        if credential.credential_json
-        else {}
+    existing_credential_json = to_source_credential_json(
+        DocumentSource.CONFLUENCE,
+        (
+            credential.credential_json.get_value(apply_mask=False)
+            if credential.credential_json
+            else {}
+        ),
     )
     new_credential_json: dict[str, Any] = dict(existing_credential_json)
     new_credential_json["cloud_id"] = cloud_id

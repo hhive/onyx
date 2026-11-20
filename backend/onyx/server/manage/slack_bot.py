@@ -1,6 +1,4 @@
-from fastapi import APIRouter
-from fastapi import Depends
-from fastapi import HTTPException
+from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
 from onyx.auth.permissions import require_permission
@@ -8,28 +6,37 @@ from onyx.configs.constants import MilestoneRecordType
 from onyx.db.constants import SLACK_BOT_PERSONA_PREFIX
 from onyx.db.engine.sql_engine import get_session
 from onyx.db.enums import Permission
-from onyx.db.models import ChannelConfig
-from onyx.db.models import User
+from onyx.db.models import ChannelConfig, User
 from onyx.db.persona import get_persona_by_id
-from onyx.db.slack_bot import fetch_slack_bot
-from onyx.db.slack_bot import fetch_slack_bots
-from onyx.db.slack_bot import insert_slack_bot
-from onyx.db.slack_bot import remove_slack_bot
-from onyx.db.slack_bot import update_slack_bot
-from onyx.db.slack_channel_config import create_slack_channel_persona
-from onyx.db.slack_channel_config import fetch_slack_channel_config
-from onyx.db.slack_channel_config import fetch_slack_channel_configs
-from onyx.db.slack_channel_config import insert_slack_channel_config
-from onyx.db.slack_channel_config import remove_slack_channel_config
-from onyx.db.slack_channel_config import update_slack_channel_config
+from onyx.db.slack_bot import (
+    fetch_slack_bot,
+    fetch_slack_bots,
+    insert_slack_bot,
+    remove_slack_bot,
+    update_slack_bot,
+)
+from onyx.db.slack_channel_config import (
+    create_slack_channel_persona,
+    fetch_slack_channel_config,
+    fetch_slack_channel_configs,
+    insert_slack_channel_config,
+    remove_slack_channel_config,
+    update_slack_channel_config,
+)
+from onyx.error_handling.error_codes import OnyxErrorCode
+from onyx.error_handling.exceptions import OnyxError
 from onyx.onyxbot.slack.config import validate_channel_name
-from onyx.server.manage.models import SlackBot
-from onyx.server.manage.models import SlackBotCreationRequest
-from onyx.server.manage.models import SlackChannelConfig
-from onyx.server.manage.models import SlackChannelConfigCreationRequest
-from onyx.server.manage.validate_tokens import validate_app_token
-from onyx.server.manage.validate_tokens import validate_bot_token
-from onyx.server.manage.validate_tokens import validate_user_token
+from onyx.server.manage.models import (
+    SlackBot,
+    SlackBotCreationRequest,
+    SlackChannelConfig,
+    SlackChannelConfigCreationRequest,
+)
+from onyx.server.manage.validate_tokens import (
+    validate_app_token,
+    validate_bot_token,
+    validate_user_token,
+)
 from onyx.utils.logger import setup_logger
 from onyx.utils.telemetry import mt_cloud_telemetry
 from shared_configs.contextvars import get_current_tenant_id
@@ -64,10 +71,7 @@ def _form_channel_config(
             current_slack_bot_id=slack_channel_config_creation_request.slack_bot_id,
         )
     except ValueError as e:
-        raise HTTPException(
-            status_code=400,
-            detail=str(e),
-        )
+        raise OnyxError(OnyxErrorCode.BAD_REQUEST, str(e))
 
     if (
         slack_channel_config_creation_request.is_ephemeral
@@ -109,7 +113,7 @@ def _form_channel_config(
 def create_slack_channel_config(
     slack_channel_config_creation_request: SlackChannelConfigCreationRequest,
     db_session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    _: User = Depends(require_permission(Permission.MANAGE_BOTS)),
 ) -> SlackChannelConfig:
     channel_config = _form_channel_config(
         db_session=db_session,
@@ -118,10 +122,7 @@ def create_slack_channel_config(
     )
 
     if channel_config["channel_name"] is None:
-        raise HTTPException(
-            status_code=400,
-            detail="Channel name is required",
-        )
+        raise OnyxError(OnyxErrorCode.BAD_REQUEST, "Channel name is required")
 
     persona_id = None
     if slack_channel_config_creation_request.persona_id is not None:
@@ -150,7 +151,7 @@ def patch_slack_channel_config(
     slack_channel_config_id: int,
     slack_channel_config_creation_request: SlackChannelConfigCreationRequest,
     db_session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    _: User = Depends(require_permission(Permission.MANAGE_BOTS)),
 ) -> SlackChannelConfig:
     channel_config = _form_channel_config(
         db_session=db_session,
@@ -166,10 +167,7 @@ def patch_slack_channel_config(
             db_session=db_session, slack_channel_config_id=slack_channel_config_id
         )
         if existing_slack_channel_config is None:
-            raise HTTPException(
-                status_code=404,
-                detail="Slack channel config not found",
-            )
+            raise OnyxError(OnyxErrorCode.NOT_FOUND, "Slack channel config not found")
 
         existing_persona_id = existing_slack_channel_config.persona_id
         if existing_persona_id is not None:
@@ -211,19 +209,18 @@ def patch_slack_channel_config(
 def delete_slack_channel_config(
     slack_channel_config_id: int,
     db_session: Session = Depends(get_session),
-    user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    _: User = Depends(require_permission(Permission.MANAGE_BOTS)),
 ) -> None:
     remove_slack_channel_config(
         db_session=db_session,
         slack_channel_config_id=slack_channel_config_id,
-        user=user,
     )
 
 
 @router.get("/admin/slack-app/channel")
 def list_slack_channel_configs(
     db_session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    _: User = Depends(require_permission(Permission.MANAGE_BOTS)),
 ) -> list[SlackChannelConfig]:
     slack_channel_config_models = fetch_slack_channel_configs(db_session=db_session)
     return [
@@ -236,7 +233,7 @@ def list_slack_channel_configs(
 def create_bot(
     slack_bot_creation_request: SlackBotCreationRequest,
     db_session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    _: User = Depends(require_permission(Permission.MANAGE_BOTS)),
 ) -> SlackBot:
     tenant_id = get_current_tenant_id()
 
@@ -282,7 +279,7 @@ def patch_bot(
     slack_bot_id: int,
     slack_bot_creation_request: SlackBotCreationRequest,
     db_session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    _: User = Depends(require_permission(Permission.MANAGE_BOTS)),
 ) -> SlackBot:
     validate_bot_token(slack_bot_creation_request.bot_token)
     validate_app_token(slack_bot_creation_request.app_token)
@@ -303,7 +300,7 @@ def patch_bot(
 def delete_bot(
     slack_bot_id: int,
     db_session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    _: User = Depends(require_permission(Permission.MANAGE_BOTS)),
 ) -> None:
     remove_slack_bot(
         db_session=db_session,
@@ -315,7 +312,7 @@ def delete_bot(
 def get_bot_by_id(
     slack_bot_id: int,
     db_session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    _: User = Depends(require_permission(Permission.MANAGE_BOTS)),
 ) -> SlackBot:
     slack_bot_model = fetch_slack_bot(
         db_session=db_session,
@@ -327,7 +324,7 @@ def get_bot_by_id(
 @router.get("/admin/slack-app/bots")
 def list_bots(
     db_session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    _: User = Depends(require_permission(Permission.MANAGE_BOTS)),
 ) -> list[SlackBot]:
     slack_bot_models = fetch_slack_bots(db_session=db_session)
     return [
@@ -339,7 +336,7 @@ def list_bots(
 def list_bot_configs(
     bot_id: int,
     db_session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    _: User = Depends(require_permission(Permission.MANAGE_BOTS)),
 ) -> list[SlackChannelConfig]:
     slack_bot_config_models = fetch_slack_channel_configs(
         db_session=db_session, slack_bot_id=bot_id

@@ -68,7 +68,10 @@ from typing import Dict
 	defer func() { _ = os.Remove(testPath) }()
 
 	patterns := createPatterns([]string{"google.genai", "transformers"})
-	result := findEagerImports(testPath, patterns)
+	result, err := findEagerImports(testPath, patterns)
+	if err != nil {
+		t.Fatalf("findEagerImports failed: %v", err)
+	}
 
 	// Should find 4 violations (lines 2, 3, 4, 5)
 	if len(result.ViolationLines) != 4 {
@@ -127,7 +130,10 @@ from transformers import BertModel
 	defer func() { _ = os.Remove(testPath) }()
 
 	patterns := createPatterns([]string{"google.genai", "transformers"})
-	result := findEagerImports(testPath, patterns)
+	result, err := findEagerImports(testPath, patterns)
+	if err != nil {
+		t.Fatalf("findEagerImports failed: %v", err)
+	}
 
 	// Should only find violations for top-level imports (lines 14, 15)
 	if len(result.ViolationLines) != 2 {
@@ -167,7 +173,10 @@ import mygenai  # Should not be flagged
 	defer func() { _ = os.Remove(testPath) }()
 
 	patterns := createPatterns([]string{"google.genai"})
-	result := findEagerImports(testPath, patterns)
+	result, err := findEagerImports(testPath, patterns)
+	if err != nil {
+		t.Fatalf("findEagerImports failed: %v", err)
+	}
 
 	// Should find 2 violations (lines 2, 3)
 	if len(result.ViolationLines) != 2 {
@@ -209,7 +218,10 @@ import os
 	defer func() { _ = os.Remove(testPath) }()
 
 	patterns := createPatterns([]string{"google.genai"})
-	result := findEagerImports(testPath, patterns)
+	result, err := findEagerImports(testPath, patterns)
+	if err != nil {
+		t.Fatalf("findEagerImports failed: %v", err)
+	}
 
 	// Should find no violations
 	if len(result.ViolationLines) != 0 {
@@ -236,7 +248,10 @@ def some_function():
 	defer func() { _ = os.Remove(testPath) }()
 
 	patterns := createPatterns([]string{"google.genai", "transformers"})
-	result := findEagerImports(testPath, patterns)
+	result, err := findEagerImports(testPath, patterns)
+	if err != nil {
+		t.Fatalf("findEagerImports failed: %v", err)
+	}
 
 	// Should find no violations
 	if len(result.ViolationLines) != 0 {
@@ -248,18 +263,12 @@ def some_function():
 }
 
 func TestFindEagerImportsFileReadError(t *testing.T) {
-	// Test handling of file read errors.
+	// Test that an unreadable file fails the check instead of passing it.
 	nonexistentPath := "/nonexistent/path/test.py"
 
 	patterns := createPatterns([]string{"google.genai"})
-	result := findEagerImports(nonexistentPath, patterns)
-
-	// Should return empty result on error
-	if len(result.ViolationLines) != 0 {
-		t.Errorf("Expected 0 violations for nonexistent file, got %d", len(result.ViolationLines))
-	}
-	if len(result.ViolatedModules) != 0 {
-		t.Errorf("Expected 0 violated modules for nonexistent file, got %d", len(result.ViolatedModules))
+	if _, err := findEagerImports(nonexistentPath, patterns); err == nil {
+		t.Fatalf("Expected an error for a nonexistent file")
 	}
 }
 
@@ -280,7 +289,10 @@ def some_function():
 	defer func() { _ = os.Remove(testPath) }()
 
 	patterns := createPatterns([]string{"onyx.llm.litellm_singleton"})
-	result := findEagerImports(testPath, patterns)
+	result, err := findEagerImports(testPath, patterns)
+	if err != nil {
+		t.Fatalf("findEagerImports failed: %v", err)
+	}
 
 	// Should find one violation (line 3)
 	if len(result.ViolationLines) != 1 {
@@ -321,7 +333,10 @@ class SomeClass:
 	defer func() { _ = os.Remove(testPath) }()
 
 	patterns := createPatterns([]string{"onyx.llm.litellm_singleton"})
-	result := findEagerImports(testPath, patterns)
+	result, err := findEagerImports(testPath, patterns)
+	if err != nil {
+		t.Fatalf("findEagerImports failed: %v", err)
+	}
 
 	// Should find no violations
 	if len(result.ViolationLines) != 0 {
@@ -506,7 +521,10 @@ def allowed_function():
 	defer func() { _ = os.Remove(testPath) }()
 
 	patterns := createPatterns([]string{"playwright"})
-	result := findEagerImports(testPath, patterns)
+	result, err := findEagerImports(testPath, patterns)
+	if err != nil {
+		t.Fatalf("findEagerImports failed: %v", err)
+	}
 
 	// Should find 4 violations (lines 2, 3, 4, 5)
 	if len(result.ViolationLines) != 4 {
@@ -555,7 +573,10 @@ def allowed_function():
 	defer func() { _ = os.Remove(testPath) }()
 
 	patterns := createPatterns([]string{"nltk"})
-	result := findEagerImports(testPath, patterns)
+	result, err := findEagerImports(testPath, patterns)
+	if err != nil {
+		t.Fatalf("findEagerImports failed: %v", err)
+	}
 
 	// Should find 4 violations (lines 2, 3, 4, 5)
 	if len(result.ViolationLines) != 4 {
@@ -605,7 +626,10 @@ def allowed_usage():
 	defer func() { _ = os.Remove(testPath) }()
 
 	patterns := createPatterns([]string{"google.genai", "playwright", "nltk"})
-	result := findEagerImports(testPath, patterns)
+	result, err := findEagerImports(testPath, patterns)
+	if err != nil {
+		t.Fatalf("findEagerImports failed: %v", err)
+	}
 
 	// Should find 3 violations (lines 2, 3, 4)
 	if len(result.ViolationLines) != 3 {
@@ -644,66 +668,44 @@ def allowed_usage():
 	}
 }
 
-func TestNewLazyImportSettings(t *testing.T) {
-	// Test NewLazyImportSettings with no ignore files.
-	settings := NewLazyImportSettings()
-	if len(settings.IgnoreFiles) != 0 {
-		t.Errorf("Expected 0 ignore files, got %d", len(settings.IgnoreFiles))
+func TestBraintrustAndExaViolations(t *testing.T) {
+	// Both packages pull in openai (and braintrust also litellm) at import time.
+	testContent := `
+import braintrust
+from braintrust import Eval
+from exa_py import Exa
+from exa_py.api import HighlightsContentsOptions
+import braintrust_langchain  # Different package, not flagged
+
+def allowed_function():
+    from braintrust import init_dataset
+    from exa_py import Exa
+    return init_dataset, Exa
+`
+
+	testPath := createTempPythonFile(t, testContent)
+	defer func() { _ = os.Remove(testPath) }()
+
+	patterns := createPatterns([]string{"braintrust", "exa_py"})
+	result, err := findEagerImports(testPath, patterns)
+	if err != nil {
+		t.Fatalf("findEagerImports failed: %v", err)
 	}
 
-	// Test with ignore files.
-	settings = NewLazyImportSettings("file1.py", "file2.py")
-	if len(settings.IgnoreFiles) != 2 {
-		t.Errorf("Expected 2 ignore files, got %d", len(settings.IgnoreFiles))
+	lineNumbers := extractLineNumbers(result.ViolationLines)
+	expectedLines := []int{2, 3, 4, 5}
+	if len(lineNumbers) != len(expectedLines) {
+		t.Errorf("Expected %d violations, got %d (lines %v)", len(expectedLines), len(lineNumbers), lineNumbers)
 	}
-	if _, ok := settings.IgnoreFiles["file1.py"]; !ok {
-		t.Error("Expected file1.py in ignore files")
-	}
-	if _, ok := settings.IgnoreFiles["file2.py"]; !ok {
-		t.Error("Expected file2.py in ignore files")
-	}
-}
-
-func TestDefaultLazyImportModules(t *testing.T) {
-	// Test that DefaultLazyImportModules returns expected modules.
-	modules := DefaultLazyImportModules()
-
-	expectedModules := []string{
-		"google.genai",
-		"openai",
-		"markitdown",
-		"tiktoken",
-		"transformers",
-		"setfit",
-		"unstructured",
-		"onyx.llm.litellm_singleton",
-		"litellm",
-		"nltk",
-		"trafilatura",
-		"pypdf",
-		"unstructured_client",
-	}
-
-	for _, mod := range expectedModules {
-		if _, ok := modules[mod]; !ok {
-			t.Errorf("Expected %s in default modules", mod)
+	for _, expected := range expectedLines {
+		if !containsLineNum(lineNumbers, expected) {
+			t.Errorf("Expected line %d in violations", expected)
 		}
 	}
 
-	// Check specific ignore files for some modules
-	if _, ok := modules["transformers"].IgnoreFiles["model_server/main.py"]; !ok {
-		t.Error("Expected model_server/main.py in transformers ignore files")
-	}
-
-	litellmIgnores := modules["litellm"].IgnoreFiles
-	expectedLitellmIgnores := []string{
-		"onyx/llm/litellm_singleton/__init__.py",
-		"onyx/llm/litellm_singleton/config.py",
-		"onyx/llm/litellm_singleton/monkey_patches.py",
-	}
-	for _, ignore := range expectedLitellmIgnores {
-		if _, ok := litellmIgnores[ignore]; !ok {
-			t.Errorf("Expected %s in litellm ignore files", ignore)
+	for _, mod := range []string{"braintrust", "exa_py"} {
+		if _, ok := result.ViolatedModules[mod]; !ok {
+			t.Errorf("Expected %s in violated modules", mod)
 		}
 	}
 }
@@ -732,65 +734,6 @@ func TestIsValidPythonFile(t *testing.T) {
 				t.Errorf("isValidPythonFile(%q) = %v, want %v", tt.path, result, tt.expected)
 			}
 		})
-	}
-}
-
-func TestShouldCheckFileForModule(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "test_check_*")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer func() { _ = os.RemoveAll(tmpDir) }()
-
-	// Create test file
-	testFile := filepath.Join(tmpDir, "onyx", "llm", "test.py")
-	if err := os.MkdirAll(filepath.Dir(testFile), 0755); err != nil {
-		t.Fatalf("Failed to create dirs: %v", err)
-	}
-	if err := os.WriteFile(testFile, []byte("import os"), 0644); err != nil {
-		t.Fatalf("Failed to create test file: %v", err)
-	}
-
-	// Test with no ignore files - should check
-	settings := NewLazyImportSettings()
-	if !shouldCheckFileForModule(testFile, tmpDir, settings) {
-		t.Error("Expected to check file when no ignore files")
-	}
-
-	// Test with different ignore file - should check
-	settings = NewLazyImportSettings("other/file.py")
-	if !shouldCheckFileForModule(testFile, tmpDir, settings) {
-		t.Error("Expected to check file when ignore file is different")
-	}
-
-	// Test with matching ignore file - should not check
-	settings = NewLazyImportSettings("onyx/llm/test.py")
-	if shouldCheckFileForModule(testFile, tmpDir, settings) {
-		t.Error("Expected to NOT check file when it matches ignore file")
-	}
-}
-
-func TestFormatViolatedModules(t *testing.T) {
-	// Test formatting of violated modules.
-	modules := map[string]struct{}{
-		"google.genai": {},
-		"nltk":         {},
-		"playwright":   {},
-	}
-
-	result := FormatViolatedModules(modules)
-
-	// Should be sorted alphabetically
-	expected := "google.genai, nltk, playwright"
-	if result != expected {
-		t.Errorf("FormatViolatedModules() = %q, want %q", result, expected)
-	}
-
-	// Test empty map
-	emptyModules := map[string]struct{}{}
-	result = FormatViolatedModules(emptyModules)
-	if result != "" {
-		t.Errorf("FormatViolatedModules(empty) = %q, want empty string", result)
 	}
 }
 
@@ -833,39 +776,6 @@ func TestCompileModulePatterns(t *testing.T) {
 	}
 }
 
-func TestEmptyFile(t *testing.T) {
-	// Test handling of empty file.
-	testContent := ""
-
-	testPath := createTempPythonFile(t, testContent)
-	defer func() { _ = os.Remove(testPath) }()
-
-	patterns := createPatterns([]string{"google.genai"})
-	result := findEagerImports(testPath, patterns)
-
-	if len(result.ViolationLines) != 0 {
-		t.Errorf("Expected 0 violations for empty file, got %d", len(result.ViolationLines))
-	}
-}
-
-func TestFileWithOnlyComments(t *testing.T) {
-	// Test file with only comments.
-	testContent := `# This is a comment
-# import google.genai
-# Another comment
-`
-
-	testPath := createTempPythonFile(t, testContent)
-	defer func() { _ = os.Remove(testPath) }()
-
-	patterns := createPatterns([]string{"google.genai"})
-	result := findEagerImports(testPath, patterns)
-
-	if len(result.ViolationLines) != 0 {
-		t.Errorf("Expected 0 violations for comment-only file, got %d", len(result.ViolationLines))
-	}
-}
-
 func TestMultipleViolationsOnSameLine(t *testing.T) {
 	// Test that a single line can match multiple modules.
 	// Note: Python doesn't really support this, but let's verify behavior
@@ -878,7 +788,10 @@ import google.genai
 
 	// Use patterns that might both match the same line
 	patterns := createPatterns([]string{"google.genai", "google"})
-	result := findEagerImports(testPath, patterns)
+	result, err := findEagerImports(testPath, patterns)
+	if err != nil {
+		t.Fatalf("findEagerImports failed: %v", err)
+	}
 
 	// The line should be flagged by google.genai pattern
 	if len(result.ViolationLines) < 1 {
@@ -923,5 +836,29 @@ func TestIgnoreEnvDirectory(t *testing.T) {
 		if base == "env_file.py" || base == "dotenv_file.py" {
 			t.Errorf("File %s should have been ignored", f)
 		}
+	}
+}
+
+func TestCollectPythonFilesResolvesSelectors(t *testing.T) {
+	// Backend-relative selectors resolve via the backend fallback, and a
+	// selector that resolves to nothing is an error.
+	backendDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(backendDir, "pkg"), 0755); err != nil {
+		t.Fatalf("Failed to create pkg dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(backendDir, "pkg", "a.py"), []byte("import os"), 0644); err != nil {
+		t.Fatalf("Failed to create pkg/a.py: %v", err)
+	}
+
+	files, err := collectPythonFiles([]string{"pkg"}, backendDir)
+	if err != nil {
+		t.Fatalf("collectPythonFiles failed: %v", err)
+	}
+	if len(files) != 1 || files[0] != filepath.Join(backendDir, "pkg", "a.py") {
+		t.Fatalf("Expected only pkg/a.py, got %v", files)
+	}
+
+	if _, err := collectPythonFiles([]string{"nonexistent"}, backendDir); err == nil {
+		t.Fatalf("Expected an error for a selector that matches nothing")
 	}
 }

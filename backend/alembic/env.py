@@ -1,23 +1,38 @@
-from typing import Any
-from onyx.db.engine.iam_auth import get_iam_auth_token
+from onyx.db.engine.iam_auth import make_provide_iam_token_async
+from onyx.db.engine.migration_lock import schema_migration_lock
+from onyx.db.engine.migration_search_path import pin_search_path_per_transaction
+from onyx.db.engine.pg_ssl import create_pg_ssl_context
 from onyx.configs.app_configs import USE_IAM_AUTH
 from onyx.configs.app_configs import POSTGRES_HOST
 from onyx.configs.app_configs import POSTGRES_PORT
 from onyx.configs.app_configs import POSTGRES_USER
-from onyx.configs.app_configs import AWS_REGION_NAME
+from onyx.db.engine.shard_registry import ALEMBIC_TARGET_URL_ATTRIBUTE
+from onyx.db.engine.shard_registry import get_shard_spec
+from onyx.db.engine.shard_registry import validate_shard_name
+from onyx.db.engine.shard_registry import is_sharded
 from onyx.db.engine.sql_engine import build_connection_string
-from onyx.db.engine.tenant_utils import get_all_tenant_ids
+from onyx.db.engine.tenant_utils import get_tenant_ids_by_shard
 from sqlalchemy import event
 from sqlalchemy import pool
 from sqlalchemy import text
+from sqlalchemy.engine.url import make_url
 from sqlalchemy.engine.base import Connection
+from sqlalchemy.schema import (
+    Column,
+    ColumnCollectionConstraint,
+    Constraint,
+    Index,
+    SchemaItem,
+    Table,
+)
 import os
-import ssl
+from itertools import chain
 import asyncio
 import logging
 from logging.config import fileConfig
 
 from alembic import context
+from sqlalchemy.ext.asyncio import AsyncEngine
 from sqlalchemy.ext.asyncio import create_async_engine
 from onyx.configs.constants import SSL_CERT_FILE
 from shared_configs.configs import (
@@ -27,10 +42,17 @@ from shared_configs.configs import (
 )
 from shared_configs.contextvars import CURRENT_TENANT_ID_CONTEXTVAR
 from onyx.db.models import Base
-from celery.backends.database.session import (  # ty: ignore[unresolved-import]
-    ResultModelBase,
+from celery.backends.database.session import (
+    ResultModelBase,  # ty: ignore[unresolved-import]
 )
 from onyx.db.engine.sql_engine import SqlEngine
+from onyx.utils.variable_functionality import set_is_ee_if_available
+from onyx.utils.encryption import validate_encryption_configuration
+
+# Match the app processes' edition so migrations that use versioned
+# implementations (e.g. encrypt_string_to_bytes) resolve the EE variants.
+set_is_ee_if_available()
+validate_encryption_configuration()
 
 # Make sure in alembic.ini [logger_root] level=INFO is set or most logging will be
 # hidden! (defaults to level=WARN)
@@ -47,13 +69,106 @@ if config.config_file_name is not None and config.attributes.get(
 
 target_metadata = [Base.metadata, ResultModelBase.metadata]
 
+# Tables that stay in the database for rollback after their model was deleted.
+# Without this filter, autogenerate proposes to drop them.
+_TABLES_KEPT_WITHOUT_MODEL = frozenset(
+    {
+        "external_app__skill",
+        "external_app_user_credential",
+        "mcp_server__user",
+        "mcp_server_user_preference",
+        "oauth_user_token",
+        "scheduled_task_action_policy",
+        "scheduled_task_enabled_app",
+        "skill__user",
+        "skill__user_group",
+        "tool_user_preference",
+        "user_action_policy",
+        "user_skill_preference",
+        "workspace_action_policy",
+    }
+)
+
+# Columns of a mapped table that stay in the database for rollback after they
+# left the model, and the indexes and constraints that use them.
+_COLUMNS_KEPT_WITHOUT_MODEL = frozenset(
+    ("skill", column)
+    for column in (
+        "bundle_file_id",
+        "bundle_sha256",
+        "is_valid",
+        "author_user_id",
+        "public_permission",
+        "installation_policy",
+    )
+)
+_INDEXES_KEPT_WITHOUT_MODEL = frozenset({"uq_skill_automatic_name"})
+
+
+def include_object(
+    object_: SchemaItem,
+    _name: str | None,
+    _type: str,
+    reflected: bool,
+    compare_to: SchemaItem | None,
+) -> bool:
+    if not reflected or compare_to is not None:
+        return True
+    if isinstance(object_, Table):
+        return object_.name not in _TABLES_KEPT_WITHOUT_MODEL
+    if isinstance(object_, Column):
+        table = object_.table
+        return table is None or (
+            table.name not in _TABLES_KEPT_WITHOUT_MODEL
+            and (table.name, object_.name) not in _COLUMNS_KEPT_WITHOUT_MODEL
+        )
+    if isinstance(object_, (Constraint, Index)):
+        table = object_.table
+        return table is None or (
+            table.name not in _TABLES_KEPT_WITHOUT_MODEL
+            and object_.name not in _INDEXES_KEPT_WITHOUT_MODEL
+            and not (
+                isinstance(object_, (ColumnCollectionConstraint, Index))
+                and any(
+                    (table.name, column.name) in _COLUMNS_KEPT_WITHOUT_MODEL
+                    for column in object_.columns
+                )
+            )
+        )
+    return True
+
+
 logger = logging.getLogger(__name__)
 
-ssl_context: ssl.SSLContext | None = None
-if USE_IAM_AUTH:
-    if not os.path.exists(SSL_CERT_FILE):
-        raise FileNotFoundError(f"Expected {SSL_CERT_FILE} when USE_IAM_AUTH is true.")
-    ssl_context = ssl.create_default_context(cafile=SSL_CERT_FILE)
+
+def connection_url(shard_name: str | None = None) -> str:
+    """Database URL for this migration run.
+
+    In precedence order: a caller that has already decided which database to target
+    (per-tenant migrations, via `ALEMBIC_TARGET_URL_ATTRIBUTE`), then an explicit
+    shard, then the process-wide POSTGRES_* settings.
+    """
+    configured = config.attributes.get(ALEMBIC_TARGET_URL_ATTRIBUTE)
+    if configured:
+        return configured
+
+    if shard_name is None:
+        return build_connection_string()
+
+    spec = get_shard_spec(shard_name)
+    return build_connection_string(
+        user=spec.user,
+        password=spec.password,
+        host=spec.host,
+        port=spec.port,
+        db=spec.db,
+    )
+
+
+# Fail at import rather than on the first connection. The context itself is built by
+# `create_pg_ssl_context`, which both the engine and the IAM listener use.
+if USE_IAM_AUTH and not os.path.exists(SSL_CERT_FILE):
+    raise FileNotFoundError(f"Expected {SSL_CERT_FILE} when USE_IAM_AUTH is true.")
 
 
 def filter_tenants_by_range(
@@ -97,16 +212,17 @@ def filter_tenants_by_range(
     filtered_tenant_schemas = sorted_tenant_schemas[start_idx:end_idx]
 
     # Combine with non-tenant schemas and preserve original order
-    filtered_tenants = []
-    for tenant_id in tenant_ids:
-        if tenant_id in filtered_tenant_schemas or tenant_id in non_tenant_schemas:
-            filtered_tenants.append(tenant_id)
+    filtered_tenants = [
+        tenant_id
+        for tenant_id in tenant_ids
+        if tenant_id in filtered_tenant_schemas or tenant_id in non_tenant_schemas
+    ]
 
     return filtered_tenants
 
 
 def get_schema_options() -> tuple[
-    bool, bool, bool, int | None, int | None, list[str] | None
+    bool, bool, bool, int | None, int | None, list[str] | None, str | None
 ]:
     x_args_raw = context.get_x_argument()
     x_args = {}
@@ -191,6 +307,13 @@ def get_schema_options() -> tuple[
             "or provide schemas. Cannot run default migration."
         )
 
+    # Pins the run to one physical database. Omitted means the default shard for a
+    # named-schema run, and every shard for upgrade_all_tenants.
+    shard = x_args.get("shard") or None
+    if shard is not None:
+        # Fails here rather than after connecting to the wrong database.
+        validate_shard_name(shard)
+
     return (
         create_schema,
         upgrade_all_tenants,
@@ -198,6 +321,7 @@ def get_schema_options() -> tuple[
         tenant_range_start,
         tenant_range_end,
         schemas,
+        shard,
     )
 
 
@@ -207,13 +331,16 @@ def do_run_migrations(
     if create_schema:
         connection.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema_name}"'))
 
-    connection.execute(text(f'SET search_path TO "{schema_name}"'))
+    # Per transaction, not once: a migration that commits mid-run may continue
+    # on another server connection behind PgBouncer transaction pooling.
+    pin_search_path_per_transaction(connection, schema_name)
 
     context.configure(
         connection=connection,
         target_metadata=target_metadata,
         version_table_schema=schema_name,
         include_schemas=True,
+        include_object=include_object,
         compare_type=True,
         compare_server_default=True,
         script_location=config.get_main_option("script_location"),
@@ -230,25 +357,97 @@ def do_run_migrations(
         CURRENT_TENANT_ID_CONTEXTVAR.reset(token)
 
 
-def provide_iam_token_for_alembic(
-    dialect: Any,  # noqa: ARG001
-    conn_rec: Any,  # noqa: ARG001
-    cargs: Any,  # noqa: ARG001
-    cparams: Any,
-) -> None:
+def create_migration_engine(target_url: str) -> AsyncEngine:
+    """Async engine for one database, with IAM bound to that database.
+
+    An RDS IAM token is only valid for the host/port/user it was minted for, so the
+    listener is built from the URL this engine connects to rather than from the
+    process-wide POSTGRES_* settings.
+    """
+    engine = create_async_engine(
+        target_url,
+        poolclass=pool.NullPool,
+        connect_args={"ssl": create_pg_ssl_context()},
+    )
     if USE_IAM_AUTH:
-        # Database connection settings
-        region = AWS_REGION_NAME
-        host = POSTGRES_HOST
-        port = POSTGRES_PORT
-        user = POSTGRES_USER
+        url = make_url(target_url)
+        event.listen(
+            engine.sync_engine,
+            "do_connect",
+            make_provide_iam_token_async(
+                url.host or POSTGRES_HOST,
+                str(url.port) if url.port else POSTGRES_PORT,
+                url.username or POSTGRES_USER,
+            ),
+        )
+    return engine
 
-        # Get IAM authentication token
-        token = get_iam_auth_token(host, port, user, region)
 
-        # For Alembic / SQLAlchemy in this context, set SSL and password
-        cparams["password"] = token
-        cparams["ssl"] = ssl_context
+async def _migrate_schemas(
+    engine: AsyncEngine,
+    schemas: list[str],
+    create_schema: bool,
+    continue_on_error: bool,
+    label: str,
+) -> None:
+    """Run migrations for a list of schemas against one database."""
+    num_schemas = len(schemas)
+    for i_schema, schema in enumerate(schemas, start=1):
+        logger.info(
+            "Migrating schema: index=%s num_%s=%s schema=%s",
+            i_schema,
+            label,
+            num_schemas,
+            schema,
+        )
+        try:
+            async with schema_migration_lock(engine, schema):
+                async with engine.connect() as connection:
+                    await connection.run_sync(
+                        do_run_migrations,
+                        schema_name=schema,
+                        create_schema=create_schema,
+                    )
+                    await connection.commit()
+        except Exception as e:
+            logger.error("Error migrating schema %s: %s", schema, e)
+            if not continue_on_error:
+                logger.error("--continue=true is not set, raising exception!")
+                raise
+
+            logger.warning("--continue=true is set, continuing to next schema.")
+
+
+def _tenants_to_migrate(
+    shard: str | None,
+    tenant_range_start: int | None,
+    tenant_range_end: int | None,
+) -> dict[str, list[str]]:
+    """Tenants needing migration, grouped by the shard that physically holds them."""
+    tenants_by_shard = get_tenant_ids_by_shard()
+    if shard is not None:
+        tenants_by_shard = {shard: tenants_by_shard.get(shard, [])}
+
+    if tenant_range_start is None and tenant_range_end is None:
+        return tenants_by_shard
+
+    # The range is positional over *all* tenants, so it has to be applied before
+    # partitioning — filtering per shard would select the range N times over.
+    all_tenants = sorted(set(chain.from_iterable(tenants_by_shard.values())))
+    selected = set(
+        filter_tenants_by_range(all_tenants, tenant_range_start, tenant_range_end)
+    )
+    logger.info(
+        "Filtering tenants by range: start=%s, end=%s. Total tenants: %s, Filtered tenants: %s",
+        tenant_range_start,
+        tenant_range_end,
+        len(all_tenants),
+        len(selected),
+    )
+    return {
+        shard_name: [t for t in tenants if t in selected]
+        for shard_name, tenants in tenants_by_shard.items()
+    }
 
 
 async def run_async_migrations() -> None:
@@ -259,6 +458,7 @@ async def run_async_migrations() -> None:
         tenant_range_start,
         tenant_range_end,
         schemas,
+        shard,
     ) = get_schema_options()
 
     if not schemas and not MULTI_TENANT:
@@ -267,93 +467,35 @@ async def run_async_migrations() -> None:
     # without init_engine, subsequent engine calls fail hard intentionally
     SqlEngine.init_engine(pool_size=20, max_overflow=5)
 
-    engine = create_async_engine(
-        build_connection_string(),
-        poolclass=pool.NullPool,
-    )
-
-    if USE_IAM_AUTH:
-
-        @event.listens_for(engine.sync_engine, "do_connect")
-        def event_provide_iam_token_for_alembic(
-            dialect: Any, conn_rec: Any, cargs: Any, cparams: Any
-        ) -> None:
-            provide_iam_token_for_alembic(dialect, conn_rec, cargs, cparams)
-
     if schemas:
         # Use specific schema names directly without fetching all tenants
         logger.info("Migrating specific schema names: %s", schemas)
 
-        i_schema = 0
-        num_schemas = len(schemas)
-        for schema in schemas:
-            i_schema += 1
-            logger.info(
-                "Migrating schema: index=%s num_schemas=%s schema=%s",
-                i_schema,
-                num_schemas,
-                schema,
+        engine = create_migration_engine(connection_url(shard))
+        try:
+            await _migrate_schemas(
+                engine, schemas, create_schema, continue_on_error, "schemas"
             )
-            try:
-                async with engine.connect() as connection:
-                    await connection.run_sync(
-                        do_run_migrations,
-                        schema_name=schema,
-                        create_schema=create_schema,
-                    )
-                    await connection.commit()
-            except Exception as e:
-                logger.error("Error migrating schema %s: %s", schema, e)
-                if not continue_on_error:
-                    logger.error("--continue=true is not set, raising exception!")
-                    raise
-
-                logger.warning("--continue=true is set, continuing to next schema.")
+        finally:
+            await engine.dispose()
 
     elif upgrade_all_tenants:
-        tenant_schemas = get_all_tenant_ids()
-
-        filtered_tenant_schemas = filter_tenants_by_range(
-            tenant_schemas, tenant_range_start, tenant_range_end
-        )
-
-        if tenant_range_start is not None or tenant_range_end is not None:
-            logger.info(
-                "Filtering tenants by range: start=%s, end=%s",
-                tenant_range_start,
-                tenant_range_end,
-            )
-            logger.info(
-                "Total tenants: %s, Filtered tenants: %s",
-                len(tenant_schemas),
-                len(filtered_tenant_schemas),
-            )
-
-        i_tenant = 0
-        num_tenants = len(filtered_tenant_schemas)
-        for schema in filtered_tenant_schemas:
-            i_tenant += 1
-            logger.info(
-                "Migrating schema: index=%s num_tenants=%s schema=%s",
-                i_tenant,
-                num_tenants,
-                schema,
-            )
+        # One engine per shard: a tenant's schema only exists on the database holding
+        # it, so migrating every tenant against a single engine would skip every
+        # tenant that has been moved off it.
+        for shard_name, tenants in sorted(
+            _tenants_to_migrate(shard, tenant_range_start, tenant_range_end).items()
+        ):
+            if not tenants:
+                continue
+            logger.info("Migrating %s tenant(s) on shard %s", len(tenants), shard_name)
+            engine = create_migration_engine(connection_url(shard_name))
             try:
-                async with engine.connect() as connection:
-                    await connection.run_sync(
-                        do_run_migrations,
-                        schema_name=schema,
-                        create_schema=create_schema,
-                    )
-                    await connection.commit()
-            except Exception as e:
-                logger.error("Error migrating schema %s: %s", schema, e)
-                if not continue_on_error:
-                    logger.error("--continue=true is not set, raising exception!")
-                    raise
-
-                logger.warning("--continue=true is set, continuing to next schema.")
+                await _migrate_schemas(
+                    engine, tenants, create_schema, continue_on_error, "tenants"
+                )
+            finally:
+                await engine.dispose()
 
     else:
         # This should not happen in the new design since we require either
@@ -362,8 +504,6 @@ async def run_async_migrations() -> None:
         raise ValueError(
             "No migration target specified. Use either upgrade_all_tenants=true for all tenants or schemas for specific schemas."
         )
-
-    await engine.dispose()
 
 
 def run_migrations_offline() -> None:
@@ -389,8 +529,16 @@ def run_migrations_offline() -> None:
         tenant_range_start,
         tenant_range_end,
         schemas,
+        shard,
     ) = get_schema_options()
-    url = build_connection_string()
+
+    # An offline run emits one SQL script, which can only be applied to one database.
+    if shard is None and is_sharded():
+        raise ValueError(
+            "Offline migrations must target a single database. Pass -x shard=<name>."
+        )
+
+    url = connection_url(shard)
 
     if schemas:
         # Use specific schema names directly without fetching all tenants
@@ -412,34 +560,14 @@ def run_migrations_offline() -> None:
                 context.run_migrations()
 
     elif upgrade_all_tenants:
-        engine = create_async_engine(url)
-
-        if USE_IAM_AUTH:
-
-            @event.listens_for(engine.sync_engine, "do_connect")
-            def event_provide_iam_token_for_alembic_offline(
-                dialect: Any, conn_rec: Any, cargs: Any, cparams: Any
-            ) -> None:
-                provide_iam_token_for_alembic(dialect, conn_rec, cargs, cparams)
-
-        tenant_schemas = get_all_tenant_ids()
-        engine.sync_engine.dispose()
-
-        filtered_tenant_schemas = filter_tenants_by_range(
-            tenant_schemas, tenant_range_start, tenant_range_end
-        )
-
-        if tenant_range_start is not None or tenant_range_end is not None:
-            logger.info(
-                "Filtering tenants by range: start=%s, end=%s",
-                tenant_range_start,
-                tenant_range_end,
-            )
-            logger.info(
-                "Total tenants: %s, Filtered tenants: %s",
-                len(tenant_schemas),
-                len(filtered_tenant_schemas),
-            )
+        # Single shard, enforced above, so this is the only group.
+        filtered_tenant_schemas = [
+            schema
+            for schemas_on_shard in _tenants_to_migrate(
+                shard, tenant_range_start, tenant_range_end
+            ).values()
+            for schema in schemas_on_shard
+        ]
 
         for schema in filtered_tenant_schemas:
             logger.info("Migrating schema: %s", schema)
@@ -483,14 +611,16 @@ def run_migrations_online() -> None:
 
         # pytest-alembic passes an Engine, we need to get a connection from it
         with connectable.connect() as connection:
-            # Set search path for the schema
-            connection.execute(text(f'SET search_path TO "{schema_name}"'))
+            pin_search_path_per_transaction(connection, schema_name)
 
             context.configure(
                 connection=connection,
                 target_metadata=target_metadata,
-                version_table_schema=schema_name,
-                include_schemas=True,
+                version_table_schema=(
+                    None if schema_name == POSTGRES_DEFAULT_SCHEMA else schema_name
+                ),
+                include_schemas=schema_name != POSTGRES_DEFAULT_SCHEMA,
+                include_object=include_object,
                 compare_type=True,
                 compare_server_default=True,
                 script_location=config.get_main_option("script_location"),

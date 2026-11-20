@@ -1,47 +1,27 @@
 """Unit tests for multi-model answer generation types.
 
 Tests cover:
-- Placement.model_index serialization
 - MultiModelMessageResponseIDInfo round-trip
 - SendMessageRequest.llm_overrides backward compatibility
 - ChatMessageDetail new fields
 """
 
-from datetime import datetime
-from datetime import timezone
+from datetime import datetime, timezone
 from uuid import uuid4
 
 from onyx.llm.override_models import LLMOverride
-from onyx.server.query_and_chat.models import ChatMessageDetail
-from onyx.server.query_and_chat.models import ModelResponseSlot
-from onyx.server.query_and_chat.models import MultiModelMessageResponseIDInfo
-from onyx.server.query_and_chat.models import SendMessageRequest
-from onyx.server.query_and_chat.placement import Placement
-
-
-class TestPlacementModelIndex:
-    def test_default_none(self) -> None:
-        p = Placement(turn_index=0)
-        assert p.model_index is None
-
-    def test_set_value(self) -> None:
-        p = Placement(turn_index=0, model_index=2)
-        assert p.model_index == 2
-
-    def test_serializes(self) -> None:
-        p = Placement(turn_index=0, tab_index=1, model_index=1)
-        d = p.model_dump()
-        assert d["model_index"] == 1
-
-    def test_none_excluded_when_default(self) -> None:
-        p = Placement(turn_index=0)
-        d = p.model_dump()
-        assert d["model_index"] is None
+from onyx.server.query_and_chat.models import (
+    ChatMessageDetail,
+    ModelResponseSlot,
+    MultiModelMessageResponseIDInfo,
+    SendMessageRequest,
+)
 
 
 class TestMultiModelMessageResponseIDInfo:
     def test_round_trip(self) -> None:
         info = MultiModelMessageResponseIDInfo(
+            mentions=[],
             user_message_id=42,
             responses=[
                 ModelResponseSlot(message_id=43, model_name="gpt-4"),
@@ -61,6 +41,7 @@ class TestMultiModelMessageResponseIDInfo:
 
     def test_null_user_message_id(self) -> None:
         info = MultiModelMessageResponseIDInfo(
+            mentions=[],
             user_message_id=None,
             responses=[
                 ModelResponseSlot(message_id=1, model_name="a"),
@@ -106,6 +87,7 @@ class TestChatMessageDetailMultiModel:
         from onyx.configs.constants import MessageType
 
         detail = ChatMessageDetail(
+            mentions=[],
             message_id=1,
             message="hello",
             message_type=MessageType.ASSISTANT,
@@ -119,6 +101,7 @@ class TestChatMessageDetailMultiModel:
         from onyx.configs.constants import MessageType
 
         detail = ChatMessageDetail(
+            mentions=[],
             message_id=1,
             message="hello",
             message_type=MessageType.USER,
@@ -134,6 +117,7 @@ class TestChatMessageDetailMultiModel:
         from onyx.configs.constants import MessageType
 
         detail = ChatMessageDetail(
+            mentions=[],
             message_id=1,
             message="hello",
             message_type=MessageType.ASSISTANT,

@@ -1,17 +1,19 @@
-from fastapi import APIRouter
-from fastapi import Depends
-from fastapi import HTTPException
+from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
 from ee.onyx.onyxbot.slack.handlers.handle_standard_answers import (
     oneoff_standard_answers,
 )
-from ee.onyx.server.query_and_chat.models import StandardAnswerRequest
-from ee.onyx.server.query_and_chat.models import StandardAnswerResponse
+from ee.onyx.server.query_and_chat.models import (
+    StandardAnswerRequest,
+    StandardAnswerResponse,
+)
 from onyx.auth.permissions import require_permission
 from onyx.db.engine.sql_engine import get_session
 from onyx.db.enums import Permission
 from onyx.db.models import User
+from onyx.error_handling.error_codes import OnyxErrorCode
+from onyx.error_handling.exceptions import OnyxError
 from onyx.utils.logger import setup_logger
 
 logger = setup_logger()
@@ -34,4 +36,6 @@ def get_standard_answer(
         return StandardAnswerResponse(standard_answers=standard_answers)
     except Exception as e:
         logger.error("Error in get_standard_answer: %s", str(e), exc_info=True)
-        raise HTTPException(status_code=500, detail="An internal server error occurred")
+        raise OnyxError(
+            OnyxErrorCode.INTERNAL_ERROR, "An internal server error occurred"
+        )

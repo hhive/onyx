@@ -1,7 +1,6 @@
 """Tests for tenant provisioning helpers."""
 
-from unittest.mock import MagicMock
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 _PROVISIONING_MODULE = "ee.onyx.server.tenants.provisioning"
 
@@ -51,7 +50,7 @@ def _run_configure(
             return_value=None,
         ),
         patch(f"{_PROVISIONING_MODULE}.upsert_llm_provider") as upsert_mock,
-        patch(f"{_PROVISIONING_MODULE}.update_default_provider"),
+        patch(f"{_PROVISIONING_MODULE}.update_default_model"),
         patch(
             f"{_PROVISIONING_MODULE}.create_default_image_gen_config_from_api_key"
         ) as image_gen_mock,

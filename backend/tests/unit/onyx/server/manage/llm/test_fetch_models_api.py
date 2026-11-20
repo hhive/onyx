@@ -2,27 +2,32 @@
 
 These tests verify the full request/response flow for fetching models
 from dynamic providers (Ollama, OpenRouter, Litellm), including the
-sync-to-DB behavior when provider_name is specified.
+sync-to-DB behavior when provider_id is specified.
 """
 
-from unittest.mock import MagicMock
-from unittest.mock import patch
+import os
+from typing import Any
+from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
 
 from onyx.db.enums import LLMModelFlowType
 from onyx.error_handling.exceptions import OnyxError
-from onyx.server.manage.llm.models import BifrostFinalModelResponse
-from onyx.server.manage.llm.models import BifrostModelsRequest
-from onyx.server.manage.llm.models import LitellmFinalModelResponse
-from onyx.server.manage.llm.models import LitellmModelsRequest
-from onyx.server.manage.llm.models import LMStudioFinalModelResponse
-from onyx.server.manage.llm.models import LMStudioModelsRequest
-from onyx.server.manage.llm.models import OllamaFinalModelResponse
-from onyx.server.manage.llm.models import OllamaModelsRequest
-from onyx.server.manage.llm.models import OpenRouterFinalModelResponse
-from onyx.server.manage.llm.models import OpenRouterModelsRequest
+from onyx.server.manage.llm.models import (
+    BedrockModelsRequest,
+    BifrostFinalModelResponse,
+    BifrostModelsRequest,
+    LitellmFinalModelResponse,
+    LitellmModelsRequest,
+    LMStudioFinalModelResponse,
+    LMStudioModelsRequest,
+    OllamaFinalModelResponse,
+    OllamaModelsRequest,
+    OpenAICompatibleModelsRequest,
+    OpenRouterFinalModelResponse,
+    OpenRouterModelsRequest,
+)
 
 
 class TestGetOllamaAvailableModels:
@@ -87,10 +92,51 @@ class TestGetOllamaAvailableModels:
                 [r.name for r in results], key=str.lower
             )
 
-    def test_syncs_to_db_when_provider_name_specified(
+    def test_unreachable_server_returns_400(self) -> None:
+        """An unreachable Ollama URL maps to 400, not a 502 gateway fault.
+
+        Patch ``httpx.get``, not the whole module, so the real ``httpx``
+        exception classes remain usable in the handler's except clauses.
+        """
+        from onyx.error_handling.error_codes import OnyxErrorCode
+        from onyx.server.manage.llm.api import get_ollama_available_models
+
+        with patch(
+            "onyx.server.manage.llm.api.httpx.get",
+            side_effect=httpx.ConnectError("connection refused", request=MagicMock()),
+        ):
+            request = OllamaModelsRequest(api_base="http://localhost:11434")
+            with pytest.raises(OnyxError) as exc_info:
+                get_ollama_available_models(request, MagicMock(), MagicMock())
+
+        assert exc_info.value.error_code == OnyxErrorCode.VALIDATION_ERROR
+        assert exc_info.value.status_code == 400
+
+    def test_upstream_error_status_returns_502(self) -> None:
+        """An error *response* from Ollama is a genuine upstream fault → 502."""
+        from onyx.error_handling.error_codes import OnyxErrorCode
+        from onyx.server.manage.llm.api import get_ollama_available_models
+
+        error_response = httpx.Response(
+            status_code=500, request=httpx.Request("GET", "http://localhost:11434")
+        )
+        with patch(
+            "onyx.server.manage.llm.api.httpx.get",
+            side_effect=httpx.HTTPStatusError(
+                "server error", request=error_response.request, response=error_response
+            ),
+        ):
+            request = OllamaModelsRequest(api_base="http://localhost:11434")
+            with pytest.raises(OnyxError) as exc_info:
+                get_ollama_available_models(request, MagicMock(), MagicMock())
+
+        assert exc_info.value.error_code == OnyxErrorCode.BAD_GATEWAY
+        assert exc_info.value.status_code == 502
+
+    def test_syncs_to_db_when_provider_id_specified(
         self, mock_ollama_tags_response: dict, mock_ollama_show_response: dict
     ) -> None:
-        """Test that models are synced to DB when provider_name is given."""
+        """Test that models are synced to DB when provider_id is given."""
         from onyx.server.manage.llm.api import get_ollama_available_models
 
         mock_session = MagicMock()
@@ -101,7 +147,8 @@ class TestGetOllamaAvailableModels:
         with (
             patch("onyx.server.manage.llm.api.httpx") as mock_httpx,
             patch(
-                "onyx.db.llm.fetch_existing_llm_provider", return_value=mock_provider
+                "onyx.db.llm.fetch_existing_llm_provider_by_id",
+                return_value=mock_provider,
             ),
         ):
             mock_get_response = MagicMock()
@@ -114,20 +161,27 @@ class TestGetOllamaAvailableModels:
             mock_post_response.raise_for_status = MagicMock()
             mock_httpx.post.return_value = mock_post_response
 
+            # The bulk model insert returns the inserted (id, name) rows.
+            mock_session.execute.return_value.all.return_value = [
+                (1, "llama3:latest"),
+                (2, "mistral:7b"),
+                (3, "qwen2.5:14b"),
+            ]
+
             request = OllamaModelsRequest(
                 api_base="http://localhost:11434",
-                provider_name="my-ollama",
+                provider_id=1,
             )
             get_ollama_available_models(request, MagicMock(), mock_session)
 
-            # Verify DB operations were called
-            assert mock_session.execute.call_count == 6
+            # One bulk insert for the models, one for their flows.
+            assert mock_session.execute.call_count == 2
             mock_session.commit.assert_called_once()
 
-    def test_no_sync_when_provider_name_not_specified(
+    def test_no_sync_when_provider_id_not_specified(
         self, mock_ollama_tags_response: dict, mock_ollama_show_response: dict
     ) -> None:
-        """Test that models are NOT synced when provider_name is None."""
+        """Test that models are NOT synced when provider_id is None."""
         from onyx.server.manage.llm.api import get_ollama_available_models
 
         mock_session = MagicMock()
@@ -329,23 +383,33 @@ class TestGetOpenRouterAvailableModels:
             assert claude.supports_image_input is True
             assert llama.supports_image_input is False
 
-    def test_syncs_to_db_when_provider_name_specified(
-        self, mock_openrouter_response: dict
-    ) -> None:
-        """Test that models are synced to DB when provider_name is given."""
+    def test_marks_router_models(self, mock_openrouter_response: dict) -> None:
+        """Router entries are detected via tokenizer "Router" or -1 pricing."""
         from onyx.server.manage.llm.api import get_openrouter_available_models
 
-        mock_session = MagicMock()
-        mock_provider = MagicMock()
-        mock_provider.id = 1
-        mock_provider.model_configurations = []
+        mock_openrouter_response["data"].extend(
+            [
+                {
+                    "id": "openrouter/auto",
+                    "name": "Auto Router",
+                    "architecture": {
+                        "tokenizer": "Router",
+                        "input_modalities": ["text", "image"],
+                    },
+                    "pricing": {"prompt": "-1", "completion": "-1"},
+                },
+                {
+                    "id": "openrouter/fusion",
+                    "name": "Fusion",
+                    "architecture": {"input_modalities": ["text"]},
+                    "pricing": {"prompt": "-1", "completion": "-1"},
+                },
+            ]
+        )
 
-        with (
-            patch("onyx.server.manage.llm.api.httpx.get") as mock_get,
-            patch(
-                "onyx.db.llm.fetch_existing_llm_provider", return_value=mock_provider
-            ),
-        ):
+        mock_session = MagicMock()
+
+        with patch("onyx.server.manage.llm.api.httpx.get") as mock_get:
             mock_response = MagicMock()
             mock_response.json.return_value = mock_openrouter_response
             mock_response.raise_for_status = MagicMock()
@@ -354,12 +418,60 @@ class TestGetOpenRouterAvailableModels:
             request = OpenRouterModelsRequest(
                 api_base="https://openrouter.ai/api/v1",
                 api_key="test-key",
-                provider_name="my-openrouter",
+            )
+            results = get_openrouter_available_models(
+                request, MagicMock(), mock_session
+            )
+
+            by_name = {r.name: r for r in results}
+            assert by_name["openrouter/auto"].is_router is True
+            assert by_name["openrouter/fusion"].is_router is True
+            assert by_name["anthropic/claude-3.5-sonnet"].is_router is False
+            assert by_name["openai/gpt-4o"].is_router is False
+
+    def test_syncs_to_db_when_provider_id_specified(
+        self, mock_openrouter_response: dict
+    ) -> None:
+        """Test that models are synced to DB when provider_id is given."""
+        from onyx.server.manage.llm.api import get_openrouter_available_models
+
+        mock_session = MagicMock()
+        mock_provider = MagicMock()
+        mock_provider.id = 1
+        mock_provider.provider = "openrouter"
+        mock_provider.model_configurations = []
+
+        with (
+            patch("onyx.server.manage.llm.api.httpx.get") as mock_get,
+            patch(
+                "onyx.server.manage.llm.api.fetch_existing_llm_provider_by_id",
+                return_value=mock_provider,
+            ),
+            patch(
+                "onyx.db.llm.fetch_existing_llm_provider_by_id",
+                return_value=mock_provider,
+            ),
+        ):
+            mock_response = MagicMock()
+            mock_response.json.return_value = mock_openrouter_response
+            mock_response.raise_for_status = MagicMock()
+            mock_get.return_value = mock_response
+
+            mock_session.execute.return_value.all.return_value = [
+                (1, "anthropic/claude-3.5-sonnet"),
+                (2, "openai/gpt-4o"),
+                (3, "meta-llama/llama-3.1-70b"),
+            ]
+
+            request = OpenRouterModelsRequest(
+                api_base="https://openrouter.ai/api/v1",
+                api_key="test-key",
+                provider_id=1,
             )
             get_openrouter_available_models(request, MagicMock(), mock_session)
 
-            # Verify DB operations were called
-            assert mock_session.execute.call_count == 8
+            # One bulk insert for the models, one for their flows.
+            assert mock_session.execute.call_count == 2
             mock_session.commit.assert_called_once()
 
     def test_preserves_existing_models_on_sync(
@@ -370,18 +482,30 @@ class TestGetOpenRouterAvailableModels:
 
         mock_session = MagicMock()
 
-        # Provider already has claude model
+        # Provider already has claude model, with capability flows already
+        # up to date so the sync leaves it untouched.
         existing_model = MagicMock()
         existing_model.name = "anthropic/claude-3.5-sonnet"
+        existing_model.llm_model_flow_types = [
+            LLMModelFlowType.CHAT,
+            LLMModelFlowType.VISION,
+            LLMModelFlowType.REASONING,
+        ]
 
         mock_provider = MagicMock()
         mock_provider.id = 1
+        mock_provider.provider = "openrouter"
         mock_provider.model_configurations = [existing_model]
 
         with (
             patch("onyx.server.manage.llm.api.httpx.get") as mock_get,
             patch(
-                "onyx.db.llm.fetch_existing_llm_provider", return_value=mock_provider
+                "onyx.server.manage.llm.api.fetch_existing_llm_provider_by_id",
+                return_value=mock_provider,
+            ),
+            patch(
+                "onyx.db.llm.fetch_existing_llm_provider_by_id",
+                return_value=mock_provider,
             ),
         ):
             mock_response = MagicMock()
@@ -389,20 +513,33 @@ class TestGetOpenRouterAvailableModels:
             mock_response.raise_for_status = MagicMock()
             mock_get.return_value = mock_response
 
+            mock_session.execute.return_value.all.return_value = [
+                (2, "openai/gpt-4o"),
+                (3, "meta-llama/llama-3.1-70b"),
+            ]
+
             request = OpenRouterModelsRequest(
                 api_base="https://openrouter.ai/api/v1",
                 api_key="test-key",
-                provider_name="my-openrouter",
+                provider_id=1,
             )
             get_openrouter_available_models(request, MagicMock(), mock_session)
 
-            # Only 2 new models should be inserted (claude already exists)
-            assert mock_session.execute.call_count == 5
+            # Claude already exists and is untouched: one bulk insert for the two
+            # new models and one for their flows.
+            assert mock_session.execute.call_count == 2
+            inserted_names = {
+                key: value
+                for call in mock_session.execute.call_args_list
+                for key, value in call.args[0].compile().params.items()
+                if key.startswith("name")
+            }
+            assert "anthropic/claude-3.5-sonnet" not in inserted_names.values()
 
-    def test_no_sync_when_provider_name_not_specified(
+    def test_no_sync_when_provider_id_not_specified(
         self, mock_openrouter_response: dict
     ) -> None:
-        """Test that models are NOT synced when provider_name is None."""
+        """Test that models are NOT synced when provider_id is None."""
         from onyx.server.manage.llm.api import get_openrouter_available_models
 
         mock_session = MagicMock()
@@ -546,6 +683,60 @@ class TestGetLMStudioAvailableModels:
             assert deepseek.supports_reasoning is True
             assert llama.supports_reasoning is False
 
+    def test_reads_capabilities_given_as_options_objects(self) -> None:
+        """Test that option-object capabilities are read as booleans.
+
+        Newer LM Studio servers describe a capability with an object such as
+        {"allowed_options": ["off", "on"], "default": "on"} instead of a bool.
+        """
+        from onyx.server.manage.llm.api import get_lm_studio_available_models
+
+        mock_session = MagicMock()
+        response = {
+            "models": [
+                {
+                    "key": "openai/gpt-oss-20b",
+                    "type": "llm",
+                    "display_name": "gpt-oss 20B",
+                    "max_context_length": 131072,
+                    "capabilities": {
+                        "reasoning": {
+                            "allowed_options": ["off", "low", "medium", "high"],
+                            "default": "medium",
+                        },
+                        "vision": {"allowed_options": ["off", "on"], "default": "on"},
+                    },
+                },
+                {
+                    "key": "lmstudio-community/Meta-Llama-3-8B",
+                    "type": "llm",
+                    "display_name": "Meta Llama 3 8B",
+                    "max_context_length": 8192,
+                    "capabilities": {
+                        "reasoning": {"allowed_options": ["off"], "default": "off"},
+                        "vision": False,
+                    },
+                },
+            ]
+        }
+
+        with patch("onyx.server.manage.llm.api.httpx") as mock_httpx:
+            mock_response = MagicMock()
+            mock_response.json.return_value = response
+            mock_response.raise_for_status = MagicMock()
+            mock_httpx.get.return_value = mock_response
+
+            request = LMStudioModelsRequest(api_base="http://localhost:1234")
+            results = get_lm_studio_available_models(request, MagicMock(), mock_session)
+
+            gpt_oss = next(r for r in results if "gpt-oss" in r.name)
+            llama = next(r for r in results if "Llama" in r.name)
+
+            assert gpt_oss.supports_reasoning is True
+            assert gpt_oss.supports_image_input is True
+            assert llama.supports_reasoning is False
+            assert llama.supports_image_input is False
+
     def test_uses_display_name_from_api(self, mock_lm_studio_response: dict) -> None:
         """Test that display_name from the API is used directly."""
         from onyx.server.manage.llm.api import get_lm_studio_available_models
@@ -620,7 +811,7 @@ class TestGetLMStudioAvailableModels:
         with (
             patch("onyx.server.manage.llm.api.httpx") as mock_httpx,
             patch(
-                "onyx.server.manage.llm.api.fetch_existing_llm_provider",
+                "onyx.server.manage.llm.api.fetch_existing_llm_provider_by_id",
                 return_value=mock_provider,
             ),
         ):
@@ -633,7 +824,7 @@ class TestGetLMStudioAvailableModels:
                 api_base="http://localhost:1234",
                 api_key="masked-value",
                 api_key_changed=False,
-                provider_name="my-lm-studio",
+                provider_id=1,
             )
             get_lm_studio_available_models(request, MagicMock(), mock_session)
 
@@ -667,7 +858,7 @@ class TestGetLMStudioAvailableModels:
                 api_base="http://localhost:1234",
                 api_key="new-secret",
                 api_key_changed=True,
-                provider_name="my-lm-studio",
+                provider_id=1,
             )
             get_lm_studio_available_models(request, MagicMock(), mock_session)
 
@@ -744,7 +935,8 @@ class TestGetLMStudioAvailableModels:
         with (
             patch("onyx.server.manage.llm.api.httpx") as mock_httpx,
             patch(
-                "onyx.db.llm.fetch_existing_llm_provider", return_value=mock_provider
+                "onyx.db.llm.fetch_existing_llm_provider_by_id",
+                return_value=mock_provider,
             ),
         ):
             mock_response = MagicMock()
@@ -752,17 +944,23 @@ class TestGetLMStudioAvailableModels:
             mock_response.raise_for_status = MagicMock()
             mock_httpx.get.return_value = mock_response
 
+            mock_session.execute.return_value.all.return_value = [
+                (1, "lmstudio-community/DeepSeek-R1-8B")
+            ]
+
             request = LMStudioModelsRequest(
                 api_base="http://localhost:1234",
-                provider_name="my-lm-studio",
+                provider_id=1,
             )
             get_lm_studio_available_models(request, MagicMock(), mock_session)
 
-        # Inspect execute calls for a REASONING flow insert.
+        # The bulk flow insert carries one llm_model_flow_type_N param per row.
         inserted_flow_types = [
-            call.args[0].compile().params.get("llm_model_flow_type")
+            value
             for call in mock_session.execute.call_args_list
             if hasattr(call.args[0], "compile")
+            for key, value in call.args[0].compile().params.items()
+            if key.startswith("llm_model_flow_type")
         ]
         assert LLMModelFlowType.REASONING in inserted_flow_types
 
@@ -1226,8 +1424,9 @@ class TestGetLitellmAvailableModels:
             call_args = mock_get.call_args
             assert call_args[0][0] == "http://localhost:4000/v1/model/info"
 
-    def test_connection_failure_raises_onyx_error(self) -> None:
-        """Test that connection failures are wrapped in OnyxError."""
+    def test_connection_failure_returns_400(self) -> None:
+        """An unreachable proxy is a client misconfig → 400 VALIDATION_ERROR, not 502."""
+        from onyx.error_handling.error_codes import OnyxErrorCode
         from onyx.server.manage.llm.api import get_litellm_available_models
 
         mock_session = MagicMock()
@@ -1241,8 +1440,11 @@ class TestGetLitellmAvailableModels:
                 api_base="http://localhost:4000",
                 api_key="test-key",
             )
-            with pytest.raises(OnyxError, match="Failed to fetch LiteLLM proxy models"):
+            with pytest.raises(OnyxError) as exc_info:
                 get_litellm_available_models(request, MagicMock(), mock_session)
+
+        assert exc_info.value.error_code == OnyxErrorCode.VALIDATION_ERROR
+        assert exc_info.value.status_code == 400
 
     def test_401_raises_authentication_error(self) -> None:
         """Test that a 401 response raises OnyxError with authentication message."""
@@ -1294,8 +1496,8 @@ class TestGetBifrostAvailableModels:
         return {
             "data": [
                 {
-                    "id": "anthropic/claude-3-5-sonnet",
-                    "name": "Claude 3.5 Sonnet",
+                    "id": "anthropic/claude-sonnet-4-5",
+                    "name": "Claude Sonnet 4.5",
                     "context_length": 200000,
                 },
                 {
@@ -1347,13 +1549,56 @@ class TestGetBifrostAvailableModels:
             request = BifrostModelsRequest(api_base="https://bifrost.example.com")
             results = get_bifrost_available_models(request, MagicMock(), mock_session)
 
-            claude = next(r for r in results if r.name == "anthropic/claude-3-5-sonnet")
+            claude = next(r for r in results if r.name == "anthropic/claude-sonnet-4-5")
             gpt4o = next(r for r in results if r.name == "openai/gpt-4o")
             deepseek = next(r for r in results if r.name == "deepseek/deepseek-r1")
 
             assert claude.supports_image_input is True
             assert gpt4o.supports_image_input is True
             assert deepseek.supports_image_input is False
+
+    def test_infers_reasoning_support(self) -> None:
+        """Reasoning support comes from the LiteLLM cost map first — Bifrost's
+        vendor-prefixed IDs (e.g. anthropic/claude-sonnet-4-5) don't match the
+        substring heuristic — with the heuristic as fallback."""
+        from onyx.server.manage.llm.api import get_bifrost_available_models
+
+        mock_session = MagicMock()
+        response = {
+            "data": [
+                {
+                    "id": "anthropic/claude-sonnet-4-5",
+                    "name": "Claude Sonnet 4.5",
+                    "context_length": 200000,
+                },
+                {
+                    "id": "openai/gpt-4o",
+                    "name": "GPT-4o",
+                    "context_length": 128000,
+                },
+                {
+                    "id": "deepseek/deepseek-r1",
+                    "name": "DeepSeek R1",
+                    "context_length": 64000,
+                },
+            ]
+        }
+
+        with patch("onyx.server.manage.llm.api.httpx.get") as mock_get:
+            mock_response = MagicMock()
+            mock_response.json.return_value = response
+            mock_response.raise_for_status = MagicMock()
+            mock_get.return_value = mock_response
+
+            request = BifrostModelsRequest(api_base="https://bifrost.example.com")
+            results = get_bifrost_available_models(request, MagicMock(), mock_session)
+
+            by_name = {r.name: r.supports_reasoning for r in results}
+            # Cost map hit; the substring heuristic alone would say False
+            assert by_name["anthropic/claude-sonnet-4-5"] is True
+            assert by_name["openai/gpt-4o"] is False
+            # Reasoning-named model stays True (heuristic covers cost-map misses)
+            assert by_name["deepseek/deepseek-r1"] is True
 
     def test_existing_v1_suffix_is_not_duplicated(self) -> None:
         """Test that an existing /v1 suffix still hits a single /v1/models endpoint."""
@@ -1410,8 +1655,9 @@ class TestGetBifrostAvailableModels:
             assert by_name["openai/gpt-4o"] == "GPT-4o"
             assert by_name["some/custom-model"] == "some/custom-model"
 
-    def test_request_failure_is_logged_and_wrapped(self) -> None:
-        """Test that request-layer failures are logged before raising OnyxError."""
+    def test_request_failure_is_logged_and_returns_400(self) -> None:
+        """A request-layer failure is logged and returns 400 (client misconfig)."""
+        from onyx.error_handling.error_codes import OnyxErrorCode
         from onyx.server.manage.llm.api import get_bifrost_available_models
 
         mock_session = MagicMock()
@@ -1425,7 +1671,266 @@ class TestGetBifrostAvailableModels:
             )
 
             request = BifrostModelsRequest(api_base="https://bifrost.example.com")
-            with pytest.raises(OnyxError, match="Failed to fetch Bifrost models"):
+            with pytest.raises(OnyxError) as exc_info:
                 get_bifrost_available_models(request, MagicMock(), mock_session)
 
             mock_warning.assert_called_once()
+
+        assert exc_info.value.error_code == OnyxErrorCode.VALIDATION_ERROR
+        assert exc_info.value.status_code == 400
+
+
+class TestGetOpenAICompatibleAvailableModels:
+    """Tests for the generic OpenAI-compatible model fetch endpoint."""
+
+    def test_infers_reasoning_support(self) -> None:
+        """Reasoning support comes from the LiteLLM cost map first, with the
+        substring heuristic as fallback for models LiteLLM doesn't know."""
+        from onyx.server.manage.llm.api import (
+            get_openai_compatible_server_available_models,
+        )
+
+        mock_session = MagicMock()
+        response = {
+            "data": [
+                {"id": "gemini-2.5-pro", "name": "Gemini 2.5 Pro"},
+                {"id": "gpt-4o", "name": "GPT-4o"},
+                {"id": "deepseek-r1", "name": "DeepSeek R1"},
+            ]
+        }
+
+        with patch("onyx.server.manage.llm.api.httpx.get") as mock_get:
+            mock_response = MagicMock()
+            mock_response.json.return_value = response
+            mock_response.raise_for_status = MagicMock()
+            mock_get.return_value = mock_response
+
+            request = OpenAICompatibleModelsRequest(api_base="https://llm.example.com")
+            results = get_openai_compatible_server_available_models(
+                request, MagicMock(), mock_session
+            )
+
+            by_name = {r.name: r.supports_reasoning for r in results}
+            # Cost map hit; the substring heuristic alone would say False
+            assert by_name["gemini-2.5-pro"] is True
+            assert by_name["gpt-4o"] is False
+            # Reasoning-named model stays True (heuristic covers cost-map misses)
+            assert by_name["deepseek-r1"] is True
+
+
+class _StopBeforeSend(Exception):
+    """Aborts a boto3 call right after signing so tests can inspect headers
+    without making a network request."""
+
+
+class TestGetBedrockAvailableModels:
+    """Tests for the Bedrock model fetch endpoint."""
+
+    @pytest.fixture
+    def mock_bedrock_client(self) -> MagicMock:
+        client = MagicMock()
+        client.list_foundation_models.return_value = {
+            "modelSummaries": [
+                {
+                    "modelId": "anthropic.claude-opus-4-7",
+                    "modelName": "Claude Opus 4.7",
+                    "inputModalities": ["TEXT", "IMAGE"],
+                    "responseStreamingSupported": True,
+                }
+            ]
+        }
+        client.list_inference_profiles.return_value = {"inferenceProfileSummaries": []}
+        return client
+
+    def test_bearer_token_delivered_via_per_session_provider(
+        self, mock_bedrock_client: MagicMock
+    ) -> None:
+        """Bearer token must reach boto3 via a per-session token provider with
+        signature_version='bearer' — not via the process-wide
+        AWS_BEARER_TOKEN_BEDROCK env var, which would race across concurrent
+        admin requests."""
+        from onyx.server.manage.llm.api import get_bedrock_available_models
+
+        env_before = os.environ.get("AWS_BEARER_TOKEN_BEDROCK")
+
+        mock_session = MagicMock()
+        mock_session.client.return_value = mock_bedrock_client
+
+        with patch(
+            "onyx.server.manage.llm.api.boto3.Session",
+            return_value=mock_session,
+        ) as mock_session_cls:
+            request = BedrockModelsRequest(
+                aws_region_name="us-west-2",
+                aws_bearer_token_bedrock="test-bearer-token",
+            )
+            get_bedrock_available_models(request, MagicMock(), MagicMock())
+
+        # Session was built from a botocore_session carrying our token provider.
+        botocore_session = mock_session_cls.call_args.kwargs["botocore_session"]
+        provider = botocore_session.get_component("token_provider")
+        assert provider.load_token(signing_name="bedrock").token == "test-bearer-token"
+        # Provider is scoped to bedrock — won't leak into other AWS services.
+        assert provider.load_token(signing_name="sso") is None
+
+        # Client was created with bearer signing.
+        client_config = mock_session.client.call_args.kwargs["config"]
+        assert client_config.signature_version == "bearer"
+
+        # The process-wide env var was never touched.
+        assert os.environ.get("AWS_BEARER_TOKEN_BEDROCK") == env_before
+
+    def test_no_bearer_token_means_no_signature_override(
+        self, mock_bedrock_client: MagicMock
+    ) -> None:
+        """When the request omits the bearer token (key/IAM auth path), we must
+        not force signature_version='bearer' — that would break SigV4."""
+        from onyx.server.manage.llm.api import get_bedrock_available_models
+
+        mock_session = MagicMock()
+        mock_session.client.return_value = mock_bedrock_client
+
+        with patch(
+            "onyx.server.manage.llm.api.boto3.Session",
+            return_value=mock_session,
+        ):
+            request = BedrockModelsRequest(
+                aws_region_name="us-west-2",
+                aws_access_key_id="AKIAEXAMPLE",
+                aws_secret_access_key="secret",
+            )
+            get_bedrock_available_models(request, MagicMock(), MagicMock())
+
+        assert mock_session.client.call_args.kwargs["config"] is None
+
+    def test_role_assumed_with_base_credentials(
+        self, mock_bedrock_client: MagicMock
+    ) -> None:
+        """A role ARN is assumed with the submitted credentials, and models
+        are listed with the temporary credentials of that role."""
+        from onyx.server.manage.llm.api import get_bedrock_available_models
+
+        base_session = MagicMock()
+        sts_client = base_session.client.return_value
+        sts_client.assume_role.return_value = {
+            "Credentials": {
+                "AccessKeyId": "ASIATEMP",
+                "SecretAccessKey": "temp-secret",
+                "SessionToken": "temp-token",
+            }
+        }
+        role_session = MagicMock()
+        role_session.client.return_value = mock_bedrock_client
+
+        with patch(
+            "onyx.server.manage.llm.api.boto3.Session",
+            side_effect=[base_session, role_session],
+        ) as mock_session_cls:
+            request = BedrockModelsRequest(
+                aws_region_name="us-west-2",
+                aws_access_key_id="AKIAEXAMPLE",
+                aws_secret_access_key="secret",
+                aws_role_name="arn:aws:iam::123456789012:role/bedrock",
+                aws_external_id="ext-id",
+            )
+            results = get_bedrock_available_models(request, MagicMock(), MagicMock())
+
+        base_session.client.assert_called_once_with("sts", region_name="us-west-2")
+        sts_client.assume_role.assert_called_once_with(
+            RoleArn="arn:aws:iam::123456789012:role/bedrock",
+            RoleSessionName="onyx-bedrock-model-fetch",
+            ExternalId="ext-id",
+        )
+        assert mock_session_cls.call_args_list[1].kwargs == {
+            "aws_access_key_id": "ASIATEMP",
+            "aws_secret_access_key": "temp-secret",
+            "aws_session_token": "temp-token",
+            "region_name": "us-west-2",
+        }
+        assert [r.name for r in results] == ["anthropic.claude-opus-4-7"]
+
+    @patch("onyx.server.manage.llm.api.MULTI_TENANT", True)
+    def test_role_rejected_in_multi_tenant(self) -> None:
+        from onyx.server.manage.llm.api import get_bedrock_available_models
+
+        with patch("onyx.server.manage.llm.api.boto3.Session") as mock_session_cls:
+            request = BedrockModelsRequest(
+                aws_region_name="us-west-2",
+                aws_role_name="arn:aws:iam::123456789012:role/bedrock",
+            )
+            with pytest.raises(OnyxError):
+                get_bedrock_available_models(request, MagicMock(), MagicMock())
+
+        mock_session_cls.assert_not_called()
+
+    def test_masked_bearer_token_resolved_from_existing_provider(
+        self, mock_bedrock_client: MagicMock
+    ) -> None:
+        """Editing an existing provider sends the masked bearer token. The
+        endpoint must swap it back for the stored value so the per-session
+        token provider carries real credentials, not the masked placeholder."""
+        from onyx.server.manage.llm.api import (
+            _mask_string,
+            get_bedrock_available_models,
+        )
+
+        real_token = "real-bearer-token-secret"
+        masked_token = _mask_string(real_token)
+        assert masked_token != real_token
+
+        existing_provider = MagicMock()
+        existing_provider.custom_config = {"AWS_BEARER_TOKEN_BEDROCK": real_token}
+
+        mock_session = MagicMock()
+        mock_session.client.return_value = mock_bedrock_client
+
+        with (
+            patch(
+                "onyx.server.manage.llm.api.boto3.Session",
+                return_value=mock_session,
+            ) as mock_session_cls,
+            patch(
+                "onyx.server.manage.llm.api.fetch_existing_llm_provider_by_id",
+                return_value=existing_provider,
+            ),
+            patch("onyx.server.manage.llm.api._sync_fetched_models"),
+        ):
+            request = BedrockModelsRequest(
+                aws_region_name="us-west-2",
+                aws_bearer_token_bedrock=masked_token,
+                provider_id=1,
+            )
+            get_bedrock_available_models(request, MagicMock(), MagicMock())
+
+        # The real stored token — not the masked placeholder — is what the
+        # per-session provider hands to boto3.
+        botocore_session = mock_session_cls.call_args.kwargs["botocore_session"]
+        provider = botocore_session.get_component("token_provider")
+        assert provider.load_token(signing_name="bedrock").token == real_token
+
+    def test_real_client_signs_with_bearer_token(self) -> None:
+        """End-to-end (no mocks): a client built by the session helper signs
+        Bedrock requests with ``Authorization: Bearer <token>``. Guards the
+        botocore-internals coupling against silent breakage on upgrades."""
+        from botocore.config import Config
+
+        from onyx.server.manage.llm.api import _build_bedrock_bearer_token_session
+
+        session = _build_bedrock_bearer_token_session(
+            token="my-secret-bearer-token", region_name="us-west-2"
+        )
+        client = session.client("bedrock", config=Config(signature_version="bearer"))
+
+        captured: dict[str, object] = {}
+
+        def _capture(request: Any, **_: object) -> None:
+            captured["auth"] = request.headers.get("Authorization")
+            raise _StopBeforeSend()
+
+        client.meta.events.register(
+            "before-send.bedrock.ListFoundationModels", _capture
+        )
+        with pytest.raises(_StopBeforeSend):
+            client.list_foundation_models()
+
+        assert captured["auth"] == b"Bearer my-secret-bearer-token"

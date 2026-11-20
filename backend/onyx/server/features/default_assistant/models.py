@@ -1,7 +1,6 @@
 """Models for default assistant configuration API."""
 
-from pydantic import BaseModel
-from pydantic import Field
+from pydantic import BaseModel, Field
 
 
 class DefaultAssistantConfiguration(BaseModel):
@@ -32,4 +31,8 @@ class DefaultAssistantUpdateRequest(BaseModel):
     )
 
 
-3
+class DefaultAssistantToolsUpdateRequest(BaseModel):
+    """Add or remove only the given tools, keeping the rest of the selection."""
+
+    tool_ids: list[int]
+    enabled: bool

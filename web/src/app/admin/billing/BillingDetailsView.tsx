@@ -1,15 +1,20 @@
 "use client";
 
+import { useNavigation } from "@opal/navigation";
 import { useState } from "react";
-import Link from "next/link";
-import { Section } from "@/layouts/general-layouts";
-import { Content, InputErrorText, InputVertical } from "@opal/layouts";
+import { useLocale, useTranslations } from "next-intl";
+import { markdown, richNodes } from "@opal/utils";
+import {
+  Content,
+  InputErrorText,
+  InputVertical,
+  toast,
+  Section,
+} from "@opal/layouts";
 import Card from "@/refresh-components/cards/Card";
-import Button from "@/refresh-components/buttons/Button";
-import { Button as OpalButton, MessageCard } from "@opal/components";
-import Text from "@/refresh-components/texts/Text";
+import { Button, Presence, MessageCard, Text } from "@opal/components";
 import InfoBlock from "@/refresh-components/messages/InfoBlock";
-import InputNumber from "@/refresh-components/inputs/InputNumber";
+import { InputNumber } from "@opal/components";
 import {
   SvgUsers,
   SvgExternalLink,
@@ -25,20 +30,19 @@ import {
   LicenseStatus,
   PaymentMethodRequiredError,
   StripePortalFlowType,
-} from "@/lib/billing/interfaces";
+} from "@/lib/billing/types";
 import {
   createCustomerPortalSession,
   endTrial,
   resetStripeConnection,
   updateSeatCount,
   claimLicense,
-  refreshLicenseCache,
 } from "@/lib/billing/svc";
 import { formatDateShort } from "@/lib/dateUtils";
-import { humanReadableFormatShort } from "@/lib/time";
+import { humanReadableFormatShort } from "@opal/time";
 import { NEXT_PUBLIC_CLOUD_ENABLED } from "@/lib/constants";
-import { useSettingsContext } from "@/providers/SettingsProvider";
-import { Tier } from "@/interfaces/settings";
+import { useSettings } from "@/lib/settings/hooks";
+import { Tier } from "@/lib/tiers/types";
 import useUsers from "@/hooks/useUsers";
 
 // ----------------------------------------------------------------------------
@@ -46,6 +50,13 @@ import useUsers from "@/hooks/useUsers";
 // ----------------------------------------------------------------------------
 
 const GRACE_PERIOD_DAYS = 30;
+const MS_PER_DAY = 86_400_000;
+
+/** How many days of a trial are left. Rounds up so a partial day still counts
+ *  as a whole day; the caller reads a non-positive result as "today". */
+function trialDaysRemaining(trialEnd: Date, now: number = Date.now()): number {
+  return Math.ceil((trialEnd.getTime() - now) / MS_PER_DAY);
+}
 
 // ----------------------------------------------------------------------------
 // Helpers
@@ -53,6 +64,7 @@ const GRACE_PERIOD_DAYS = 30;
 
 function getExpirationState(
   billing: BillingInformation,
+  locale: string,
   license?: LicenseStatus
 ) {
   const isAnnualBilling = billing.billing_period === "annual";
@@ -81,7 +93,7 @@ function getExpirationState(
         variant: "error" as const,
         daysRemaining: 0,
         daysUntilDeletion,
-        expirationDate: humanReadableFormatShort(gracePeriodEnd),
+        expirationDate: humanReadableFormatShort(gracePeriodEnd, locale),
       };
     }
 
@@ -90,7 +102,7 @@ function getExpirationState(
       return {
         variant: "warning" as const,
         daysRemaining,
-        expirationDate: humanReadableFormatShort(expiresAt),
+        expirationDate: humanReadableFormatShort(expiresAt, locale),
       };
     }
   }
@@ -117,7 +129,7 @@ function getExpirationState(
         variant: "error" as const,
         daysRemaining: 0,
         daysUntilDeletion,
-        expirationDate: humanReadableFormatShort(gracePeriodEnd),
+        expirationDate: humanReadableFormatShort(gracePeriodEnd, locale),
       };
     }
 
@@ -127,7 +139,7 @@ function getExpirationState(
       return {
         variant: "warning" as const,
         daysRemaining,
-        expirationDate: humanReadableFormatShort(expiresAt),
+        expirationDate: humanReadableFormatShort(expiresAt, locale),
       };
     }
   }
@@ -165,17 +177,22 @@ function SubscriptionCard({
   onReconnect?: () => Promise<void>;
   onRefresh?: () => Promise<void>;
 }) {
+  const t = useTranslations("admin.billing");
+  const locale = useLocale();
+  const navigation = useNavigation();
   const [isReconnecting, setIsReconnecting] = useState(false);
   const [isEndingTrial, setIsEndingTrial] = useState(false);
-  const [endTrialError, setEndTrialError] = useState<string | null>(null);
+  const [isSyncing, setIsSyncing] = useState(false);
 
-  const settings = useSettingsContext();
-  const tier = settings?.settings.tier;
+  const settings = useSettings();
+  const tier = settings.tier;
   const isEnterprise = tier === Tier.ENTERPRISE || tier == null;
-  const planName = isEnterprise ? "Enterprise Plan" : "Business Plan";
+  const planName = isEnterprise
+    ? t("subscription.enterprisePlan.name")
+    : t("subscription.businessPlan.name");
   const PlanIcon = isEnterprise ? SvgOrganization : SvgUsers;
   const expirationDate = billing?.current_period_end ?? license?.expires_at;
-  const formattedDate = formatDateShort(expirationDate);
+  const formattedDate = formatDateShort(expirationDate, locale);
 
   const isExpiredFromBilling =
     billing?.status === "expired" || billing?.status === "cancelled";
@@ -185,16 +202,33 @@ function SubscriptionCard({
     (license?.expires_at && new Date(license.expires_at) < new Date());
   const isExpired = isExpiredFromBilling || isExpiredFromLicense;
   const isCanceling = billing?.cancel_at_period_end;
-
+  // The license is the entitlement, so a Stripe snapshot that disagrees with it
+  // would describe a trial this instance is not actually on.
+  const trialEnd = license?.trial_end ? new Date(license.trial_end) : null;
+  const isOnTrial = trialEnd !== null && trialEnd.getTime() > Date.now();
   let subtitle: string;
   if (isExpired) {
-    subtitle = `Expired on ${formattedDate}`;
+    subtitle = t("subscription.expired.subtitle", { date: formattedDate });
   } else if (isCanceling) {
-    subtitle = `Valid until ${formattedDate}`;
+    subtitle = t("subscription.validUntil.subtitle", { date: formattedDate });
+  } else if (isOnTrial) {
+    // The trial ending and the first charge are one event, so both halves of
+    // this line have to come from the same date.
+    const trialDate = formatDateShort(license?.trial_end, locale);
+    const daysLeft = trialDaysRemaining(trialEnd);
+    subtitle =
+      daysLeft <= 0
+        ? t("subscription.trialToday.subtitle", { date: trialDate })
+        : daysLeft === 1
+          ? t("subscription.trialTomorrow.subtitle", { date: trialDate })
+          : t("subscription.trialDays.subtitle", {
+              days: daysLeft,
+              date: trialDate,
+            });
   } else if (billing) {
-    subtitle = `Next payment on ${formattedDate}`;
+    subtitle = t("subscription.nextPayment.subtitle", { date: formattedDate });
   } else {
-    subtitle = `Valid until ${formattedDate}`;
+    subtitle = t("subscription.validUntil.subtitle", { date: formattedDate });
   }
 
   const handleManagePlan = async () => {
@@ -203,7 +237,7 @@ function SubscriptionCard({
         return_url: `${window.location.origin}/admin/billing?portal_return=true`,
       });
       if (response.stripe_customer_portal_url) {
-        window.location.href = response.stripe_customer_portal_url;
+        navigation.load(response.stripe_customer_portal_url);
       }
     } catch (error) {
       console.error("Failed to open customer portal:", error);
@@ -222,9 +256,22 @@ function SubscriptionCard({
     }
   };
 
+  const handleSyncLicense = async () => {
+    setIsSyncing(true);
+    try {
+      await claimLicense();
+      await onRefresh?.();
+    } catch (error) {
+      toast.error(
+        error instanceof Error ? error.message : t("toasts.syncLicenseFailed")
+      );
+    } finally {
+      setIsSyncing(false);
+    }
+  };
+
   const handleEndTrial = async () => {
     setIsEndingTrial(true);
-    setEndTrialError(null);
     try {
       await endTrial();
       await onRefresh?.();
@@ -239,18 +286,16 @@ function SubscriptionCard({
             flow_type: StripePortalFlowType.PAYMENT_METHOD_UPDATE,
           });
           if (response.stripe_customer_portal_url) {
-            window.location.href = response.stripe_customer_portal_url;
+            navigation.load(response.stripe_customer_portal_url);
             return;
           }
         } catch (portalError) {
           console.error("Failed to open customer portal:", portalError);
-          setEndTrialError(
-            "Add a payment method first, then try upgrading again."
-          );
+          toast.error(t("toasts.paymentMethodRequired"));
         }
       } else {
-        setEndTrialError(
-          error instanceof Error ? error.message : "Failed to end trial"
+        toast.error(
+          error instanceof Error ? error.message : t("toasts.endTrialFailed")
         );
       }
     } finally {
@@ -258,7 +303,8 @@ function SubscriptionCard({
     }
   };
 
-  const isTrialing =
+  // Only cloud exposes ending a trial early. Self-hosted has no such control.
+  const canEndTrialEarly =
     NEXT_PUBLIC_CLOUD_ENABLED && billing?.status === BillingStatus.TRIALING;
 
   return (
@@ -269,79 +315,98 @@ function SubscriptionCard({
         alignItems="start"
         height="auto"
       >
-        <Section gap={0.25} alignItems="start" height="auto" width="auto">
+        <Section gap={1} alignItems="start" height="auto" width="auto">
           <PlanIcon className="w-5 h-5" />
-          <Text headingH3Muted text04>
+          <Text font="heading-section-muted" color="text-04">
             {planName}
           </Text>
-          <Text secondaryBody text03>
+          <Text font="secondary-body" color="text-03">
             {subtitle}
           </Text>
         </Section>
         <Section
           flexDirection="column"
-          gap={0.25}
+          gap={1}
           alignItems="end"
           height="auto"
           width="fit"
         >
           {isManualLicenseOnly ? (
-            <Text secondaryBody text03 className="text-right">
-              Your plan is managed through sales.
-              <br />
-              <a
-                href="mailto:support@onyx.app?subject=Billing%20change%20request"
-                className="underline"
-              >
-                Contact billing
-              </a>{" "}
-              to make changes.
+            <Text
+              as="p"
+              font="secondary-body"
+              color="text-03"
+              textPosition="text-end"
+            >
+              {richNodes(
+                t.rich("subscription.managedBySales.text", {
+                  br: () => <br />,
+                  link: (chunks) => (
+                    <a
+                      href="mailto:support@onyx.app?subject=Billing%20change%20request"
+                      className="underline"
+                    >
+                      {chunks}
+                    </a>
+                  ),
+                })
+              )}
             </Text>
           ) : disabled ? (
-            <OpalButton
+            <Button
               disabled={isReconnecting}
               prominence="secondary"
               onClick={handleReconnect}
               rightIcon={SvgArrowRight}
             >
-              {isReconnecting ? "Connecting..." : "Connect to Stripe"}
-            </OpalButton>
+              {isReconnecting
+                ? t("subscription.connecting.label")
+                : t("subscription.connectToStripe.label")}
+            </Button>
           ) : (
             <Section
               flexDirection="row"
-              gap={0.5}
+              gap={2}
               alignItems="end"
               height="auto"
               width="auto"
             >
-              {isTrialing && (
-                <OpalButton
+              {canEndTrialEarly && (
+                <Button
                   disabled={isEndingTrial}
                   onClick={handleEndTrial}
                   rightIcon={SvgArrowRight}
                 >
-                  {isEndingTrial ? "Upgrading..." : "Upgrade now"}
-                </OpalButton>
+                  {isEndingTrial
+                    ? t("subscription.upgrading.label")
+                    : t("subscription.upgradeNow.label")}
+                </Button>
               )}
-              <OpalButton
-                prominence={isTrialing ? "secondary" : "primary"}
+              {/* Cloud has no local license to pull. Self-hosted refreshes
+                  itself only inside LICENSE_RECLAIM_WINDOW, so a change made
+                  earlier in the period needs a manual pull. */}
+              {!NEXT_PUBLIC_CLOUD_ENABLED && (
+                <Button
+                  disabled={isSyncing}
+                  prominence="secondary"
+                  onClick={handleSyncLicense}
+                >
+                  {isSyncing
+                    ? t("subscription.syncing.label")
+                    : t("subscription.syncLicense.label")}
+                </Button>
+              )}
+              <Button
+                prominence={canEndTrialEarly ? "secondary" : "primary"}
                 onClick={handleManagePlan}
                 rightIcon={SvgExternalLink}
               >
-                Manage Plan
-              </OpalButton>
+                {t("subscription.managePlan.label")}
+              </Button>
             </Section>
           )}
-          {endTrialError && (
-            <Text secondaryBody className="text-status-error-04">
-              {endTrialError}
-            </Text>
-          )}
-          {/* TODO(@raunakab): migrate to opal Button once className/iconClassName is resolved */}
-          <Button tertiary onClick={onViewPlans} className="billing-text-link">
-            <Text secondaryBody text03>
-              View Plan Details
-            </Text>
+          <Button prominence="tertiary" onClick={onViewPlans}>
+            {t("subscription.viewPlanDetails.label")}
           </Button>
         </Section>
       </Section>
@@ -366,6 +431,9 @@ function SeatsCard({
   disabled?: boolean;
   hideUpdateSeats?: boolean;
 }) {
+  const t = useTranslations("admin.billing");
+  const locale = useLocale();
+  const navigation = useNavigation();
   const [isEditing, setIsEditing] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -374,7 +442,11 @@ function SeatsCard({
     includeApiKeys: false,
   });
 
-  const totalSeats = billing?.seats ?? license?.seats ?? 0;
+  // Seat enforcement reads the license, so preferring the billing snapshot can
+  // render a count the instance would refuse to honor. Seats default to 0
+  // without a license, which is not a count to prefer over billing.
+  const licensedSeats = license?.has_license ? license.seats : undefined;
+  const totalSeats = licensedSeats ?? billing?.seats ?? 0;
   const acceptedUsers =
     usersData?.accepted?.filter((u) => u.is_active).length ?? 0;
   const slackUsers =
@@ -414,13 +486,13 @@ function SeatsCard({
         // Wait for control plane to process the subscription update before claiming
         await new Promise((resolve) => setTimeout(resolve, 1500));
         await claimLicense();
-        // Force refresh the Redis cache from the database
-        await refreshLicenseCache();
       }
       await onRefresh?.();
       setIsEditing(false);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to update seats");
+      setError(
+        err instanceof Error ? err.message : t("seats.updateFailed.error")
+      );
     } finally {
       setIsSubmitting(false);
     }
@@ -429,129 +501,127 @@ function SeatsCard({
   const seatDifference = newSeatCount - totalSeats;
   const isAdding = seatDifference > 0;
   const isRemoving = seatDifference < 0;
-  const nextBillingDate = formatDateShort(billing?.current_period_end);
+  const nextBillingDate = formatDateShort(billing?.current_period_end, locale);
   const seatCount = Math.abs(seatDifference);
-  const seatWord = seatCount === 1 ? "seat" : "seats";
 
   if (isEditing) {
     return (
-      <Card
-        padding={0}
-        gap={0}
-        alignItems="stretch"
-        className="billing-card-enter"
-      >
-        <Section
-          flexDirection="row"
-          justifyContent="between"
-          alignItems="start"
-          padding={1}
-          height="auto"
-        >
-          <Content
-            title="Update Seats"
-            description="Add or remove seats to reflect your team size."
-            sizePreset="main-content"
-            variant="section"
-          />
-          <OpalButton
-            disabled={isSubmitting}
-            prominence="secondary"
-            onClick={handleCancel}
-          >
-            Cancel
-          </OpalButton>
-        </Section>
-
-        <div className="billing-content-area">
+      <Presence>
+        <Card padding={0} gap={0} alignItems="stretch">
           <Section
-            flexDirection="column"
-            alignItems="stretch"
-            gap={0.25}
-            padding={1}
+            flexDirection="row"
+            justifyContent="between"
+            alignItems="start"
+            padding={4}
             height="auto"
           >
-            <InputVertical title="Seats" withLabel>
-              <InputNumber
-                value={newSeatCount}
-                onChange={(v) => setNewSeatCount(v ?? 1)}
-                min={1}
-                defaultValue={totalSeats}
-                showReset
-                variant={isBelowMinimum ? "error" : "primary"}
-              />
-            </InputVertical>
+            <Content
+              font="main-content-emphasis"
+              title={t("seats.updateSeats.title")}
+              description={t("seats.updateSeats.description")}
+            />
+            <Button
+              disabled={isSubmitting}
+              prominence="secondary"
+              onClick={handleCancel}
+            >
+              {t("seats.cancel.label")}
+            </Button>
+          </Section>
 
-            {isBelowMinimum ? (
-              <InputErrorText type="error">
-                You cannot set seats below current{" "}
-                <span className="font-semibold">{minRequiredSeats}</span> seats
-                in use/pending.{" "}
-                <Link
-                  href="/admin/users"
-                  className="underline hover:no-underline"
-                >
-                  Remove users
-                </Link>{" "}
-                first before adjusting seats.
-              </InputErrorText>
-            ) : seatDifference !== 0 ? (
-              <Text secondaryBody text03>
-                {Math.abs(seatDifference)} seat
-                {Math.abs(seatDifference) !== 1 ? "s" : ""} to be{" "}
-                {isAdding ? "added" : "removed"}
+          <div className="billing-content-area">
+            <Section
+              flexDirection="column"
+              alignItems="stretch"
+              gap={1}
+              padding={4}
+              height="auto"
+            >
+              <InputVertical title={t("seats.seatsField.title")} withLabel>
+                <InputNumber
+                  value={newSeatCount}
+                  onChange={(v) => setNewSeatCount(v ?? 1)}
+                  min={1}
+                  defaultValue={totalSeats}
+                  showReset
+                  variant={isBelowMinimum ? "error" : "primary"}
+                />
+              </InputVertical>
+
+              {isBelowMinimum ? (
+                <InputErrorText type="error">
+                  {markdown(
+                    t("seats.belowMinimum.error", { minimum: minRequiredSeats })
+                  )}
+                </InputErrorText>
+              ) : seatDifference !== 0 ? (
+                <Text font="secondary-body" color="text-03">
+                  {isAdding
+                    ? t("seats.delta.added", { count: seatCount })
+                    : t("seats.delta.removed", { count: seatCount })}
+                </Text>
+              ) : null}
+
+              {error && (
+                <Text font="secondary-body" color="status-error-05">
+                  {error}
+                </Text>
+              )}
+            </Section>
+          </div>
+
+          <Section
+            flexDirection="row"
+            alignItems="center"
+            justifyContent="between"
+            padding={4}
+            height="auto"
+          >
+            {isAdding ? (
+              <Text font="secondary-body" color="text-03">
+                {richNodes(
+                  t.rich("seats.billing.added", {
+                    count: seatCount,
+                    value: (chunks) => (
+                      <Text font="secondary-body" color="text-04">
+                        {richNodes(chunks)}
+                      </Text>
+                    ),
+                  })
+                )}
               </Text>
-            ) : null}
-
-            {error && (
-              <Text secondaryBody className="billing-error-text">
-                {error}
+            ) : isRemoving ? (
+              <Text font="secondary-body" color="text-03">
+                {richNodes(
+                  t.rich("seats.billing.removed", {
+                    count: seatCount,
+                    date: nextBillingDate,
+                    value: (chunks) => (
+                      <Text font="secondary-body" color="text-04">
+                        {richNodes(chunks)}
+                      </Text>
+                    ),
+                  })
+                )}
+              </Text>
+            ) : (
+              <Text font="secondary-body" color="text-03">
+                {t("seats.billing.unchanged")}
               </Text>
             )}
+            <Button
+              disabled={
+                isSubmitting || newSeatCount === totalSeats || isBelowMinimum
+              }
+              onClick={handleConfirm}
+            >
+              {isSubmitting
+                ? t("seats.saving.label")
+                : t("seats.confirmChange.label")}
+            </Button>
           </Section>
-        </div>
-
-        <Section
-          flexDirection="row"
-          alignItems="center"
-          justifyContent="between"
-          padding={1}
-          height="auto"
-        >
-          {isAdding ? (
-            <Text secondaryBody text03>
-              You will be billed for the{" "}
-              <Text secondaryBody text04>
-                {seatCount}
-              </Text>{" "}
-              additional {seatWord} at a pro-rated amount.
-            </Text>
-          ) : isRemoving ? (
-            <Text secondaryBody text03>
-              <Text secondaryBody text04>
-                {seatCount}
-              </Text>{" "}
-              {seatWord} will be removed on{" "}
-              <Text secondaryBody text04>
-                {nextBillingDate}
-              </Text>{" "}
-              (after current billing cycle).
-            </Text>
-          ) : (
-            <Text secondaryBody text03>
-              No changes to your billing.
-            </Text>
-          )}
-          <OpalButton
-            disabled={
-              isSubmitting || newSeatCount === totalSeats || isBelowMinimum
-            }
-            onClick={handleConfirm}
-          >
-            {isSubmitting ? "Saving..." : "Confirm Change"}
-          </OpalButton>
-        </Section>
-      </Card>
+        </Card>
+      </Presence>
     );
   }
 
@@ -563,38 +633,41 @@ function SeatsCard({
         alignItems="center"
         height="auto"
       >
-        <Section gap={0.25} alignItems="start" height="auto" width="auto">
-          <Text mainContentMuted text04>
-            {totalSeats} Seats
+        <Section gap={1} alignItems="start" height="auto" width="auto">
+          <Text font="main-content-muted" color="text-04">
+            {t("seats.total.label", { count: totalSeats })}
           </Text>
-          <Text secondaryBody text03>
-            {usedSeats} in use • {pendingSeats} pending • {remainingSeats}{" "}
-            remaining
+          <Text font="secondary-body" color="text-03">
+            {t("seats.breakdown.label", {
+              used: usedSeats,
+              pending: pendingSeats,
+              remaining: remainingSeats,
+            })}
           </Text>
         </Section>
         <Section
           flexDirection="row"
-          gap={0.5}
+          gap={2}
           justifyContent="end"
           height="auto"
           width="auto"
         >
-          <OpalButton
+          <Button
             prominence="tertiary"
-            href="/admin/users"
+            {...navigation.linkTo("/admin/users")}
             icon={SvgExternalLink}
           >
-            View Users
-          </OpalButton>
+            {t("seats.viewUsers.label")}
+          </Button>
           {!hideUpdateSeats && (
-            <OpalButton
+            <Button
               disabled={isLoadingUsers || disabled || !billing}
               prominence="secondary"
               onClick={handleStartEdit}
               icon={SvgPlus}
             >
-              Update Seats
-            </OpalButton>
+              {t("seats.updateSeats.label")}
+            </Button>
           )}
         </Section>
       </Section>
@@ -607,13 +680,16 @@ function SeatsCard({
 // ----------------------------------------------------------------------------
 
 function PaymentSection({ billing }: { billing: BillingInformation }) {
+  const t = useTranslations("admin.billing");
+  const locale = useLocale();
+  const navigation = useNavigation();
   const handleOpenPortal = async () => {
     try {
       const response = await createCustomerPortalSession({
         return_url: `${window.location.origin}/admin/billing?portal_return=true`,
       });
       if (response.stripe_customer_portal_url) {
-        window.location.href = response.stripe_customer_portal_url;
+        navigation.load(response.stripe_customer_portal_url);
       }
     } catch (error) {
       console.error("Failed to open customer portal:", error);
@@ -622,18 +698,15 @@ function PaymentSection({ billing }: { billing: BillingInformation }) {
 
   if (!billing.payment_method_enabled) return null;
 
-  const lastPaymentDate = formatDateShort(billing.current_period_start);
+  const lastPaymentDate = formatDateShort(billing.current_period_start, locale);
 
   return (
     <div className="billing-payment-section">
       <Section alignItems="start" height="auto" width="full">
-        <Text mainContentEmphasis>Payment</Text>
-        <Section
-          flexDirection="row"
-          gap={0.5}
-          alignItems="stretch"
-          height="auto"
-        >
+        <Text font="main-content-emphasis" color="text-05">
+          {t("payment.section.title")}
+        </Text>
+        <Section flexDirection="row" gap={2} alignItems="stretch" height="auto">
           <Card className="billing-payment-card">
             <Section
               flexDirection="row"
@@ -643,16 +716,16 @@ function PaymentSection({ billing }: { billing: BillingInformation }) {
             >
               <InfoBlock
                 icon={SvgWallet}
-                title="Visa ending in 1234"
-                description="Payment method"
+                title={t("payment.card.title")}
+                description={t("payment.card.description")}
               />
-              <OpalButton
+              <Button
                 prominence="tertiary"
                 onClick={handleOpenPortal}
                 rightIcon={SvgExternalLink}
               >
-                Update
-              </OpalButton>
+                {t("payment.update.label")}
+              </Button>
             </Section>
           </Card>
           {lastPaymentDate && (
@@ -666,15 +739,15 @@ function PaymentSection({ billing }: { billing: BillingInformation }) {
                 <InfoBlock
                   icon={SvgFileText}
                   title={lastPaymentDate}
-                  description="Last payment"
+                  description={t("payment.lastPayment.description")}
                 />
-                <OpalButton
+                <Button
                   prominence="tertiary"
                   onClick={handleOpenPortal}
                   rightIcon={SvgExternalLink}
                 >
-                  View Invoice
-                </OpalButton>
+                  {t("payment.viewInvoice.label")}
+                </Button>
               </Section>
             </Card>
           )}
@@ -697,6 +770,7 @@ interface BillingDetailsViewProps {
   isManualLicenseOnly?: boolean;
   hasStripeError?: boolean;
   licenseCard?: React.ReactNode;
+  isGraceSyncing?: boolean;
 }
 
 export default function BillingDetailsView({
@@ -708,19 +782,29 @@ export default function BillingDetailsView({
   isManualLicenseOnly,
   hasStripeError,
   licenseCard,
+  isGraceSyncing,
 }: BillingDetailsViewProps) {
-  const expirationState = billing ? getExpirationState(billing, license) : null;
+  const t = useTranslations("admin.billing");
+  const locale = useLocale();
+  const expirationState = billing
+    ? getExpirationState(billing, locale, license)
+    : null;
   const disableBillingActions =
     isAirGapped || hasStripeError || isManualLicenseOnly;
 
   return (
-    <Section gap={1} height="auto" width="full">
+    <Section gap={4} height="auto" width="full">
+      {/* Renewal fetched on arrival while expired. The page renders regardless:
+          billing is the one route a lapsed instance must always reach. */}
+      {isGraceSyncing && (
+        <MessageCard variant="info" title={t("banners.graceSync.title")} />
+      )}
       {/* Stripe connection error banner */}
       {hasStripeError && (
         <MessageCard
           variant="warning"
-          title="Unable to connect to Stripe payment portal."
-          description="Check your internet connection or manually provide a license."
+          title={t("banners.stripeError.title")}
+          description={t("banners.stripeError.description")}
         />
       )}
 
@@ -728,8 +812,8 @@ export default function BillingDetailsView({
       {isAirGapped && !hasStripeError && !isManualLicenseOnly && (
         <MessageCard
           variant="info"
-          title="Air-gapped deployment"
-          description="Online billing management is disabled. Contact support to update your subscription."
+          title={t("banners.airGapped.title")}
+          description={t("banners.airGapped.description")}
         />
       )}
 
@@ -740,16 +824,24 @@ export default function BillingDetailsView({
           title={
             expirationState.variant === "error"
               ? expirationState.daysUntilDeletion
-                ? `Your subscription has expired. Data will be deleted in ${expirationState.daysUntilDeletion} days.`
-                : "Your subscription has expired."
-              : `Your subscription is expiring in ${expirationState.daysRemaining} days.`
+                ? t("banners.expired.withDeletion.title", {
+                    days: expirationState.daysUntilDeletion,
+                  })
+                : t("banners.expired.title")
+              : t("banners.expiring.title", {
+                  days: expirationState.daysRemaining,
+                })
           }
           description={
             expirationState.variant === "error"
               ? expirationState.expirationDate
-                ? `Renew your subscription by ${expirationState.expirationDate} to restore access.`
-                : "Renew your subscription to restore access to paid features."
-              : `Renew your subscription by ${expirationState.expirationDate} to avoid disruption.`
+                ? t("banners.expired.withDate.description", {
+                    date: expirationState.expirationDate,
+                  })
+                : t("banners.expired.description")
+              : t("banners.expiring.description", {
+                  date: expirationState.expirationDate,
+                })
           }
         />
       )}

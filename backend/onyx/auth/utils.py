@@ -5,12 +5,16 @@ from urllib.parse import unquote
 
 from fastapi import Request
 
-from onyx.auth.constants import API_KEY_HEADER_ALTERNATIVE_NAME
-from onyx.auth.constants import API_KEY_HEADER_NAME
-from onyx.auth.constants import API_KEY_PREFIX
-from onyx.auth.constants import BEARER_PREFIX
-from onyx.auth.constants import DEPRECATED_API_KEY_PREFIX
-from onyx.auth.constants import PAT_PREFIX
+from onyx.auth.constants import (
+    API_KEY_HEADER_ALTERNATIVE_NAME,
+    API_KEY_HEADER_NAME,
+    API_KEY_PREFIX,
+    BEARER_PREFIX,
+    DEPRECATED_API_KEY_PREFIX,
+    MAX_BEARER_TOKEN_LENGTH,
+    PAT_PREFIX,
+    SCIM_TOKEN_PREFIX,
+)
 
 
 def get_hashed_bearer_token_from_request(
@@ -45,6 +49,9 @@ def get_hashed_bearer_token_from_request(
     else:
         return None
 
+    if len(token) > MAX_BEARER_TOKEN_LENGTH:
+        return None
+
     # Check if token starts with any valid prefix
     if valid_prefixes:
         valid = any(token.startswith(prefix) for prefix in valid_prefixes)
@@ -74,6 +81,8 @@ def _extract_tenant_from_bearer_token(
         return None
 
     token = auth_header[len(BEARER_PREFIX) :].strip()
+    if len(token) > MAX_BEARER_TOKEN_LENGTH:
+        return None
 
     # Check if token starts with any valid prefix
     matched_prefix = None
@@ -95,14 +104,15 @@ def _extract_tenant_from_bearer_token(
 
 
 def extract_tenant_from_auth_header(request: Request) -> str | None:
-    """Extract tenant ID from API key or PAT header.
+    """Extract tenant ID from an API key, PAT, or SCIM token header.
 
-    Unified function for extracting tenant from any bearer token (API key or PAT).
+    Unified function for extracting tenant from any bearer token.
     Checks all known token prefixes in order.
 
     Returns:
         Tenant ID if found, else None
     """
     return _extract_tenant_from_bearer_token(
-        request, [API_KEY_PREFIX, DEPRECATED_API_KEY_PREFIX, PAT_PREFIX]
+        request,
+        [API_KEY_PREFIX, DEPRECATED_API_KEY_PREFIX, PAT_PREFIX, SCIM_TOKEN_PREFIX],
     )

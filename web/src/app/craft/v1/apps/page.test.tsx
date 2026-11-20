@@ -1,0 +1,31 @@
+import { redirect } from "next/navigation";
+import Page from "@/app/craft/v1/apps/page";
+
+jest.mock("next/navigation", () => ({
+  ...jest.requireActual<typeof import("@tests/setup/mocks/nextNavigation")>(
+    "@tests/setup/mocks/nextNavigation"
+  ).nextNavigationMock,
+  redirect: jest.fn(),
+}));
+
+beforeEach(() => jest.clearAllMocks());
+
+test("old Apps routes redirect to the Integrations tab", async () => {
+  await Page({ searchParams: Promise.resolve({}) });
+  expect(redirect).toHaveBeenCalledWith("/app/customize/integrations");
+});
+
+test("redirect preserves external-app connect intent and OAuth return values", async () => {
+  await Page({
+    searchParams: Promise.resolve({
+      connect: "7",
+      code: "oauth/code",
+      state: "return state",
+      tag: ["one", "two"],
+      empty: undefined,
+    }),
+  });
+  expect(redirect).toHaveBeenCalledWith(
+    "/app/customize/integrations?connect=7&code=oauth%2Fcode&state=return+state&tag=one&tag=two"
+  );
+});

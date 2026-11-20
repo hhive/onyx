@@ -1,0 +1,41 @@
+import { jest } from "@jest/globals";
+
+import type { ComposerTools } from "@/state/ComposerToolsProvider";
+
+export function makeComposerTools(
+  overrides: Partial<ComposerTools> = {},
+): ComposerTools {
+  return {
+    showDeepResearch: false,
+    deepResearchEnabled: false,
+    toggleDeepResearch: jest.fn(),
+    actionTools: [],
+    unavailableToolIds: [],
+    preferredToolId: null,
+    togglePreferredTool: jest.fn(),
+    disabledToolIds: [],
+    toggleToolEnabled: jest.fn(),
+    modelOptions: [],
+    effectiveModel: null,
+    selectModel: jest.fn(),
+    sourceToolId: null,
+    sourceOptions: [],
+    enabledSourceCount: 0,
+    isSourceEnabled: () => false,
+    toggleSource: jest.fn(),
+    enableAllSources: jest.fn(),
+    disableAllSources: jest.fn(),
+    notePendingSend: jest.fn(),
+    toolOptionsReady: true,
+    toolOptionsFailed: false,
+    retryToolOptions: jest.fn(),
+    resolveToolOptions: () => ({
+      deepResearch: false,
+      allowed: null,
+      preferredToolId: null,
+      internalSearchFilters: null,
+      llmOverride: null,
+    }),
+    ...overrides,
+  };
+}

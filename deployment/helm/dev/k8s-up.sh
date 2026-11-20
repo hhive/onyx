@@ -2,7 +2,7 @@
 #
 # k8s-up.sh — bring up an Onyx dev cluster on the local machine.
 #
-# Idempotent. See docs/dev/local-kubernetes.md for the full workflow.
+# Idempotent. See deployment/helm/dev/README.md for the full workflow.
 #
 # Usage:
 #   deployment/helm/dev/k8s-up.sh
@@ -12,9 +12,10 @@
 #   --cluster-name <name>          kind cluster name (default: onyx-dev)
 #   --namespace <ns>               k8s namespace (default: onyx)
 #   --opensearch-password <pw>     admin password on first install
-#                                  (default: generated, printed at the end)
+#                                  (default: generated and stored in a Secret)
 #   --skip-cluster-create          skip kind create (use an existing cluster)
 #   --skip-helm                    only create the cluster, don't install Onyx
+#
 
 set -euo pipefail
 
@@ -23,16 +24,17 @@ NAMESPACE="onyx"
 OPENSEARCH_PASSWORD=""
 SKIP_CLUSTER_CREATE=0
 SKIP_HELM=0
+KIND_NODE_IMAGE="${KIND_NODE_IMAGE:-kindest/node:v1.33.1}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHART_DIR="$(cd "$SCRIPT_DIR/../charts/onyx" && pwd)"
-VALUES_OVERLAY="$CHART_DIR/values-localdev.yaml"
+VALUES_OVERLAY="$SCRIPT_DIR/values-localdev.yaml"
 
 require() {
   local bin="$1"
   if ! command -v "$bin" >/dev/null 2>&1; then
     echo "error: '$bin' is required but not on PATH" >&2
-    echo "see docs/dev/local-kubernetes.md for installation" >&2
+    echo "see deployment/helm/dev/README.md for installation" >&2
     exit 1
   fi
 }
@@ -56,8 +58,12 @@ while [[ $# -gt 0 ]]; do
 done
 
 require kind
-require helm
+if [[ "$SKIP_HELM" -eq 0 ]]; then
+  require helm
+  require telepresence
+fi
 require kubectl
+require python3
 
 # ---- 1. kind cluster ----
 
@@ -65,8 +71,8 @@ if [[ "$SKIP_CLUSTER_CREATE" -eq 0 ]]; then
   if kind get clusters 2>/dev/null | grep -qx "$CLUSTER_NAME"; then
     echo "kind cluster '$CLUSTER_NAME' already exists; skipping create"
   else
-    echo "creating kind cluster '$CLUSTER_NAME' ..."
-    kind create cluster --name "$CLUSTER_NAME"
+    echo "creating kind cluster '$CLUSTER_NAME' with node image '$KIND_NODE_IMAGE' ..."
+    kind create cluster --name "$CLUSTER_NAME" --image "$KIND_NODE_IMAGE"
   fi
 fi
 
@@ -83,6 +89,13 @@ if [[ "$CURRENT_CTX" != "$EXPECTED_CTX" ]]; then
   exit 1
 fi
 
+# Kindnet handles network-policy packets; a CPU cap can stall sandbox egress.
+echo "removing the kindnet CPU limit ..."
+kubectl --context "$EXPECTED_CTX" -n kube-system patch daemonset kindnet \
+  --type=strategic \
+  -p '{"spec":{"template":{"spec":{"containers":[{"name":"kindnet-cni","resources":{"limits":{"cpu":null}}}]}}}}'
+kubectl --context "$EXPECTED_CTX" -n kube-system rollout status daemonset/kindnet --timeout=120s
+
 # ---- 2. helm install / upgrade ----
 
 if [[ "$SKIP_HELM" -eq 1 ]]; then
@@ -93,17 +106,14 @@ fi
 kubectl get namespace "$NAMESPACE" >/dev/null 2>&1 \
   || kubectl create namespace "$NAMESPACE"
 # The chart also templates the onyx-sandboxes namespace (see
-# templates/sandbox-namespace.yaml). We pre-create it here so the
-# sandbox-file-sync ServiceAccount can be created before helm install runs,
-# but we must stamp Helm ownership metadata or `helm install` refuses to
-# adopt the namespace.
+# templates/sandbox-namespace.yaml). We pre-create it here so local setup can
+# label nodes before helm install runs, but we must stamp Helm ownership
+# metadata or `helm install` refuses to adopt the namespace.
 kubectl get namespace onyx-sandboxes >/dev/null 2>&1 \
   || kubectl create namespace onyx-sandboxes
 kubectl label   namespace onyx-sandboxes app.kubernetes.io/managed-by=Helm --overwrite >/dev/null
 kubectl annotate namespace onyx-sandboxes meta.helm.sh/release-name=onyx --overwrite >/dev/null
 kubectl annotate namespace onyx-sandboxes meta.helm.sh/release-namespace="$NAMESPACE" --overwrite >/dev/null
-kubectl -n onyx-sandboxes get serviceaccount sandbox-file-sync >/dev/null 2>&1 \
-  || kubectl -n onyx-sandboxes create serviceaccount sandbox-file-sync
 kubectl label node --all onyx.app/workload=sandbox --overwrite >/dev/null 2>&1
 
 # Use an isolated helm repo config: helm matches chart deps by repo NAME, so a
@@ -118,7 +128,6 @@ trap 'rm -rf "$HELM_DEV_HOME"' EXIT
 
 # Repo names must match the dep names in Chart.yaml.
 helm repo add cloudnative-pg  https://cloudnative-pg.github.io/charts          >/dev/null
-helm repo add vespa           https://onyx-dot-app.github.io/vespa-helm-charts >/dev/null
 helm repo add opensearch      https://opensearch-project.github.io/helm-charts >/dev/null
 helm repo add ingress-nginx   https://kubernetes.github.io/ingress-nginx       >/dev/null
 helm repo add redis-ot        https://ot-container-kit.github.io/helm-charts   >/dev/null
@@ -127,7 +136,7 @@ helm repo add code-interpreter https://onyx-dot-app.github.io/python-sandbox/  >
 helm repo update >/dev/null
 
 echo "updating chart dependencies ..."
-helm dependency update "$CHART_DIR" >/dev/null
+helm dependency build "$CHART_DIR" >/dev/null
 
 # Generate a password on first install only; upgrades reuse the existing Secret.
 PW_FLAG=()
@@ -135,7 +144,7 @@ if ! kubectl -n "$NAMESPACE" get secret onyx-opensearch >/dev/null 2>&1; then
   if [[ -z "$OPENSEARCH_PASSWORD" ]]; then
     # Prefix 'Aa1!' satisfies OpenSearch's complexity rule (upper/lower/digit/symbol).
     OPENSEARCH_PASSWORD="Aa1!$(openssl rand -hex 12)"
-    echo "generated opensearch admin password: $OPENSEARCH_PASSWORD"
+    echo "generated an OpenSearch admin password (value not printed)"
     echo "(stored in k8s Secret onyx-opensearch — retrieve with:"
     echo "  kubectl -n $NAMESPACE get secret onyx-opensearch -o jsonpath='{.data.opensearch_admin_password}' | base64 -d)"
   fi
@@ -156,6 +165,7 @@ for attempt in $(seq 1 "$HELM_ATTEMPTS"); do
   if helm upgrade --install onyx "$CHART_DIR" \
       -n "$NAMESPACE" \
       -f "$VALUES_OVERLAY" \
+      --set-string "configMap.SANDBOX_CONTAINER_IMAGE=${SANDBOX_IMAGE:-onyxdotapp/sandbox:dev}" \
       ${PW_FLAG[@]+"${PW_FLAG[@]}"}; then
     break
   fi
@@ -194,42 +204,18 @@ if command -v telepresence >/dev/null 2>&1; then
       else
         echo "  traffic-manager install failed after $TP_ATTEMPTS attempts; run manually:" >&2
         echo "    telepresence helm install --context kind-$CLUSTER_NAME" >&2
+        exit 1
       fi
     done
   fi
-else
-  echo "note: telepresence CLI not found; skipping traffic-manager install."
-  echo "  install with: brew install datawire/blackbird/telepresence-oss"
+
 fi
 
-# ---- 4. next steps ----
+# ---- 4. wait for usable infrastructure ----
 
-cat <<EOF
+python3 "$SCRIPT_DIR/dev.py" --cluster-name "$CLUSTER_NAME" --namespace "$NAMESPACE" \
+  ready --stage infrastructure
 
-cluster: kind-$CLUSTER_NAME
-namespace: $NAMESPACE
-context: $(kubectl config current-context)
-
-next steps:
-  1. watch pods come up:
-       kubectl -n $NAMESPACE get pods -w
-
-  2. (optional) connect your host to cluster DNS so you can run api_server
-     locally and have it reach in-cluster services. Traffic-manager was
-     installed above; just connect:
-       telepresence connect -n $NAMESPACE
-
-  3. for features that depend on api_server-source pod identity (e.g.
-     NetworkPolicies, in-pod auth via injected env), intercept instead:
-       telepresence intercept onyx-api-server \\
-         --namespace $NAMESPACE \\
-         --port 8080:8080
-
-  4. open vscode and run the "Run All Onyx Services" launch profile.
-     Before first run, copy .vscode/.env.k8s.template to .vscode/.env.k8s
-     and fill in the <REPLACE THIS> values.
-
-teardown:
-  deployment/helm/dev/k8s-down.sh
-
-EOF
+echo "Cluster: kind-$CLUSTER_NAME; namespace: $NAMESPACE"
+echo "Start local services with the VS Code (k8s) profiles or make craft-api."
+echo "Run make craft-ready after starting the API and frontend."

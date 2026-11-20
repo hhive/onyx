@@ -1,0 +1,407 @@
+"use client";
+
+import {
+  memo,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
+import { createPortal } from "react-dom";
+import { useTranslations } from "next-intl";
+import { LineItemButton, Popover, Text } from "@opal/components";
+import {
+  flattenSections,
+  pickerEntryKey,
+  type PickerEntry,
+  type PickerSections,
+} from "@/lib/skills/picker";
+import { pickerEntryIcon } from "@/lib/skills/pickerIcons";
+import { SvgSettings } from "@opal/icons";
+import type { IconFunctionComponent, RichStr } from "@opal/types";
+
+interface EntryPickerPopoverProps {
+  open: boolean;
+  anchorRect: DOMRect | null;
+  /** The typed query; a change highlights the first row again. */
+  query: string;
+  /** The entries to show, already filtered by the caller; never empty while
+   * open. */
+  sections: PickerSections;
+  onSelect: (entry: PickerEntry) => void;
+  /** Esc: hides the picker until its trigger is deleted. */
+  onEscape: () => void;
+  /** Any other close, such as a pointer down outside the menu, including in
+   * the input: ends the session without hiding the word. */
+  onDismiss: () => void;
+  /** The character that opened the picker; skill rows show it before the name. */
+  trigger: string;
+  /** A last row that opens the page where the user manages skills. */
+  onManageSkills?: () => void;
+}
+
+function EntryPickerPopover({
+  open,
+  anchorRect,
+  query,
+  sections,
+  onSelect,
+  onEscape,
+  onDismiss,
+  trigger,
+  onManageSkills,
+}: EntryPickerPopoverProps) {
+  const t = useTranslations("chat.input");
+  const [selectedIndex, setSelectedIndex] = useState(0);
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
+
+  const flatEntries = useMemo(() => flattenSections(sections), [sections]);
+
+  useEffect(() => {
+    setSelectedIndex(0);
+  }, [open, query]);
+
+  // SWR may revalidate while open and shrink the row count; clamp so Enter
+  // doesn't silently fall back to a different row than the one highlighted.
+  // The Manage skills footer takes the index after the last entry.
+  const rowCount = flatEntries.length + (onManageSkills ? 1 : 0);
+  const footerIndex = onManageSkills ? flatEntries.length : null;
+
+  useEffect(() => {
+    setSelectedIndex((i) => (rowCount === 0 ? 0 : Math.min(i, rowCount - 1)));
+  }, [rowCount]);
+
+  useEffect(() => {
+    if (!open) return;
+    const container = scrollContainerRef.current;
+    if (!container) return;
+    const row = container.querySelector<HTMLElement>(
+      `[data-row-index="${selectedIndex}"]`
+    );
+    row?.scrollIntoView({ block: "nearest" });
+  }, [open, selectedIndex]);
+
+  useEffect(() => {
+    if (!open) return;
+
+    function handleKeyDown(e: KeyboardEvent) {
+      // An IME uses these keys to compose text.
+      if (e.isComposing) return;
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        e.stopPropagation();
+        setSelectedIndex((i) => (i + 1) % rowCount);
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        e.stopPropagation();
+        setSelectedIndex((i) => (i - 1 + rowCount) % rowCount);
+      } else if (e.key === "Enter" || e.key === "Tab") {
+        e.preventDefault();
+        e.stopPropagation();
+        if (selectedIndex === footerIndex && onManageSkills) {
+          onDismiss();
+          onManageSkills();
+          return;
+        }
+        const entry = flatEntries[selectedIndex] ?? flatEntries[0];
+        if (entry) onSelect(entry);
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        onEscape();
+      }
+    }
+
+    document.addEventListener("keydown", handleKeyDown, true);
+    return () => document.removeEventListener("keydown", handleKeyDown, true);
+  }, [
+    open,
+    flatEntries,
+    rowCount,
+    footerIndex,
+    selectedIndex,
+    onSelect,
+    onEscape,
+    onDismiss,
+    onManageSkills,
+  ]);
+
+  if (!anchorRect) return null;
+
+  // `position: fixed` is containing-block-relative under a transformed
+  // ancestor (some app shells), so portal to body to
+  // keep the anchor's coords viewport-relative.
+  if (typeof document === "undefined") return null;
+
+  return createPortal(
+    <Popover
+      open={open}
+      onOpenChange={(next) => {
+        if (!next) onDismiss();
+      }}
+    >
+      <Popover.Anchor asChild>
+        <div
+          aria-hidden
+          style={{
+            position: "fixed",
+            left: anchorRect.left,
+            top: anchorRect.top,
+            width: 0,
+            height: anchorRect.height || 1,
+            pointerEvents: "none",
+          }}
+        />
+      </Popover.Anchor>
+      <Popover.Content
+        side="top"
+        align="start"
+        width={70}
+        onOpenAutoFocus={(e) => e.preventDefault()}
+        // The keydown handler above owns Esc.
+        onEscapeKeyDown={(e) => e.preventDefault()}
+        data-testid="skill-picker-popover"
+        aria-label={t("entryPickerPopover.content.ariaLabel")}
+      >
+        <Popover.Menu
+          scrollContainerRef={scrollContainerRef}
+          footer={
+            onManageSkills ? (
+              <LineItemButton
+                icon={SvgSettings}
+                title={t("entryPickerPopover.manageSkills.label")}
+                state={selectedIndex === footerIndex ? "selected" : "empty"}
+                selectVariant="select-heavy"
+                data-row-index={footerIndex ?? undefined}
+                onMouseEnter={() => {
+                  if (footerIndex !== null) setSelectedIndex(footerIndex);
+                }}
+                onMouseDown={(event) => {
+                  event.preventDefault();
+                  onDismiss();
+                  onManageSkills();
+                }}
+              />
+            ) : undefined
+          }
+        >
+          {buildMenuChildren({
+            sections,
+            selectedIndex,
+            onSelect,
+            onHover: setSelectedIndex,
+            trigger,
+            groupLabels: {
+              skills: t("entryPickerPopover.skillsGroup.label"),
+              apps: t("entryPickerPopover.appsGroup.label"),
+              mcpServers: t("entryPickerPopover.mcpServersGroup.label"),
+            },
+          })}
+        </Popover.Menu>
+      </Popover.Content>
+    </Popover>,
+    document.body
+  );
+}
+
+interface BuildMenuChildrenArgs {
+  sections: PickerSections;
+  selectedIndex: number;
+  onSelect: (entry: PickerEntry) => void;
+  onHover: (idx: number) => void;
+  trigger: string;
+  /** Translated copy: this helper is not a component, so it cannot call `t`. */
+  groupLabels: { skills: string; apps: string; mcpServers: string };
+}
+
+// `Popover.Menu` renders a literal `null` between children as a divider.
+function buildMenuChildren({
+  sections,
+  selectedIndex,
+  onSelect,
+  onHover,
+  trigger,
+  groupLabels,
+}: BuildMenuChildrenArgs): ReactNode[] {
+  // Groups must stay in `flattenSections` order — keyboard nav indexes into that
+  // flat list, so a running index is what keeps the two aligned.
+  const groups: { key: string; label: string; entries: PickerEntry[] }[] = [
+    { key: "skills", label: groupLabels.skills, entries: sections.skills },
+    { key: "apps", label: groupLabels.apps, entries: sections.apps },
+    {
+      key: "mcpServers",
+      label: groupLabels.mcpServers,
+      entries: sections.mcpServers,
+    },
+  ];
+
+  const children: ReactNode[] = [];
+  let idx = 0;
+
+  for (const group of groups) {
+    if (group.entries.length === 0) continue;
+    if (children.length > 0) children.push(null);
+    children.push(
+      <SectionHeader key={`${group.key}-header`} label={group.label} />
+    );
+    for (const entry of group.entries) {
+      const rowProps = {
+        selected: idx === selectedIndex,
+        onHover: () => onHover(idx),
+        onPick: () => onSelect(entry),
+        rowIndex: idx,
+      };
+      children.push(
+        entry.kind === "skill" ? (
+          <SkillRow
+            key={pickerEntryKey(entry)}
+            {...rowProps}
+            title={`${trigger}${entry.slug}`}
+            slug={entry.slug}
+            description={entry.description}
+          />
+        ) : (
+          <ConnectableRow
+            key={pickerEntryKey(entry)}
+            {...rowProps}
+            logo={pickerEntryIcon(entry)}
+            name={entry.name}
+            authenticated={entry.authenticated}
+            testId={
+              entry.kind === "app"
+                ? `app-picker-row-${entry.externalAppId}`
+                : `mcp-picker-row-${entry.mcpServerId}`
+            }
+          />
+        )
+      );
+      idx += 1;
+    }
+  }
+
+  return children;
+}
+
+function SectionHeader({ label }: { label: string | RichStr }) {
+  return (
+    <div className="px-2 pt-1 pb-0.5">
+      <Text font="secondary-action" color="text-03">
+        {label}
+      </Text>
+    </div>
+  );
+}
+
+interface SkillRowProps {
+  title: string | RichStr;
+  slug: string;
+  description: string | RichStr;
+  selected: boolean;
+  onHover: () => void;
+  onPick: () => void;
+  rowIndex: number;
+}
+
+function SkillRow({
+  title,
+  slug,
+  description,
+  selected,
+  onHover,
+  onPick,
+  rowIndex,
+}: SkillRowProps) {
+  return (
+    <div className="cursor-pointer">
+      <LineItemButton
+        font="main-ui-action"
+        presentational
+        title={title}
+        titleMaxLines={1}
+        state={selected ? "selected" : "empty"}
+        selectVariant="select-heavy"
+        description={description}
+        descriptionMaxLines={1}
+        onMouseEnter={onHover}
+        onMouseDown={(e) => {
+          e.preventDefault();
+          onPick();
+        }}
+        data-row-index={rowIndex}
+        data-testid={`skill-picker-row-${slug}`}
+      />
+    </div>
+  );
+}
+
+interface ConnectableRowProps {
+  logo: IconFunctionComponent;
+  name: string | RichStr;
+  authenticated: boolean;
+  testId: string;
+  selected: boolean;
+  onHover: () => void;
+  onPick: () => void;
+  rowIndex: number;
+}
+
+// Shared by external apps and MCP servers: identical affordances, and the
+// section header above already says which kind the row is.
+function ConnectableRow({
+  logo: Logo,
+  name,
+  authenticated,
+  testId,
+  selected,
+  onHover,
+  onPick,
+  rowIndex,
+}: ConnectableRowProps) {
+  const t = useTranslations("chat.input");
+  const unauth = !authenticated;
+  return (
+    <div className="cursor-pointer">
+      {/* The logo takes the icon slot rather than riding inside the label,
+          and the unauthenticated dimming becomes the muted colour mode
+          rather than opacity on a hand-rolled span. */}
+      <LineItemButton
+        font="main-ui-action"
+        presentational
+        icon={Logo}
+        title={name}
+        titleMaxLines={1}
+        color={unauth ? "default" : undefined}
+        titleColor={unauth ? "text-03" : undefined}
+        state={selected ? "selected" : "empty"}
+        selectVariant="select-heavy"
+        description={
+          authenticated
+            ? t("entryPickerPopover.connectedRow.description")
+            : t("entryPickerPopover.connectionRequiredRow.description")
+        }
+        descriptionMaxLines={1}
+        onMouseEnter={onHover}
+        onMouseDown={(e) => {
+          e.preventDefault();
+          onPick();
+        }}
+        rightChildren={
+          unauth ? (
+            <Text
+              font="secondary-action"
+              color="text-03"
+              wordWrap="whitespace-nowrap"
+            >
+              {t("entryPickerPopover.connectAction.label")}
+            </Text>
+          ) : undefined
+        }
+        data-row-index={rowIndex}
+        data-testid={testId}
+      />
+    </div>
+  );
+}
+
+export default memo(EntryPickerPopover);

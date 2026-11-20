@@ -1,0 +1,206 @@
+package coverage
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func TestNewBaseline_roundsFloorsDown(t *testing.T) {
+	// 2/3 is 66.66...%, which must not become a 66.7% floor the same run
+	// would then fail against.
+	baseline := NewBaseline(profileOf(map[string][2]int{"cmd": {2, 3}}), TypeScript)
+
+	if got := baseline.Packages["cmd"]; got != 66.6 {
+		t.Fatalf("expected a 66.6 floor, got %v", got)
+	}
+}
+
+// The floor a run records must always pass a check of that same run.
+func TestNewBaseline_isSelfConsistent(t *testing.T) {
+	profile := profileOf(map[string][2]int{
+		"cmd":            {2, 3},
+		"internal/audit": {1, 7},
+		"internal/empty": {0, 0},
+		// 29/50 computes as 57.99999999999999%, just under 58.
+		"internal/typed": {29, 50},
+	})
+
+	for _, kind := range []Kind{GoTests, TypeScript} {
+		report := Compare(profile, NewBaseline(profile, kind).Reference(), 0)
+
+		if got := len(report.Regressions()); got != 0 {
+			t.Fatalf("%s: a fresh baseline must not fail its own run, got %d regressions", kind.Name, got)
+		}
+		if report.Changed() {
+			t.Fatalf("%s: a fresh baseline must match its own run, got %+v", kind.Name, report.Packages)
+		}
+	}
+}
+
+func TestBaseline_saveAndLoadRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), BaselineFile)
+	original := NewBaseline(profileOf(map[string][2]int{"cmd": {1, 4}, "internal/audit": {1, 2}}), GoTests)
+
+	if err := original.Save(path, GoTests); err != nil {
+		t.Fatalf("failed to save the baseline: %v", err)
+	}
+	loaded, err := LoadBaseline(path)
+	if err != nil {
+		t.Fatalf("failed to load the baseline: %v", err)
+	}
+
+	// A baseline that reorders between runs would show up as a diff on every
+	// update, so a second save must be byte-identical.
+	again := filepath.Join(t.TempDir(), BaselineFile)
+	if err := original.Save(again, GoTests); err != nil {
+		t.Fatalf("failed to save the baseline: %v", err)
+	}
+	data := readFile(t, path)
+	if data != readFile(t, again) {
+		t.Fatal("expected two saves of the same baseline to be byte-identical")
+	}
+	if !strings.HasPrefix(data, "# Minimum statement coverage") {
+		t.Fatalf("expected the explanatory header, got:\n%s", data)
+	}
+
+	if loaded.Total != original.Total || loaded.Step != original.Step {
+		t.Fatalf("expected total %v, got %v", original.Total, loaded.Total)
+	}
+	if len(loaded.Packages) != len(original.Packages) {
+		t.Fatalf("expected %d packages, got %d", len(original.Packages), len(loaded.Packages))
+	}
+	for name, floor := range original.Packages {
+		if loaded.Packages[name] != floor {
+			t.Fatalf("expected %s at %v, got %v", name, floor, loaded.Packages[name])
+		}
+	}
+}
+
+func TestBaseline_saveUsesTheKindHeader(t *testing.T) {
+	path := filepath.Join(t.TempDir(), TypeBaselineFile)
+	baseline := NewBaseline(profileOf(map[string][2]int{"src/app": {1, 2}}), TypeScript)
+
+	if err := baseline.Save(path, TypeScript); err != nil {
+		t.Fatalf("failed to save the baseline: %v", err)
+	}
+
+	data := readFile(t, path)
+	if !strings.HasPrefix(data, "# Minimum TypeScript type coverage per directory") {
+		t.Fatalf("expected the TypeScript header, got:\n%s", data)
+	}
+	if _, err := LoadBaseline(path); err != nil {
+		t.Fatalf("failed to load the baseline: %v", err)
+	}
+}
+
+func TestLoadBaseline_missingFileReportsNotExist(t *testing.T) {
+	_, err := LoadBaseline(filepath.Join(t.TempDir(), BaselineFile))
+	if !os.IsNotExist(err) {
+		t.Fatalf("expected a not-exist error, got %v", err)
+	}
+}
+
+func TestLoadBaseline_rejectsMalformedYAML(t *testing.T) {
+	path := filepath.Join(t.TempDir(), BaselineFile)
+	if err := os.WriteFile(path, []byte("total: [not a number\n"), 0644); err != nil {
+		t.Fatalf("failed to write the fixture: %v", err)
+	}
+
+	if _, err := LoadBaseline(path); err == nil {
+		t.Fatal("expected an error for malformed YAML")
+	}
+}
+
+// A floor that is not a percentage passes every comparison, which would turn
+// the gate off without anyone noticing.
+func TestLoadBaseline_rejectsInvalidFloors(t *testing.T) {
+	for _, contents := range []string{
+		"total: .nan\npackages: {}\n",
+		"total: -1\npackages: {}\n",
+		"total: 0\npackages:\n  cmd: 101\n",
+		"total: 0\npackages:\n  cmd: .inf\n",
+	} {
+		path := filepath.Join(t.TempDir(), BaselineFile)
+		if err := os.WriteFile(path, []byte(contents), 0644); err != nil {
+			t.Fatalf("failed to write the fixture: %v", err)
+		}
+		if _, err := LoadBaseline(path); err == nil {
+			t.Fatalf("expected an error for:\n%s", contents)
+		}
+	}
+}
+
+func readFile(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("failed to read %s: %v", path, err)
+	}
+	return string(data)
+}
+
+// A baseline with only a total still gates, and a nil baseline gates nothing.
+func TestLoadBaseline_withoutPackages(t *testing.T) {
+	path := filepath.Join(t.TempDir(), BaselineFile)
+	if err := os.WriteFile(path, []byte("total: 40\n"), 0644); err != nil {
+		t.Fatalf("failed to write the fixture: %v", err)
+	}
+
+	baseline, err := LoadBaseline(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reference := baseline.Reference()
+	if reference.Total != 40 || reference.Packages == nil || len(reference.Packages) != 0 {
+		t.Fatalf("expected a 40%% total and no package floors, got %+v", reference)
+	}
+	if (*Baseline)(nil).Reference() != nil {
+		t.Fatal("expected no reference from a nil baseline")
+	}
+}
+
+func TestBaseline_saveFailsUnderAFile(t *testing.T) {
+	blocker := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(blocker, nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+	baseline := &Baseline{Total: 1, Packages: map[string]float64{}}
+
+	path := filepath.Join(blocker, BaselineFile)
+	err := baseline.Save(path, GoTests)
+	if err == nil || !strings.HasPrefix(err.Error(), "write "+path+": ") {
+		t.Fatalf("expected a write error naming %s, got %v", path, err)
+	}
+}
+
+func TestNewBaseline_goFloorsRoundDownToFivePercentAndSkipZero(t *testing.T) {
+	// 889/1000 is 88.9%, 999/1000 is 99.9%, 4/100 is 4%, 0/7 is 0%.
+	baseline := NewBaseline(profileOf(map[string][2]int{
+		"cmd": {889, 1000}, "internal/docker": {999, 1000}, "internal/low": {4, 100}, "odsaudit": {0, 7},
+	}), GoTests)
+
+	want := map[string]float64{"cmd": 85, "internal/docker": 95}
+	if len(baseline.Packages) != len(want) {
+		t.Fatalf("expected floors %v, got %v", want, baseline.Packages)
+	}
+	for name, floor := range want {
+		if got := baseline.Packages[name]; got != floor {
+			t.Fatalf("expected a %v floor for %s, got %v", floor, name, got)
+		}
+	}
+	if baseline.Step != 5 {
+		t.Fatalf("expected step 5, got %v", baseline.Step)
+	}
+}
+
+func TestLoadBaseline_rejectsANegativeStep(t *testing.T) {
+	path := filepath.Join(t.TempDir(), BaselineFile)
+	if err := os.WriteFile(path, []byte("total: 50\nstep: -5\npackages:\n  cmd: 50\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadBaseline(path); err == nil || !strings.Contains(err.Error(), "step") {
+		t.Fatalf("expected a step error, got %v", err)
+	}
+}

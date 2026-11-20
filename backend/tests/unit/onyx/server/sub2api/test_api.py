@@ -260,7 +260,7 @@ async def test_upsert_onyx_user_from_sub2api_creates_missing_web_user() -> None:
     user_manager.create.assert_awaited_once()
     created_payload = user_manager.create.await_args.args[0]
     assert created_payload.email == "user@example.com"
-    assert created_payload.role == "basic"
+    assert created_payload.is_superuser is False
     assert created_payload.account_type == AccountType.STANDARD
     assert created_payload.is_verified is True
 

@@ -7,56 +7,59 @@ Thin HTTP layer over ``onyx.db.scheduled_task``. Every handler:
 3. Optionally enqueues the executor task on the ``scheduled_tasks`` queue.
 
 The router is mounted under the existing ``/build`` prefix (see
-``backend/onyx/server/features/build/api/api.py``), which provides the
+``backend/onyx/server/features/build/api.py``), which provides the
 ``require_onyx_craft_enabled`` gate.
 """
 
 from __future__ import annotations
 
-from datetime import datetime
-from datetime import timezone
+from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
-from fastapi import APIRouter
-from fastapi import Depends
-from fastapi import Query
-from fastapi import Response
-from pydantic import BaseModel
-from pydantic import ConfigDict
-from pydantic import Field
-from pydantic import model_validator
+from fastapi import APIRouter, Depends, Query, Response
+from pydantic import BaseModel, ConfigDict, Field, PositiveInt, model_validator
 from sqlalchemy.orm import Session
 
 from onyx.auth.permissions import require_permission
 from onyx.background.celery.versioned_apps.client import app as celery_app
-from onyx.configs.constants import OnyxCeleryPriority
-from onyx.configs.constants import OnyxCeleryQueues
-from onyx.configs.constants import OnyxCeleryTask
+from onyx.configs.constants import OnyxCeleryPriority, OnyxCeleryQueues, OnyxCeleryTask
 from onyx.db.engine.sql_engine import get_session
-from onyx.db.enums import Permission
-from onyx.db.enums import ScheduledTaskRunStatus
-from onyx.db.enums import ScheduledTaskStatus
-from onyx.db.enums import ScheduledTaskTriggerSource
-from onyx.db.models import ScheduledTask
-from onyx.db.models import ScheduledTaskRun
-from onyx.db.models import User
-from onyx.db.scheduled_task import create_scheduled_task
-from onyx.db.scheduled_task import get_scheduled_task
-from onyx.db.scheduled_task import insert_run
-from onyx.db.scheduled_task import list_runs_for_task
-from onyx.db.scheduled_task import list_scheduled_tasks_for_user
-from onyx.db.scheduled_task import soft_delete_scheduled_task
-from onyx.db.scheduled_task import update_scheduled_task
+from onyx.db.enums import (
+    Permission,
+    ScheduledTaskRunStatus,
+    ScheduledTaskStatus,
+    ScheduledTaskTriggerSource,
+)
+from onyx.db.integration_policy import list_task_integration_links
+from onyx.db.models import ScheduledTask, ScheduledTaskRun, User
+from onyx.db.scheduled_task import (
+    create_scheduled_task,
+    get_scheduled_task,
+    insert_run,
+    list_runs_for_task,
+    list_scheduled_tasks_for_user,
+    mark_runs_viewed,
+    soft_delete_scheduled_task,
+    unread_run_counts_for_user,
+    update_scheduled_task,
+)
 from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
-from onyx.server.features.build.scheduled_tasks.schedule import compile_to_cron
-from onyx.server.features.build.scheduled_tasks.schedule import EDITOR_PAYLOAD_MODELS
-from onyx.server.features.build.scheduled_tasks.schedule import EditorMode
-from onyx.server.features.build.scheduled_tasks.schedule import EditorPayload
-from onyx.server.features.build.scheduled_tasks.schedule import human_readable
-from onyx.server.features.build.scheduled_tasks.schedule import next_n_fires
-from onyx.server.features.build.scheduled_tasks.schedule import validate_timezone
+from onyx.integrations.craft import list_task_integration_views
+from onyx.integrations.policy import parse_action_settings
+from onyx.server.features.build.models import TaskIntegrationView
+from onyx.server.features.build.scheduled_tasks.schedule import (
+    EDITOR_PAYLOAD_MODELS,
+    EditorMode,
+    EditorPayload,
+    compile_to_cron,
+    human_readable,
+    next_n_fires,
+)
+from onyx.server.features.build.timeouts import QUEUE_RESIDENCY_SECONDS
+from onyx.tools.models import IntegrationLinkConfiguration
+from onyx.utils.datetime import datetime_to_utc
 from onyx.utils.logger import setup_logger
 from shared_configs.contextvars import get_current_tenant_id
 
@@ -67,17 +70,15 @@ logger = setup_logger()
 # Constants
 # ---------------------------------------------------------------------------
 
-# Number of seconds before a queued executor task is dropped. Mirrors
-# ``check-for-pruning`` and ``check-for-indexing`` — 15 minutes is plenty for
-# the worker to pick up the task; anything still queued past that is dead.
-EXECUTOR_TASK_EXPIRES_SECONDS = 900
-
 # Number of future fires returned by the detail endpoint for UI preview.
 NEXT_RUNS_PREVIEW_COUNT = 3
 
 # Default and max page sizes for the runs listing endpoint.
 RUNS_DEFAULT_PAGE_SIZE = 50
 RUNS_MAX_PAGE_SIZE = 100
+
+# Max run IDs accepted by one bulk mark-viewed request.
+RUNS_VIEWED_MAX_ENTRIES = 1000
 
 
 router = APIRouter(prefix="/scheduled-tasks")
@@ -89,9 +90,7 @@ router = APIRouter(prefix="/scheduled-tasks")
 
 
 class _Forbid(BaseModel):
-    """Base model that rejects unknown fields. Matches the convention in
-    ``backend/onyx/server/features/build/api/models.py`` for newer endpoints.
-    """
+    """Base model that rejects unknown fields."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -129,9 +128,9 @@ class ScheduledTaskCreate(_Forbid):
     prompt: str = Field(..., min_length=1)
     editor_mode: EditorMode
     editor_payload: EditorPayload
-    timezone: str
     status: ScheduledTaskStatus = ScheduledTaskStatus.ACTIVE
     run_immediately: bool = False
+    integrations: list[IntegrationLinkConfiguration] | None = None
 
     _dispatch = model_validator(mode="before")(_dispatch_editor_payload)
 
@@ -147,8 +146,8 @@ class ScheduledTaskPatch(_Forbid):
     prompt: str | None = Field(default=None, min_length=1)
     editor_mode: EditorMode | None = None
     editor_payload: EditorPayload | None = None
-    timezone: str | None = None
     status: ScheduledTaskStatus | None = None
+    integrations: list[IntegrationLinkConfiguration] | None = None
 
     _dispatch = model_validator(mode="before")(_dispatch_editor_payload)
 
@@ -173,6 +172,8 @@ class RunSummary(BaseModel):
     summary: str | None
     skip_reason: str | None
     error_class: str | None
+    revision: int
+    viewed_revision: int | None
 
     @classmethod
     def from_model(cls, run: ScheduledTaskRun) -> "RunSummary":
@@ -186,6 +187,8 @@ class RunSummary(BaseModel):
             summary=run.summary,
             skip_reason=run.skip_reason,
             error_class=run.error_class,
+            revision=run.version,
+            viewed_revision=run.viewed_revision,
         )
 
 
@@ -196,11 +199,11 @@ class ScheduledTaskListItem(BaseModel):
     name: str
     human_readable_schedule: str
     cron_expression: str
-    timezone: str
     editor_mode: str
     status: ScheduledTaskStatus
     next_run_at: datetime | None
     last_run: RunSummary | None
+    unviewed_run_count: int
     created_at: datetime
     updated_at: datetime
 
@@ -215,12 +218,12 @@ class ScheduledTaskDetail(BaseModel):
     prompt: str
     human_readable_schedule: str
     cron_expression: str
-    timezone: str
     editor_mode: str
     status: ScheduledTaskStatus
     next_run_at: datetime | None
     next_runs: list[datetime]
     last_run: RunSummary | None
+    integrations: list[IntegrationLinkConfiguration]
     created_at: datetime
     updated_at: datetime
 
@@ -232,6 +235,18 @@ class ScheduledTaskListResponse(BaseModel):
 class RunListResponse(BaseModel):
     items: list[RunSummary]
     next_cursor: str | None
+
+
+class UnviewedTaskCountResponse(BaseModel):
+    count: int
+
+
+class RunsViewedRequest(BaseModel):
+    revisions: dict[UUID, PositiveInt] = Field(max_length=RUNS_VIEWED_MAX_ENTRIES)
+
+
+class RunViewedRequest(BaseModel):
+    revision: int = Field(gt=0)
 
 
 class RunNowResponse(BaseModel):
@@ -268,18 +283,19 @@ def _list_item(
     db_session: Session,
     task: ScheduledTask,
     user_id: UUID,
+    unviewed_run_count: int,
 ) -> ScheduledTaskListItem:
     last_run = _latest_run(db_session, task, user_id)
     return ScheduledTaskListItem(
         id=str(task.id),
         name=task.name,
-        human_readable_schedule=human_readable(task.cron_expression, task.timezone),
+        human_readable_schedule=human_readable(task.cron_expression),
         cron_expression=task.cron_expression,
-        timezone=task.timezone,
         editor_mode=task.editor_mode,
         status=task.status,
         next_run_at=task.next_run_at,
         last_run=RunSummary.from_model(last_run) if last_run is not None else None,
+        unviewed_run_count=unviewed_run_count,
         created_at=task.created_at,
         updated_at=task.updated_at,
     )
@@ -295,7 +311,6 @@ def _detail(
     if task.status == ScheduledTaskStatus.ACTIVE:
         next_runs = next_n_fires(
             task.cron_expression,
-            task.timezone,
             datetime.now(tz=timezone.utc),
             NEXT_RUNS_PREVIEW_COUNT,
         )
@@ -303,14 +318,20 @@ def _detail(
         id=str(task.id),
         name=task.name,
         prompt=task.prompt,
-        human_readable_schedule=human_readable(task.cron_expression, task.timezone),
+        human_readable_schedule=human_readable(task.cron_expression),
         cron_expression=task.cron_expression,
-        timezone=task.timezone,
         editor_mode=task.editor_mode,
         status=task.status,
         next_run_at=task.next_run_at,
         next_runs=next_runs,
         last_run=RunSummary.from_model(last_run) if last_run is not None else None,
+        integrations=[
+            IntegrationLinkConfiguration(
+                integration_id=link.integration_id,
+                action_settings=parse_action_settings(link.action_settings),
+            )
+            for link in list_task_integration_links(db_session, task.id)
+        ],
         created_at=task.created_at,
         updated_at=task.updated_at,
     )
@@ -333,7 +354,7 @@ def _enqueue_executor(run_id: UUID) -> None:
         kwargs={"run_id": str(run_id), "tenant_id": tenant_id},
         queue=OnyxCeleryQueues.SCHEDULED_TASKS,
         priority=OnyxCeleryPriority.MEDIUM,
-        expires=EXECUTOR_TASK_EXPIRES_SECONDS,
+        expires=QUEUE_RESIDENCY_SECONDS,
     )
 
 
@@ -351,9 +372,7 @@ def _parse_cursor(cursor: str | None) -> datetime | None:
             OnyxErrorCode.INVALID_INPUT,
             f"Invalid cursor (expected ISO-8601 datetime): {cursor!r}",
         ) from e
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed
+    return datetime_to_utc(parsed)
 
 
 # ---------------------------------------------------------------------------
@@ -368,8 +387,22 @@ def list_scheduled_tasks(
 ) -> ScheduledTaskListResponse:
     """List the caller's scheduled tasks, newest first."""
     tasks = list_scheduled_tasks_for_user(db_session=db_session, user_id=user.id)
-    items = [_list_item(db_session, task, user.id) for task in tasks]
+    unviewed = unread_run_counts_for_user(db_session=db_session, user_id=user.id)
+    items = [
+        _list_item(db_session, task, user.id, unviewed.get(task.id, 0))
+        for task in tasks
+    ]
     return ScheduledTaskListResponse(items=items)
+
+
+@router.get("/unviewed-count")
+def get_unviewed_task_count(
+    user: User = Depends(require_permission(Permission.BASIC_ACCESS)),
+    db_session: Session = Depends(get_session),
+) -> UnviewedTaskCountResponse:
+    """Number of the caller's tasks with run results they have not opened."""
+    unviewed = unread_run_counts_for_user(db_session=db_session, user_id=user.id)
+    return UnviewedTaskCountResponse(count=len(unviewed))
 
 
 @router.post("")
@@ -381,14 +414,12 @@ def create_task(
     """Create a new scheduled task.
 
     Pipeline:
-      1. Validate the timezone.
-      2. Compile ``editor_mode`` + ``editor_payload`` to a canonical cron.
-      3. Insert via ``create_scheduled_task`` (which computes ``next_run_at``
+      1. Compile ``editor_mode`` + ``editor_payload`` to a canonical cron.
+      2. Insert via ``create_scheduled_task`` (which computes ``next_run_at``
          when the task is created ACTIVE).
-      4. If ``run_immediately`` is set, insert a ``manual_run_now`` run row
+      3. If ``run_immediately`` is set, insert a ``manual_run_now`` run row
          and enqueue the executor. Does NOT touch ``next_run_at``.
     """
-    validate_timezone(request.timezone)
     cron_expression = compile_to_cron(request.editor_payload)
 
     task = create_scheduled_task(
@@ -397,9 +428,9 @@ def create_task(
         name=request.name,
         prompt=request.prompt,
         cron_expression=cron_expression,
-        timezone_name=request.timezone,
         editor_mode=request.editor_mode,
         status=request.status,
+        integrations=request.integrations,
     )
 
     if request.run_immediately:
@@ -442,8 +473,8 @@ def patch_task(
 
     If ``editor_mode`` + ``editor_payload`` are provided, the cron is
     recompiled before being handed to ``update_scheduled_task``. The DB op
-    handles ``next_run_at`` recomputation (schedule/timezone change,
-    pause/resume) on its own.
+    handles ``next_run_at`` recomputation (schedule change, pause/resume) on
+    its own.
     """
     cron_expression: str | None = None
     if request.editor_payload is not None:
@@ -458,9 +489,9 @@ def patch_task(
         name=request.name,
         prompt=request.prompt,
         cron_expression=cron_expression,
-        timezone_name=request.timezone,
         editor_mode=request.editor_mode,
         status=request.status,
+        integrations=request.integrations,
     )
     db_session.commit()
     db_session.refresh(task)
@@ -509,6 +540,7 @@ def list_task_runs(
     task_id: UUID,
     cursor: str | None = Query(default=None),
     limit: int = Query(default=RUNS_DEFAULT_PAGE_SIZE, ge=1, le=RUNS_MAX_PAGE_SIZE),
+    unviewed: bool = Query(default=False),
     user: User = Depends(require_permission(Permission.BASIC_ACCESS)),
     db_session: Session = Depends(get_session),
 ) -> RunListResponse:
@@ -516,7 +548,8 @@ def list_task_runs(
 
     ``cursor`` is the ``started_at`` (ISO-8601) of the last row returned by
     the previous page. ``next_cursor`` is ``None`` when the last page is
-    reached.
+    reached. ``unviewed`` keeps only runs with results the owner has not
+    opened.
 
     Raises ``OnyxError(NOT_FOUND)`` when the task is missing, soft-deleted,
     or owned by another user (ownership check happens inside the DB op).
@@ -528,6 +561,7 @@ def list_task_runs(
         user_id=user.id,
         cursor=cursor_dt,
         limit=limit,
+        unviewed_only=unviewed,
     )
     next_cursor: str | None = None
     if len(runs) == limit:
@@ -538,3 +572,62 @@ def list_task_runs(
         items=[RunSummary.from_model(run) for run in runs],
         next_cursor=next_cursor,
     )
+
+
+@router.patch("/{task_id}/runs/viewed")
+def view_task_runs(
+    task_id: UUID,
+    body: RunsViewedRequest,
+    user: User = Depends(require_permission(Permission.BASIC_ACCESS)),
+    db_session: Session = Depends(get_session),
+) -> RunListResponse:
+    try:
+        runs = mark_runs_viewed(
+            db_session=db_session,
+            task_id=task_id,
+            user_id=user.id,
+            revisions=body.revisions,
+        )
+    except ValueError as error:
+        raise OnyxError(OnyxErrorCode.CONFLICT, str(error)) from error
+    response = RunListResponse(
+        items=[RunSummary.from_model(run) for run in runs], next_cursor=None
+    )
+    db_session.commit()
+    return response
+
+
+@router.patch("/{task_id}/runs/{run_id}/viewed")
+def view_task_run(
+    task_id: UUID,
+    run_id: UUID,
+    body: RunViewedRequest,
+    user: User = Depends(require_permission(Permission.BASIC_ACCESS)),
+    db_session: Session = Depends(get_session),
+) -> RunSummary:
+    try:
+        runs = mark_runs_viewed(
+            db_session=db_session,
+            task_id=task_id,
+            user_id=user.id,
+            revisions={run_id: body.revision},
+        )
+    except ValueError as error:
+        raise OnyxError(OnyxErrorCode.CONFLICT, str(error)) from error
+    if not runs:
+        raise OnyxError(OnyxErrorCode.NOT_FOUND, "Scheduled task run not found")
+    response = RunSummary.from_model(runs[0])
+    db_session.commit()
+    return response
+
+
+@router.get("/{task_id}/action-policies")
+def list_task_action_policies(
+    task_id: UUID,
+    user: User = Depends(require_permission(Permission.BASIC_ACCESS)),
+    db_session: Session = Depends(get_session),
+) -> list[TaskIntegrationView]:
+    """The integrations the task can use, each marked when the task uses it, with
+    the setting and the effective policy of each action."""
+    get_scheduled_task(db_session=db_session, task_id=task_id, user_id=user.id)
+    return list_task_integration_views(db_session, user, task_id)

@@ -26,10 +26,10 @@
    These auto-switch for dark mode via colors.css — no dark: modifier needed.
    Note: text-05 = highest contrast, text-01 = lowest. */
 .prose-onyx {
-  --tw-prose-body: var(--text-05);
-  --tw-prose-headings: var(--text-05);
+  --tw-prose-body: var(--text-04);
+  --tw-prose-headings: var(--text-04);
   --tw-prose-lead: var(--text-04);
-  --tw-prose-links: var(--action-link-05);
+  --tw-prose-links: var(--text-04);
   --tw-prose-bold: var(--text-05);
   --tw-prose-counters: var(--text-03);
   --tw-prose-bullets: var(--text-03);
@@ -297,10 +297,10 @@ pre[class*="language-"] {
 .markdown-table-breakout {
   overflow-x: auto;
 
-  /* Always reserve scrollbar height so hover doesn't shift content.
-     Thumb is transparent by default, revealed on hover. */
-  scrollbar-width: thin; /* Firefox — always shows track */
-  scrollbar-color: transparent transparent; /* invisible thumb + track */
+  /* The thumb shows whenever the table overflows, so the extra columns
+     are discoverable without hovering. */
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-03) transparent;
 }
 .markdown-table-breakout::-webkit-scrollbar {
   height: 6px;
@@ -309,23 +309,17 @@ pre[class*="language-"] {
   background: transparent;
 }
 .markdown-table-breakout::-webkit-scrollbar-thumb {
-  background: transparent;
+  background: var(--border-03);
   border-radius: 3px;
 }
-.markdown-table-breakout:hover {
-  scrollbar-color: var(--border-03) transparent; /* Firefox — reveal thumb */
-}
-.markdown-table-breakout:hover::-webkit-scrollbar-thumb {
-  background: var(--border-03);
-}
 
-/* Fade the right edge via an ::after overlay on the non-scrolling card.
-   Stays pinned while table scrolls; doesn't affect the sticky column. */
+/* Fade the scroll-end edge via an ::after overlay on the non-scrolling
+   card. Stays pinned while the table scrolls. */
 .markdown-table-card::after {
   content: "";
   position: absolute;
   top: 0;
-  right: 0;
+  inset-inline-end: 0;
   bottom: 0;
   width: 2rem;
   pointer-events: none;
@@ -339,45 +333,63 @@ pre[class*="language-"] {
   opacity: 0;
   transition: opacity 0.15s;
 }
+.markdown-table-card:dir(rtl)::after {
+  background: linear-gradient(
+    to left,
+    transparent,
+    var(--background-neutral-01)
+  );
+  border-radius: 0.5rem 0 0 0.5rem;
+}
 .markdown-table-card[data-overflows="true"]::after {
   opacity: 1;
 }
 
-/* Sticky first column — inherits the container's background so it
-   matches regardless of theme or custom wallpaper. */
+/* Edge padding on the outer columns. */
 .markdown-table-breakout th:first-child,
 .markdown-table-breakout td:first-child {
-  position: sticky;
-  left: 0;
-  z-index: 1;
-  padding-left: 0.75rem;
-  background: var(--background-neutral-01);
+  padding-inline-start: 0.75rem;
 }
 .markdown-table-breakout th:last-child,
 .markdown-table-breakout td:last-child {
-  padding-right: 0.75rem;
+  padding-inline-end: 0.75rem;
 }
 
-/* Shadow on sticky column when scrolled. Uses an ::after pseudo-element
-   so it isn't clipped by the overflow container or the mask-image fade. */
-.markdown-table-breakout th:first-child::after,
-.markdown-table-breakout td:first-child::after {
-  content: "";
+/* The table sizes to its content and fills at least the column. Long text
+   wraps at 16rem, so several columns show at once and a wider table
+   scrolls instead of squeezing every column narrow. A table
+   narrower than the column spreads the spare width across its cells. */
+.markdown-table-breakout table {
+  width: max-content;
+  min-width: 100%;
+}
+.markdown-table-breakout :is(th, td) {
+  max-width: 16rem;
+  vertical-align: top;
+  /* A long URL or path breaks inside the cell instead of widening it. */
+  overflow-wrap: anywhere;
+}
+/* KaTeX lays formulas out on one line; let math cells keep their width. */
+.markdown-table-breakout :is(th, td):has(.katex) {
+  max-width: none;
+}
+
+/* Copy button in the top inline-end corner, above the fade overlay. The
+   wrapper paints nothing and takes no clicks, so the header under it stays
+   readable and selectable while the button is hidden. */
+.markdown-table-copy {
   position: absolute;
-  top: 0;
-  right: -6px;
-  bottom: 0;
-  width: 6px;
+  top: 0.25rem;
+  inset-inline-end: 0.25rem;
+  z-index: 3;
   pointer-events: none;
-  opacity: 0;
-  transition: opacity 0.15s;
-  box-shadow: inset 6px 0 8px -4px var(--alpha-grey-100-25);
 }
-.dark .markdown-table-breakout th:first-child::after,
-.dark .markdown-table-breakout td:first-child::after {
-  box-shadow: inset 6px 0 8px -4px var(--alpha-grey-100-60);
+/* Hoverable sets pointer-events: none on the item while it is hidden. */
+.markdown-table-copy > * {
+  pointer-events: auto;
 }
-.markdown-table-breakout[data-scrolled="true"] th:first-child::after,
-.markdown-table-breakout[data-scrolled="true"] td:first-child::after {
-  opacity: 1;
+/* Inside the hover item, so the background hides with the button. */
+.markdown-table-copy-surface {
+  border-radius: 0.5rem;
+  background: var(--background-neutral-01);
 }

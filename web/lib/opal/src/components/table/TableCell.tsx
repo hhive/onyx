@@ -8,10 +8,21 @@ interface TableCellProps extends WithoutStyles<
   children: React.ReactNode;
   /** Explicit pixel width for the cell. */
   width?: number;
+  alignment?: "left" | "center" | "right";
+  /** Content never widens the column; long content is cut off instead. */
+  truncate?: boolean;
 }
+
+const alignmentJustifyClass = {
+  left: "justify-start",
+  center: "justify-center",
+  right: "justify-end",
+} as const;
 
 export default function TableCell({
   width,
+  alignment = "left",
+  truncate = false,
   children,
   ...props
 }: TableCellProps) {
@@ -24,7 +35,14 @@ export default function TableCell({
       {...props}
     >
       <div
-        className={cn("tbl-cell-inner", "flex items-center overflow-hidden")}
+        className={cn(
+          "tbl-cell-inner",
+          "flex items-center overflow-hidden",
+          // w-0 + min-w-full: content does not widen the column under
+          // `table-layout: auto`.
+          truncate && "w-0 min-w-full",
+          alignmentJustifyClass[alignment]
+        )}
         data-size={resolvedSize}
       >
         {children}

@@ -1,3 +1,5 @@
+import { LLMProviderView } from "@/lib/languageModels/types";
+
 const getApiVersionParam = (url: URL): string => {
   const directApiVersion = url.searchParams.get("api-version");
   if (directApiVersion?.trim()) {
@@ -26,6 +28,12 @@ const getDeploymentNameParam = (url: URL): string => {
 const isResponsesPath = (url: URL): boolean =>
   /\/openai\/responses/i.test(url.pathname);
 
+/** Azure's v1 API (`/openai/v1/...`) needs no dated api-version. */
+const AZURE_V1_API_VERSION = "v1";
+
+const isV1Path = (url: URL): boolean =>
+  /\/openai\/v1(\/|$)/i.test(url.pathname);
+
 export const parseAzureTargetUri = (
   rawUri: string
 ): {
@@ -33,23 +41,63 @@ export const parseAzureTargetUri = (
   apiVersion: string;
   deploymentName: string;
   isResponsesPath: boolean;
+  isV1Path: boolean;
 } => {
   const url = new URL(rawUri);
+  const v1Path = isV1Path(url);
   return {
     url,
-    apiVersion: getApiVersionParam(url),
+    apiVersion: getApiVersionParam(url) || (v1Path ? AZURE_V1_API_VERSION : ""),
     deploymentName: getDeploymentNameParam(url),
     isResponsesPath: isResponsesPath(url),
+    isV1Path: v1Path,
   };
 };
 
 export const isValidAzureTargetUri = (rawUri: string): boolean => {
   try {
-    const { apiVersion, deploymentName, isResponsesPath } =
+    const { apiVersion, deploymentName, isResponsesPath, isV1Path } =
       parseAzureTargetUri(rawUri);
 
-    return Boolean(apiVersion) && (Boolean(deploymentName) || isResponsesPath);
+    return (
+      Boolean(apiVersion) &&
+      (Boolean(deploymentName) || isResponsesPath || isV1Path)
+    );
   } catch {
     return false;
   }
+};
+
+/**
+ * Reconstructs the Azure "target URI" that pre-fills the edit form for an
+ * existing provider.
+ *
+ * When the provider routes per-model (no provider-level `deployment_name`), we
+ * emit the deployment-less `/openai/responses` form instead of injecting a
+ * placeholder deployment (or the `/openai/v1/` form when `api_version` is
+ * `v1`). Fabricating a deployment here caused
+ * `parseAzureTargetUri` to persist that bogus value on save, routing every
+ * model to a non-existent deployment and breaking the provider with Azure
+ * `DeploymentNotFound` (issue #13590). The path is discarded on save
+ * (`processValues` keeps only `url.origin`); it exists solely so the parsed URI
+ * round-trips back to the same `api_base`, `api_version`, and deployment.
+ */
+export const buildTargetUri = (
+  existingLlmProvider?: LLMProviderView
+): string => {
+  if (!existingLlmProvider?.api_base || !existingLlmProvider?.api_version) {
+    return "";
+  }
+
+  const { api_base, api_version, deployment_name } = existingLlmProvider;
+
+  if (!deployment_name && api_version === AZURE_V1_API_VERSION) {
+    return `${api_base}/openai/v1/`;
+  }
+
+  if (!deployment_name) {
+    return `${api_base}/openai/responses?api-version=${api_version}`;
+  }
+
+  return `${api_base}/openai/deployments/${deployment_name}/chat/completions?api-version=${api_version}`;
 };

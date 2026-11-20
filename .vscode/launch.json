@@ -22,6 +22,7 @@
         "Celery light",
         "Celery heavy",
         "Celery docfetching",
+        "Celery docconversion",
         "Celery docprocessing",
         "Celery user_file_processing",
         "Celery scheduled_tasks",
@@ -44,6 +45,7 @@
     },
     {
       "name": "Run All Onyx Services (k8s)",
+      "preLaunchTask": "k8s: telepresence intercept api_server",
       "configurations": [
         "Web Server",
         "API Server (k8s)",
@@ -51,10 +53,12 @@
         "Celery light (k8s)",
         "Celery heavy (k8s)",
         "Celery docfetching (k8s)",
+        "Celery docconversion (k8s)",
         "Celery docprocessing (k8s)",
         "Celery user_file_processing (k8s)",
         "Celery scheduled_tasks (k8s)",
-        "Celery beat (k8s)"
+        "Celery beat (k8s)",
+        "Craft application readiness"
       ],
       "presentation": {
         "group": "1"
@@ -70,6 +74,7 @@
         "Celery user_file_processing",
         "Celery scheduled_tasks",
         "Celery docfetching",
+        "Celery docconversion",
         "Celery docprocessing",
         "Celery beat"
       ],
@@ -77,6 +82,16 @@
         "group": "1"
       },
       "stopAll": true
+    },
+    {
+      "name": "Craft dev (remote cluster)",
+      "configurations": [
+        "Web Server",
+        "API Server (craft-dev)"
+      ],
+      "presentation": {
+        "group": "1"
+      }
     },
     {
       "name": "Celery (k8s)",
@@ -88,8 +103,20 @@
         "Celery user_file_processing (k8s)",
         "Celery scheduled_tasks (k8s)",
         "Celery docfetching (k8s)",
+        "Celery docconversion (k8s)",
         "Celery docprocessing (k8s)",
         "Celery beat (k8s)"
+      ],
+      "presentation": {
+        "group": "1"
+      },
+      "stopAll": true
+    },
+    {
+      "name": "Web Server + Shared Watch",
+      "configurations": [
+        "Web Server",
+        "Shared Watch (rebuild dist)"
       ],
       "presentation": {
         "group": "1"
@@ -125,6 +152,22 @@
       "consoleTitle": "Web Server Console"
     },
     {
+      "name": "Shared Watch (rebuild dist)",
+      "type": "node",
+      "request": "launch",
+      "cwd": "${workspaceRoot}/web/lib/shared",
+      "runtimeExecutable": "bun",
+      "runtimeArgs": [
+        "run",
+        "dev"
+      ],
+      "presentation": {
+        "group": "2"
+      },
+      "console": "integratedTerminal",
+      "consoleTitle": "Shared Watch Console"
+    },
+    {
       "name": "Model Server",
       "consoleName": "Model Server",
       "type": "debugpy",
@@ -139,6 +182,8 @@
       "args": [
         "model_server.main:app",
         "--reload",
+        "--reload-exclude",
+        "${workspaceFolder}/backend/onyx/skills/builtin",
         "--port",
         "9000"
       ],
@@ -154,6 +199,7 @@
       "request": "launch",
       "module": "uvicorn",
       "cwd": "${workspaceFolder}/backend",
+      "preLaunchTask": "ods-env",
       "envFile": "${workspaceFolder}/.vscode/.env",
       "env": {
         "LOG_LEVEL": "DEBUG",
@@ -162,6 +208,10 @@
       "args": [
         "onyx.main:app",
         "--reload",
+        "--reload-exclude",
+        "${workspaceFolder}/backend/onyx/skills/builtin",
+        "--reload-exclude",
+        "${workspaceFolder}/backend/onyx/server/features/build/sandbox/image",
         "--port",
         "8080"
       ],
@@ -176,26 +226,46 @@
       "consoleName": "API Server (k8s)",
       "type": "debugpy",
       "request": "launch",
-      "module": "uvicorn",
       "cwd": "${workspaceFolder}/backend",
-      "envFile": "${workspaceFolder}/.vscode/.env.k8s",
       "preLaunchTask": "k8s: telepresence intercept api_server",
       "env": {
         "LOG_LEVEL": "DEBUG",
-        "PYTHONUNBUFFERED": "1",
-        "SANDBOX_BACKEND": "kubernetes"
+        "PYTHONUNBUFFERED": "1"
       },
       "args": [
-        "onyx.main:app",
-        "--reload",
-        "--port",
-        "8080"
+        "api"
       ],
       "presentation": {
         "group": "2"
       },
       "consoleTitle": "API Server (k8s) Console",
-      "justMyCode": false
+      "justMyCode": false,
+      "program": "${workspaceFolder}/deployment/helm/dev/launch.py",
+      "subProcess": true
+    },
+    {
+      "name": "API Server (craft-dev)",
+      "consoleName": "API Server (craft-dev)",
+      "type": "debugpy",
+      "request": "launch",
+      "cwd": "${workspaceFolder}/backend",
+      "env": {
+        "LOG_LEVEL": "DEBUG",
+        "PYTHONUNBUFFERED": "1",
+        "CRAFT_API_PORT": "8080"
+      },
+      "args": [
+        "--target",
+        "craft-dev",
+        "api"
+      ],
+      "presentation": {
+        "group": "2"
+      },
+      "consoleTitle": "API Server (craft-dev) Console",
+      "justMyCode": false,
+      "program": "${workspaceFolder}/deployment/helm/dev/launch.py",
+      "subProcess": true
     },
     {
       "name": "Slack Bot",
@@ -251,6 +321,8 @@
       "args": [
         "onyx.mcp_server.api:mcp_app",
         "--reload",
+        "--reload-exclude",
+        "${workspaceFolder}/backend/onyx/skills/builtin",
         "--port",
         "8090",
         "--timeout-graceful-shutdown",
@@ -268,6 +340,7 @@
       "program": "${workspaceFolder}/backend/scripts/dev_celery_reload.py",
       "subProcess": true,
       "cwd": "${workspaceFolder}/backend",
+      "preLaunchTask": "ods-env",
       "envFile": "${workspaceFolder}/.vscode/.env",
       "env": {
         "LOG_LEVEL": "INFO",
@@ -299,6 +372,7 @@
       "program": "${workspaceFolder}/backend/scripts/dev_celery_reload.py",
       "subProcess": true,
       "cwd": "${workspaceFolder}/backend",
+      "preLaunchTask": "ods-env",
       "envFile": "${workspaceFolder}/.vscode/.env",
       "env": {
         "LOG_LEVEL": "INFO",
@@ -315,7 +389,7 @@
         "--loglevel=INFO",
         "--hostname=light@%n",
         "-Q",
-        "vespa_metadata_sync,connector_deletion,doc_permissions_upsert,checkpoint_cleanup,index_attempt_cleanup,opensearch_migration"
+        "vespa_metadata_sync,connector_deletion,doc_permissions_upsert,checkpoint_cleanup,index_attempt_cleanup,index_reclaim,chat_ttl_deletion,capability_checks_draft"
       ],
       "presentation": {
         "group": "2",
@@ -330,6 +404,7 @@
       "program": "${workspaceFolder}/backend/scripts/dev_celery_reload.py",
       "subProcess": true,
       "cwd": "${workspaceFolder}/backend",
+      "preLaunchTask": "ods-env",
       "envFile": "${workspaceFolder}/.vscode/.env",
       "env": {
         "LOG_LEVEL": "INFO",
@@ -346,7 +421,7 @@
         "--loglevel=INFO",
         "--hostname=heavy@%n",
         "-Q",
-        "connector_pruning,connector_doc_permissions_sync,connector_external_group_sync,csv_generation,sandbox"
+        "connector_pruning,connector_doc_permissions_sync,connector_external_group_sync,csv_generation,sandbox,connector_hierarchy_fetching,capability_checks"
       ],
       "presentation": {
         "group": "2",
@@ -362,6 +437,7 @@
       "program": "${workspaceFolder}/backend/scripts/dev_celery_reload.py",
       "subProcess": true,
       "cwd": "${workspaceFolder}/backend",
+      "preLaunchTask": "ods-env",
       "envFile": "${workspaceFolder}/.vscode/.env",
       "env": {
         "LOG_LEVEL": "INFO",
@@ -393,6 +469,7 @@
       "program": "${workspaceFolder}/backend/scripts/dev_celery_reload.py",
       "subProcess": true,
       "cwd": "${workspaceFolder}/backend",
+      "preLaunchTask": "ods-env",
       "envFile": "${workspaceFolder}/.vscode/.env",
       "env": {
         "LOG_LEVEL": "INFO",
@@ -409,7 +486,7 @@
         "--loglevel=INFO",
         "--hostname=user_file_processing@%n",
         "-Q",
-        "user_file_processing,user_file_project_sync,user_file_delete"
+        "user_file_processing,user_file_project_sync,user_file_delete,user_file_port"
       ],
       "presentation": {
         "group": "2",
@@ -425,6 +502,7 @@
       "program": "${workspaceFolder}/backend/scripts/dev_celery_reload.py",
       "subProcess": true,
       "cwd": "${workspaceFolder}/backend",
+      "preLaunchTask": "ods-env",
       "envFile": "${workspaceFolder}/.vscode/.env",
       "env": {
         "LOG_LEVEL": "INFO",
@@ -457,6 +535,7 @@
       "program": "${workspaceFolder}/backend/scripts/dev_celery_reload.py",
       "subProcess": true,
       "cwd": "${workspaceFolder}/backend",
+      "preLaunchTask": "ods-env",
       "envFile": "${workspaceFolder}/.vscode/.env",
       "env": {
         "LOG_LEVEL": "DEBUG",
@@ -482,12 +561,45 @@
       "justMyCode": false
     },
     {
+      "name": "Celery docconversion",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/backend/scripts/dev_celery_reload.py",
+      "subProcess": true,
+      "cwd": "${workspaceFolder}/backend",
+      "preLaunchTask": "ods-env",
+      "envFile": "${workspaceFolder}/.vscode/.env",
+      "env": {
+        "LOG_LEVEL": "DEBUG",
+        "PYTHONUNBUFFERED": "1",
+        "PYTHONPATH": "."
+      },
+      "args": [
+        "-A",
+        "onyx.background.celery.versioned_apps.docconversion",
+        "worker",
+        "--pool=threads",
+        "--prefetch-multiplier=1",
+        "--loglevel=INFO",
+        "--hostname=docconversion@%n",
+        "-Q",
+        "docconversion"
+      ],
+      "presentation": {
+        "group": "2",
+        "hidden": true
+      },
+      "consoleTitle": "Celery docconversion Console",
+      "justMyCode": false
+    },
+    {
       "name": "Celery docprocessing",
       "type": "debugpy",
       "request": "launch",
       "program": "${workspaceFolder}/backend/scripts/dev_celery_reload.py",
       "subProcess": true,
       "cwd": "${workspaceFolder}/backend",
+      "preLaunchTask": "ods-env",
       "envFile": "${workspaceFolder}/.vscode/.env",
       "env": {
         "ENABLE_MULTIPASS_INDEXING": "false",
@@ -504,7 +616,7 @@
         "--loglevel=INFO",
         "--hostname=docprocessing@%n",
         "-Q",
-        "docprocessing"
+        "docprocessing,port"
       ],
       "presentation": {
         "group": "2",
@@ -520,6 +632,7 @@
       "program": "${workspaceFolder}/backend/scripts/dev_celery_reload.py",
       "subProcess": true,
       "cwd": "${workspaceFolder}/backend",
+      "preLaunchTask": "ods-env",
       "envFile": "${workspaceFolder}/.vscode/.env",
       "env": {
         "LOG_LEVEL": "DEBUG",
@@ -542,18 +655,17 @@
       "name": "Celery primary (k8s)",
       "type": "debugpy",
       "request": "launch",
-      "program": "${workspaceFolder}/backend/scripts/dev_celery_reload.py",
+      "program": "${workspaceFolder}/deployment/helm/dev/launch.py",
       "subProcess": true,
       "cwd": "${workspaceFolder}/backend",
-      "envFile": "${workspaceFolder}/.vscode/.env.k8s",
-      "preLaunchTask": "k8s: telepresence intercept api_server",
+      "preLaunchTask": "k8s: telepresence connect",
       "env": {
         "LOG_LEVEL": "INFO",
         "PYTHONUNBUFFERED": "1",
-        "PYTHONPATH": ".",
-        "SANDBOX_BACKEND": "kubernetes"
+        "PYTHONPATH": "."
       },
       "args": [
+        "celery",
         "-A",
         "onyx.background.celery.versioned_apps.primary",
         "worker",
@@ -575,18 +687,17 @@
       "name": "Celery light (k8s)",
       "type": "debugpy",
       "request": "launch",
-      "program": "${workspaceFolder}/backend/scripts/dev_celery_reload.py",
+      "program": "${workspaceFolder}/deployment/helm/dev/launch.py",
       "subProcess": true,
       "cwd": "${workspaceFolder}/backend",
-      "envFile": "${workspaceFolder}/.vscode/.env.k8s",
-      "preLaunchTask": "k8s: telepresence intercept api_server",
+      "preLaunchTask": "k8s: telepresence connect",
       "env": {
         "LOG_LEVEL": "INFO",
         "PYTHONUNBUFFERED": "1",
-        "PYTHONPATH": ".",
-        "SANDBOX_BACKEND": "kubernetes"
+        "PYTHONPATH": "."
       },
       "args": [
+        "celery",
         "-A",
         "onyx.background.celery.versioned_apps.light",
         "worker",
@@ -596,7 +707,7 @@
         "--loglevel=INFO",
         "--hostname=light@%n",
         "-Q",
-        "vespa_metadata_sync,connector_deletion,doc_permissions_upsert,checkpoint_cleanup,index_attempt_cleanup,opensearch_migration"
+        "vespa_metadata_sync,connector_deletion,doc_permissions_upsert,checkpoint_cleanup,index_attempt_cleanup,index_reclaim,chat_ttl_deletion,capability_checks_draft"
       ],
       "presentation": {
         "group": "2",
@@ -608,18 +719,17 @@
       "name": "Celery heavy (k8s)",
       "type": "debugpy",
       "request": "launch",
-      "program": "${workspaceFolder}/backend/scripts/dev_celery_reload.py",
+      "program": "${workspaceFolder}/deployment/helm/dev/launch.py",
       "subProcess": true,
       "cwd": "${workspaceFolder}/backend",
-      "envFile": "${workspaceFolder}/.vscode/.env.k8s",
-      "preLaunchTask": "k8s: telepresence intercept api_server",
+      "preLaunchTask": "k8s: telepresence connect",
       "env": {
         "LOG_LEVEL": "INFO",
         "PYTHONUNBUFFERED": "1",
-        "PYTHONPATH": ".",
-        "SANDBOX_BACKEND": "kubernetes"
+        "PYTHONPATH": "."
       },
       "args": [
+        "celery",
         "-A",
         "onyx.background.celery.versioned_apps.heavy",
         "worker",
@@ -629,7 +739,7 @@
         "--loglevel=INFO",
         "--hostname=heavy@%n",
         "-Q",
-        "connector_pruning,connector_doc_permissions_sync,connector_external_group_sync,csv_generation,sandbox"
+        "connector_pruning,connector_doc_permissions_sync,connector_external_group_sync,csv_generation,sandbox,connector_hierarchy_fetching,capability_checks"
       ],
       "presentation": {
         "group": "2",
@@ -642,18 +752,17 @@
       "name": "Celery monitoring (k8s)",
       "type": "debugpy",
       "request": "launch",
-      "program": "${workspaceFolder}/backend/scripts/dev_celery_reload.py",
+      "program": "${workspaceFolder}/deployment/helm/dev/launch.py",
       "subProcess": true,
       "cwd": "${workspaceFolder}/backend",
-      "envFile": "${workspaceFolder}/.vscode/.env.k8s",
-      "preLaunchTask": "k8s: telepresence intercept api_server",
+      "preLaunchTask": "k8s: telepresence connect",
       "env": {
         "LOG_LEVEL": "INFO",
         "PYTHONUNBUFFERED": "1",
-        "PYTHONPATH": ".",
-        "SANDBOX_BACKEND": "kubernetes"
+        "PYTHONPATH": "."
       },
       "args": [
+        "celery",
         "-A",
         "onyx.background.celery.versioned_apps.monitoring",
         "worker",
@@ -675,18 +784,17 @@
       "name": "Celery user_file_processing (k8s)",
       "type": "debugpy",
       "request": "launch",
-      "program": "${workspaceFolder}/backend/scripts/dev_celery_reload.py",
+      "program": "${workspaceFolder}/deployment/helm/dev/launch.py",
       "subProcess": true,
       "cwd": "${workspaceFolder}/backend",
-      "envFile": "${workspaceFolder}/.vscode/.env.k8s",
-      "preLaunchTask": "k8s: telepresence intercept api_server",
+      "preLaunchTask": "k8s: telepresence connect",
       "env": {
         "LOG_LEVEL": "INFO",
         "PYTHONUNBUFFERED": "1",
-        "PYTHONPATH": ".",
-        "SANDBOX_BACKEND": "kubernetes"
+        "PYTHONPATH": "."
       },
       "args": [
+        "celery",
         "-A",
         "onyx.background.celery.versioned_apps.user_file_processing",
         "worker",
@@ -696,7 +804,7 @@
         "--loglevel=INFO",
         "--hostname=user_file_processing@%n",
         "-Q",
-        "user_file_processing,user_file_project_sync,user_file_delete"
+        "user_file_processing,user_file_project_sync,user_file_delete,user_file_port"
       ],
       "presentation": {
         "group": "2",
@@ -709,18 +817,17 @@
       "name": "Celery scheduled_tasks (k8s)",
       "type": "debugpy",
       "request": "launch",
-      "program": "${workspaceFolder}/backend/scripts/dev_celery_reload.py",
+      "program": "${workspaceFolder}/deployment/helm/dev/launch.py",
       "subProcess": true,
       "cwd": "${workspaceFolder}/backend",
-      "envFile": "${workspaceFolder}/.vscode/.env.k8s",
-      "preLaunchTask": "k8s: telepresence intercept api_server",
+      "preLaunchTask": "k8s: telepresence connect",
       "env": {
         "LOG_LEVEL": "INFO",
         "PYTHONUNBUFFERED": "1",
-        "PYTHONPATH": ".",
-        "SANDBOX_BACKEND": "kubernetes"
+        "PYTHONPATH": "."
       },
       "args": [
+        "celery",
         "-A",
         "onyx.background.celery.versioned_apps.scheduled_tasks",
         "worker",
@@ -743,18 +850,17 @@
       "name": "Celery docfetching (k8s)",
       "type": "debugpy",
       "request": "launch",
-      "program": "${workspaceFolder}/backend/scripts/dev_celery_reload.py",
+      "program": "${workspaceFolder}/deployment/helm/dev/launch.py",
       "subProcess": true,
       "cwd": "${workspaceFolder}/backend",
-      "envFile": "${workspaceFolder}/.vscode/.env.k8s",
-      "preLaunchTask": "k8s: telepresence intercept api_server",
+      "preLaunchTask": "k8s: telepresence connect",
       "env": {
         "LOG_LEVEL": "DEBUG",
         "PYTHONUNBUFFERED": "1",
-        "PYTHONPATH": ".",
-        "SANDBOX_BACKEND": "kubernetes"
+        "PYTHONPATH": "."
       },
       "args": [
+        "celery",
         "-A",
         "onyx.background.celery.versioned_apps.docfetching",
         "worker",
@@ -773,22 +879,53 @@
       "justMyCode": false
     },
     {
+      "name": "Celery docconversion (k8s)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/deployment/helm/dev/launch.py",
+      "subProcess": true,
+      "cwd": "${workspaceFolder}/backend",
+      "preLaunchTask": "k8s: telepresence connect",
+      "env": {
+        "LOG_LEVEL": "DEBUG",
+        "PYTHONUNBUFFERED": "1",
+        "PYTHONPATH": "."
+      },
+      "args": [
+        "celery",
+        "-A",
+        "onyx.background.celery.versioned_apps.docconversion",
+        "worker",
+        "--pool=threads",
+        "--prefetch-multiplier=1",
+        "--loglevel=INFO",
+        "--hostname=docconversion@%n",
+        "-Q",
+        "docconversion"
+      ],
+      "presentation": {
+        "group": "2",
+        "hidden": true
+      },
+      "consoleTitle": "Celery docconversion (k8s) Console",
+      "justMyCode": false
+    },
+    {
       "name": "Celery docprocessing (k8s)",
       "type": "debugpy",
       "request": "launch",
-      "program": "${workspaceFolder}/backend/scripts/dev_celery_reload.py",
+      "program": "${workspaceFolder}/deployment/helm/dev/launch.py",
       "subProcess": true,
       "cwd": "${workspaceFolder}/backend",
-      "envFile": "${workspaceFolder}/.vscode/.env.k8s",
-      "preLaunchTask": "k8s: telepresence intercept api_server",
+      "preLaunchTask": "k8s: telepresence connect",
       "env": {
         "ENABLE_MULTIPASS_INDEXING": "false",
         "LOG_LEVEL": "DEBUG",
         "PYTHONUNBUFFERED": "1",
-        "PYTHONPATH": ".",
-        "SANDBOX_BACKEND": "kubernetes"
+        "PYTHONPATH": "."
       },
       "args": [
+        "celery",
         "-A",
         "onyx.background.celery.versioned_apps.docprocessing",
         "worker",
@@ -797,7 +934,7 @@
         "--loglevel=INFO",
         "--hostname=docprocessing@%n",
         "-Q",
-        "docprocessing"
+        "docprocessing,port"
       ],
       "presentation": {
         "group": "2",
@@ -810,18 +947,17 @@
       "name": "Celery beat (k8s)",
       "type": "debugpy",
       "request": "launch",
-      "program": "${workspaceFolder}/backend/scripts/dev_celery_reload.py",
+      "program": "${workspaceFolder}/deployment/helm/dev/launch.py",
       "subProcess": true,
       "cwd": "${workspaceFolder}/backend",
-      "envFile": "${workspaceFolder}/.vscode/.env.k8s",
-      "preLaunchTask": "k8s: telepresence intercept api_server",
+      "preLaunchTask": "k8s: telepresence connect",
       "env": {
         "LOG_LEVEL": "DEBUG",
         "PYTHONUNBUFFERED": "1",
-        "PYTHONPATH": ".",
-        "SANDBOX_BACKEND": "kubernetes"
+        "PYTHONPATH": "."
       },
       "args": [
+        "celery",
         "-A",
         "onyx.background.celery.versioned_apps.beat",
         "beat",
@@ -873,19 +1009,21 @@
         "up",
         "-d"
       ],
-      "cwd": "${workspaceFolder}/profiling",
+      "cwd": "${workspaceFolder}/tools/profiling",
       "console": "integratedTerminal",
       "presentation": {
         "group": "3"
       }
     },
     {
-      "name": "Clear and Restart External Volumes and Containers",
+      "name": "Start External Infrastructure Containers",
       "type": "node",
       "request": "launch",
+      "preLaunchTask": "ods-compose-dev-infra",
       "runtimeExecutable": "bash",
       "runtimeArgs": [
-        "${workspaceFolder}/backend/scripts/restart_containers.sh"
+        "-c",
+        "true"
       ],
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
@@ -922,6 +1060,7 @@
       "request": "launch",
       "program": "scripts/dev_run_background_jobs.py",
       "cwd": "${workspaceFolder}/backend",
+      "preLaunchTask": "ods-env",
       "envFile": "${workspaceFolder}/.vscode/.env",
       "env": {
         "LOG_LEVEL": "DEBUG",
@@ -1118,6 +1257,21 @@
       "request": "launch",
       "url": "http://localhost:3000",
       "webRoot": "${workspaceFolder}/web"
+    },
+    {
+      "name": "Craft application readiness",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/deployment/helm/dev/launch.py",
+      "args": [
+        "ready"
+      ],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "presentation": {
+        "group": "2",
+        "hidden": true
+      }
     }
   ]
 }

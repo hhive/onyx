@@ -1,19 +1,17 @@
 from collections.abc import Callable
-from typing import Any
-from typing import Union
+from typing import Any, Union
 
-from braintrust import Eval
-from braintrust import EvalCase
-from braintrust import init_dataset
-from braintrust import Score
+from braintrust import Eval, EvalCase, Score, init_dataset
 
-from onyx.configs.app_configs import BRAINTRUST_MAX_CONCURRENCY
-from onyx.configs.app_configs import BRAINTRUST_PROJECT
-from onyx.evals.models import EvalationAck
-from onyx.evals.models import EvalConfigurationOptions
-from onyx.evals.models import EvalProvider
-from onyx.evals.models import EvalToolResult
-from onyx.evals.models import MultiTurnEvalResult
+from onyx.configs.app_configs import BRAINTRUST_MAX_CONCURRENCY, BRAINTRUST_PROJECT
+from onyx.evals.models import (
+    EvalationAck,
+    EvalConfigurationOptions,
+    EvalProvider,
+    EvalToolResult,
+    MultiTurnEvalResult,
+    evaluation_input,
+)
 from onyx.utils.logger import setup_logger
 
 logger = setup_logger()
@@ -118,6 +116,7 @@ class BraintrustEvalProvider(EvalProvider):
 
         # Create a wrapper task that dispatches to the appropriate handler
         def dispatch_task(eval_input: dict[str, Any]) -> EvalResult:
+            eval_input = evaluation_input(eval_input)
             if "messages" in eval_input and multi_turn_task is not None:
                 return multi_turn_task(eval_input)
             return task(eval_input)
@@ -132,17 +131,7 @@ class BraintrustEvalProvider(EvalProvider):
             if data:
                 eval_data = [
                     EvalCase(
-                        input={
-                            **item.get("input", {}),
-                            # Pass through per-test tool configuration (for single-turn)
-                            "force_tools": item.get("force_tools", []),
-                            "expected_tools": item.get("expected_tools", []),
-                            "require_all_tools": item.get("require_all_tools", False),
-                            # Pass through per-test model configuration
-                            "model": item.get("model"),
-                            "model_provider": item.get("model_provider"),
-                            "temperature": item.get("temperature"),
-                        },
+                        input=evaluation_input(item.get("input", {}), item),
                         expected=item.get("expected"),
                     )
                     for item in data

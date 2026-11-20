@@ -4,78 +4,120 @@ import uuid
 import aiohttp  # Async HTTP client
 import httpx
 import requests
-from fastapi import HTTPException
 from fastapi import Request
-from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ee.onyx.configs.app_configs import HUBSPOT_TRACKING_URL
+from ee.onyx.db.tenant_provisioning import (
+    delete_available_tenant__no_commit,
+    get_available_tenant_by_id,
+    get_first_search_settings_by_status,
+    get_latest_search_settings_by_status,
+    lock_oldest_available_tenant,
+)
+from ee.onyx.db.user_tenant_mapping import (
+    add_users_to_tenant,
+    delete_user_tenant_mappings__no_commit,
+    resolve_tenant_id,
+    user_owns_a_tenant,
+)
 from ee.onyx.server.tenants.access import generate_data_plane_token
-from ee.onyx.server.tenants.models import TenantByDomainResponse
-from ee.onyx.server.tenants.models import TenantCreationPayload
-from ee.onyx.server.tenants.models import TenantDeletionPayload
-from ee.onyx.server.tenants.schema_management import create_schema_if_not_exists
-from ee.onyx.server.tenants.schema_management import drop_schema
-from ee.onyx.server.tenants.schema_management import run_alembic_migrations
-from ee.onyx.server.tenants.user_mapping import add_users_to_tenant
-from ee.onyx.server.tenants.user_mapping import get_tenant_id_for_email
-from ee.onyx.server.tenants.user_mapping import user_owns_a_tenant
-from onyx.auth.users import exceptions
-from onyx.configs.app_configs import ANTHROPIC_DEFAULT_API_KEY
-from onyx.configs.app_configs import AUTO_PROVISION_DEFAULT_LLM_PROVIDERS
-from onyx.configs.app_configs import COHERE_DEFAULT_API_KEY
-from onyx.configs.app_configs import CONTROL_PLANE_API_BASE_URL
-from onyx.configs.app_configs import DEV_MODE
-from onyx.configs.app_configs import OPENAI_DEFAULT_API_KEY
-from onyx.configs.app_configs import OPENROUTER_DEFAULT_API_KEY
-from onyx.configs.app_configs import VERTEXAI_DEFAULT_CREDENTIALS
-from onyx.configs.app_configs import VERTEXAI_DEFAULT_LOCATION
-from onyx.db.engine.sql_engine import get_session_with_shared_schema
-from onyx.db.engine.sql_engine import get_session_with_tenant
+from ee.onyx.server.tenants.models import (
+    SignUpDomainState,
+    TenantByDomainResponse,
+    TenantCreationPayload,
+    TenantDeletionPayload,
+)
+from ee.onyx.server.tenants.schema_management import (
+    build_tenant_schema,
+    create_schema_if_not_exists,
+    drop_schema,
+    run_alembic_migrations,
+)
+from onyx.configs.app_configs import (
+    ANTHROPIC_DEFAULT_API_KEY,
+    AUTO_PROVISION_DEFAULT_LLM_PROVIDERS,
+    COHERE_DEFAULT_API_KEY,
+    CONTROL_PLANE_API_BASE_URL,
+    DEV_MODE,
+    OPENAI_DEFAULT_API_KEY,
+    OPENROUTER_DEFAULT_API_KEY,
+    VERTEXAI_DEFAULT_CREDENTIALS,
+    VERTEXAI_DEFAULT_LOCATION,
+)
+from onyx.configs.model_configs import DEFAULT_OPENAI_MODEL
+from onyx.db.engine.shard_routing import get_shard_for_new_tenant
+from onyx.db.engine.sql_engine import (
+    get_session_with_shared_schema,
+    get_session_with_tenant,
+)
+from onyx.db.enums import LLMModelFlowType
 from onyx.db.image_generation import create_default_image_gen_config_from_api_key
-from onyx.db.llm import fetch_existing_llm_provider_by_name_and_type
-from onyx.db.llm import fetch_existing_llm_provider_by_type_nameless
-from onyx.db.llm import update_default_provider
-from onyx.db.llm import upsert_cloud_embedding_provider
-from onyx.db.llm import upsert_llm_provider
-from onyx.db.models import AvailableTenant
+from onyx.db.llm import (
+    fetch_existing_llm_provider_by_name_and_type,
+    fetch_existing_llm_provider_by_type_nameless,
+    update_default_model,
+    upsert_cloud_embedding_provider,
+    upsert_llm_provider,
+)
 from onyx.db.models import IndexModelStatus
-from onyx.db.models import SearchSettings
-from onyx.db.models import UserTenantMapping
+from onyx.db.search_settings import get_secondary_search_settings
+from onyx.db.tenant_shard import clear_tenant_placement, record_tenant_placement
+from onyx.error_handling.error_codes import OnyxErrorCode
+from onyx.error_handling.exceptions import OnyxError
 from onyx.llm.well_known_providers.auto_update_models import LLMRecommendations
-from onyx.llm.well_known_providers.constants import ANTHROPIC_PROVIDER_NAME
-from onyx.llm.well_known_providers.constants import OPENAI_PROVIDER_NAME
-from onyx.llm.well_known_providers.constants import OPENROUTER_PROVIDER_NAME
-from onyx.llm.well_known_providers.constants import VERTEX_CREDENTIALS_FILE_KWARG
-from onyx.llm.well_known_providers.constants import VERTEX_LOCATION_KWARG
-from onyx.llm.well_known_providers.constants import VERTEXAI_PROVIDER_NAME
-from onyx.llm.well_known_providers.llm_provider_options import get_recommendations
+from onyx.llm.well_known_providers.constants import (
+    ANTHROPIC_PROVIDER_NAME,
+    OPENAI_PROVIDER_NAME,
+    OPENROUTER_PROVIDER_NAME,
+    VERTEX_CREDENTIALS_FILE_KWARG,
+    VERTEX_LOCATION_KWARG,
+    VERTEXAI_PROVIDER_NAME,
+)
 from onyx.llm.well_known_providers.llm_provider_options import (
+    get_recommendations,
     model_configurations_for_provider,
 )
 from onyx.server.manage.embedding.models import CloudEmbeddingProviderCreationRequest
-from onyx.server.manage.llm.models import LLMProviderUpsertRequest
-from onyx.server.manage.llm.models import ModelConfigurationUpsertRequest
+from onyx.server.manage.llm.models import (
+    LLMProviderUpsertRequest,
+    ModelConfigurationUpsertRequest,
+)
 from onyx.setup import setup_onyx
 from onyx.utils.logger import setup_logger
-from shared_configs.configs import MULTI_TENANT
-from shared_configs.configs import POSTGRES_DEFAULT_SCHEMA
-from shared_configs.configs import TENANT_ID_PREFIX
+from shared_configs.configs import (
+    IS_PLAYGROUND,
+    MULTI_TENANT,
+    POSTGRES_DEFAULT_SCHEMA,
+    TENANT_ID_PREFIX,
+)
 from shared_configs.contextvars import CURRENT_TENANT_ID_CONTEXTVAR
 from shared_configs.enums import EmbeddingProvider
 
 logger = setup_logger()
+
+# Matches billing.py. Without it a hung control plane pins the caller forever.
+_CONTROL_PLANE_TIMEOUT_S = 30
 
 
 async def get_or_provision_tenant(
     email: str,
     referral_source: str | None = None,
     request: Request | None = None,
+    oauth_name: str | None = None,
+    account_id: str | None = None,
+    start_new_team: bool = False,
 ) -> str:
     """
     Get existing tenant ID for an email or create a new tenant if none exists.
     This function should only be called after we have verified we want this user's tenant to exist.
     It returns the tenant ID associated with the email, creating a new tenant if necessary.
+
+    When the caller knows the IdP subject it is tried before the email, which is
+    what stops a renamed user being treated as a brand new signup.
+
+    On the playground `start_new_team` says the person chose to start a new team
+    although a team from their domain has a running trial.
     """
     # Early return for non-multi-tenant mode
     if not MULTI_TENANT:
@@ -84,14 +126,13 @@ async def get_or_provision_tenant(
     if referral_source and request:
         await submit_to_hubspot(email, referral_source, request)
 
-    # First, check if the user already has a tenant
-    tenant_id: str | None = None
-    try:
-        tenant_id = get_tenant_id_for_email(email)
+    tenant_id = resolve_tenant_id(email, oauth_name, account_id)
+    if tenant_id:
         return tenant_id
-    except exceptions.UserNotExists:
-        # User doesn't exist, so we need to create a new tenant or assign an existing one
-        pass
+
+    # Before the try below: a refusal must reach the person, not become a 500.
+    if IS_PLAYGROUND:
+        await check_playground_sign_up(email, start_new_team)
 
     try:
         # Try to get a pre-provisioned tenant
@@ -100,7 +141,7 @@ async def get_or_provision_tenant(
         if tenant_id:
             # Run migrations to ensure the pre-provisioned tenant schema is current.
             # Pool tenants may have been created before a new migration was deployed.
-            # Capture as a non-optional local so mypy can type the lambda correctly.
+            # Capture as a non-optional local so type-checking can type the lambda correctly.
             _tenant_id: str = tenant_id
             loop = asyncio.get_running_loop()
             try:
@@ -140,10 +181,60 @@ async def get_or_provision_tenant(
         # If we've encountered an error, log and raise an exception
         error_msg = "Failed to provision tenant"
         logger.error(error_msg, exc_info=e)
-        raise HTTPException(
-            status_code=500,
-            detail="Failed to provision tenant. Please try again later.",
+        raise OnyxError(
+            OnyxErrorCode.INTERNAL_ERROR,
+            "Failed to provision tenant. Please try again later.",
         )
+
+
+# The web shows a page for each code: contact sales, or join-or-new.
+PLAYGROUND_REFUSAL_CODES = {
+    SignUpDomainState.EMAIL_USED: "PLAYGROUND_EMAIL_USED",
+    SignUpDomainState.LIMIT_REACHED: "PLAYGROUND_LIMIT_REACHED",
+    SignUpDomainState.ACTIVE_TENANT: "PLAYGROUND_ACTIVE_TENANT",
+}
+# The control plane did not answer, so the rules could not run.
+PLAYGROUND_CHECK_FAILED_CODE = "PLAYGROUND_CHECK_FAILED"
+
+
+async def fetch_sign_up_domain_state(email: str) -> SignUpDomainState:
+    """What the control plane says a playground sign-up from this address
+    runs into. Raises when the control plane is down or answers badly.
+    """
+    headers = {
+        "Authorization": f"Bearer {generate_data_plane_token()}",
+        "Content-Type": "application/json",
+    }
+    async with httpx.AsyncClient(timeout=_CONTROL_PLANE_TIMEOUT_S) as client:
+        response = await client.post(
+            f"{CONTROL_PLANE_API_BASE_URL}/sign-up-domain",
+            headers=headers,
+            json={"email": email},
+        )
+    response.raise_for_status()
+    return SignUpDomainState(response.json()["state"])
+
+
+async def check_playground_sign_up(email: str, start_new_team: bool) -> None:
+    """Refuses a playground sign-up the control plane rules out.
+
+    `active_tenant` passes when the person chose to start a new team. A
+    control plane that cannot answer refuses too: no tenant without the rules.
+    """
+    try:
+        state = await fetch_sign_up_domain_state(email)
+    except Exception:
+        logger.exception("Control plane sign-up check failed")
+        raise OnyxError(
+            OnyxErrorCode.REGISTRATION_DISABLED, PLAYGROUND_CHECK_FAILED_CODE
+        )
+    if state is SignUpDomainState.NEW:
+        return
+    if state is SignUpDomainState.ACTIVE_TENANT and start_new_team:
+        return
+    raise OnyxError(
+        OnyxErrorCode.REGISTRATION_DISABLED, PLAYGROUND_REFUSAL_CODES[state]
+    )
 
 
 async def create_tenant(
@@ -169,23 +260,29 @@ async def create_tenant(
             await rollback_tenant_provisioning(tenant_id)
         except Exception:
             logger.exception("Failed to rollback tenant provisioning for %s", tenant_id)
-        raise HTTPException(status_code=500, detail="Failed to provision tenant.")
+        raise OnyxError(OnyxErrorCode.INTERNAL_ERROR, "Failed to provision tenant.")
 
     return tenant_id
 
 
 async def provision_tenant(tenant_id: str, email: str) -> None:
     if not MULTI_TENANT:
-        raise HTTPException(status_code=403, detail="Multi-tenancy is not enabled")
+        raise OnyxError(OnyxErrorCode.UNAUTHORIZED, "Multi-tenancy is not enabled")
 
     if user_owns_a_tenant(email):
-        raise HTTPException(
-            status_code=409, detail="User already belongs to an organization"
+        raise OnyxError(
+            OnyxErrorCode.CONFLICT, "User already belongs to an organization"
         )
 
-    logger.debug("Provisioning tenant %s for user %s", tenant_id, email)
+    shard_name = get_shard_for_new_tenant()
+    logger.debug(
+        "Provisioning tenant %s for user %s on shard %s", tenant_id, email, shard_name
+    )
 
     try:
+        # Before schema creation: every step below routes via the catalog.
+        record_tenant_placement(tenant_id, shard_name)
+
         # Create the schema for the tenant
         if not create_schema_if_not_exists(tenant_id):
             logger.debug("Created schema for tenant %s", tenant_id)
@@ -200,8 +297,8 @@ async def provision_tenant(tenant_id: str, email: str) -> None:
 
     except Exception as e:
         logger.exception("Failed to create tenant %s", tenant_id)
-        raise HTTPException(
-            status_code=500, detail=f"Failed to create tenant: {str(e)}"
+        raise OnyxError(
+            OnyxErrorCode.INTERNAL_ERROR, f"Failed to create tenant: {str(e)}"
         )
 
 
@@ -243,8 +340,10 @@ async def rollback_tenant_provisioning(tenant_id: str) -> None:
     rollback_errors = []
 
     # 1. Try to drop the tenant's schema
+    schema_dropped = False
     try:
         drop_schema(tenant_id)
+        schema_dropped = True
         logger.info("Successfully dropped schema for tenant %s", tenant_id)
     except Exception as e:
         error_msg = f"Failed to drop schema for tenant {tenant_id}: {str(e)}"
@@ -256,9 +355,7 @@ async def rollback_tenant_provisioning(tenant_id: str) -> None:
         with get_session_with_shared_schema() as db_session:
             db_session.begin()
             try:
-                db_session.query(UserTenantMapping).filter(
-                    UserTenantMapping.tenant_id == tenant_id
-                ).delete()
+                delete_user_tenant_mappings__no_commit(db_session, tenant_id)
                 db_session.commit()
                 logger.info(
                     "Successfully removed user mappings for tenant %s", tenant_id
@@ -276,14 +373,10 @@ async def rollback_tenant_provisioning(tenant_id: str) -> None:
         with get_session_with_shared_schema() as db_session:
             db_session.begin()
             try:
-                available_tenant = (
-                    db_session.query(AvailableTenant)
-                    .filter(AvailableTenant.tenant_id == tenant_id)
-                    .first()
-                )
+                available_tenant = get_available_tenant_by_id(db_session, tenant_id)
 
                 if available_tenant:
-                    db_session.delete(available_tenant)
+                    delete_available_tenant__no_commit(db_session, available_tenant)
                     db_session.commit()
                     logger.info(
                         "Removed tenant %s from available tenants table", tenant_id
@@ -295,6 +388,26 @@ async def rollback_tenant_provisioning(tenant_id: str) -> None:
         error_msg = f"Failed to remove tenant {tenant_id} from available tenants table: {str(e)}"
         logger.error(error_msg)
         rollback_errors.append(error_msg)
+
+    # 4. Drop the shard mapping — last, and only if the schema is actually gone.
+    # The mapping is the only route to that schema, so clearing it after a failed
+    # drop strands it on a shard nothing can resolve.
+    if schema_dropped:
+        try:
+            clear_tenant_placement(tenant_id)
+            logger.info("Successfully cleared shard mapping for tenant %s", tenant_id)
+        except Exception as e:
+            error_msg = (
+                f"Failed to clear shard mapping for tenant {tenant_id}: {str(e)}"
+            )
+            logger.error(error_msg)
+            rollback_errors.append(error_msg)
+    else:
+        logger.warning(
+            "Keeping shard mapping for tenant %s: its schema was not dropped, and the "
+            "mapping is what a retry needs to find it",
+            tenant_id,
+        )
 
     # Log summary of rollback operation
     if rollback_errors:
@@ -345,7 +458,12 @@ def configure_default_api_keys(db_session: Session) -> None:
                 request.id = existing.id
             provider = upsert_llm_provider(request, db_session)
             if not has_set_default_provider:
-                update_default_provider(provider.id, default_model, db_session)
+                update_default_model(
+                    provider_id=provider.id,
+                    model=default_model,
+                    db_session=db_session,
+                    flow_type=LLMModelFlowType.CHAT,
+                )
                 has_set_default_provider = True
         except Exception as e:
             logger.error("Failed to configure %s provider: %s", request.provider, e)
@@ -357,7 +475,9 @@ def configure_default_api_keys(db_session: Session) -> None:
             logger.error(
                 "No default model found for %s in recommendations", OPENAI_PROVIDER_NAME
             )
-        default_model_name = default_model.name if default_model else "gpt-5.2"
+        default_model_name = (
+            default_model.name if default_model else DEFAULT_OPENAI_MODEL
+        )
 
         openai_provider = LLMProviderUpsertRequest(
             name="OpenAI",
@@ -392,9 +512,7 @@ def configure_default_api_keys(db_session: Session) -> None:
                 "No default model found for %s in recommendations",
                 ANTHROPIC_PROVIDER_NAME,
             )
-        default_model_name = (
-            default_model.name if default_model else "claude-sonnet-4-5"
-        )
+        default_model_name = default_model.name if default_model else "claude-sonnet-5"
 
         anthropic_provider = LLMProviderUpsertRequest(
             name="Anthropic",
@@ -496,13 +614,7 @@ def configure_default_api_keys(db_session: Session) -> None:
             logger.info("Successfully upserted Cohere cloud embedding provider")
 
             logger.info("Updating search settings with Cohere embedding model details")
-            query = (
-                select(SearchSettings)
-                .where(SearchSettings.status == IndexModelStatus.FUTURE)
-                .order_by(SearchSettings.id.desc())
-            )
-            result = db_session.execute(query)
-            current_search_settings = result.scalars().first()
+            current_search_settings = get_secondary_search_settings(db_session)
 
             if current_search_settings:
                 current_search_settings.model_name = (
@@ -523,13 +635,7 @@ def configure_default_api_keys(db_session: Session) -> None:
                     "No search settings specified, DB is not in a valid state"
                 )
             logger.info("Fetching updated search settings to verify changes")
-            updated_query = (
-                select(SearchSettings)
-                .where(SearchSettings.status == IndexModelStatus.PRESENT)
-                .order_by(SearchSettings.id.desc())
-            )
-            updated_result = db_session.execute(updated_query)
-            updated_result.scalars().first()
+            get_latest_search_settings_by_status(db_session, IndexModelStatus.PRESENT)
 
         except Exception:
             logger.exception("Failed to configure Cohere embedding provider")
@@ -618,6 +724,7 @@ def get_tenant_by_domain_from_control_plane(
             f"{CONTROL_PLANE_API_BASE_URL}/tenant-by-domain",
             headers=headers,
             json={"domain": domain, "tenant_id": tenant_id},
+            timeout=_CONTROL_PLANE_TIMEOUT_S,
         )
 
         if response.status_code != 200:
@@ -653,17 +760,12 @@ async def get_available_tenant() -> str | None:
             db_session.begin()
 
             # Get the oldest available tenant with FOR UPDATE lock to prevent race conditions
-            available_tenant = (
-                db_session.query(AvailableTenant)
-                .order_by(AvailableTenant.date_created)
-                .with_for_update(skip_locked=True)  # Skip locked rows to avoid blocking
-                .first()
-            )
+            available_tenant = lock_oldest_available_tenant(db_session)
 
             if available_tenant:
                 tenant_id = available_tenant.tenant_id
                 # Remove the tenant from the available tenants table
-                db_session.delete(available_tenant)
+                delete_available_tenant__no_commit(db_session, available_tenant)
                 db_session.commit()
                 logger.info("Using pre-provisioned tenant %s", tenant_id)
                 return tenant_id
@@ -685,11 +787,9 @@ async def setup_tenant(tenant_id: str) -> None:
     try:
         token = CURRENT_TENANT_ID_CONTEXTVAR.set(tenant_id)
 
-        # Run Alembic migrations in a way that isolates it from the current event loop
-        # Create a new event loop for this synchronous operation
+        # Both paths block on Postgres, so they run off the event loop.
         loop = asyncio.get_event_loop()
-        # Use run_in_executor which properly isolates the thread execution
-        await loop.run_in_executor(None, lambda: run_alembic_migrations(tenant_id))
+        await loop.run_in_executor(None, lambda: build_tenant_schema(tenant_id))
 
         # Configure the tenant with default settings
         with get_session_with_tenant(tenant_id=tenant_id) as db_session:
@@ -697,10 +797,8 @@ async def setup_tenant(tenant_id: str) -> None:
             configure_default_api_keys(db_session)
 
             # Set up Onyx with appropriate settings
-            current_search_settings = (
-                db_session.query(SearchSettings)
-                .filter_by(status=IndexModelStatus.FUTURE)
-                .first()
+            current_search_settings = get_first_search_settings_by_status(
+                db_session, IndexModelStatus.FUTURE
             )
             cohere_enabled = (
                 current_search_settings is not None

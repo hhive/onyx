@@ -12,10 +12,8 @@ typing error, not a silent cross-tenant write.
 # annotations like ``-> set[bytes]``.
 from __future__ import annotations
 
-from collections.abc import Generator
-from collections.abc import Mapping
-from typing import Any
-from typing import cast
+from collections.abc import Generator, Mapping, Sequence
+from typing import Any, cast
 
 import redis
 from redis.client import Pipeline
@@ -147,6 +145,27 @@ class TenantRedisClient:
             exist.
         """
         return cast("bytes | None", self._r.get(_prefix_key(self._prefix, name)))
+
+    def getdel(self, name: KeyArg) -> bytes | None:
+        """Atomically gets and deletes a tenant-prefixed key."""
+        return cast("bytes | None", self._r.getdel(_prefix_key(self._prefix, name)))
+
+    def mget(self, names: Sequence[KeyArg]) -> list[bytes | None]:
+        """Issues an MGET against tenant-prefixed keys.
+
+        Args:
+            names: The (unprefixed) keys to read, in the order to read them.
+                An empty sequence skips the round trip, since MGET rejects a
+                call with no keys.
+
+        Returns:
+            One entry per key, positionally aligned with *names*. A key that
+            does not exist reads as ``None``.
+        """
+        if not names:
+            return []
+        prefixed = [_prefix_key(self._prefix, n) for n in names]
+        return cast("list[bytes | None]", self._r.mget(prefixed))
 
     def set(
         self,
@@ -620,6 +639,18 @@ class TenantRedisClient:
             int, self._r.zremrangebyscore(_prefix_key(self._prefix, name), min, max)
         )
 
+    def zrem(self, name: KeyArg, *values: str | bytes) -> int:
+        """Removes members from a tenant-prefixed sorted-set key.
+
+        Args:
+            name: The (unprefixed) sorted-set key.
+            values: The members to remove.
+
+        Returns:
+            The number of members removed.
+        """
+        return cast(int, self._r.zrem(_prefix_key(self._prefix, name), *values))
+
     def zscore(self, name: KeyArg, value: str | bytes) -> float | None:
         """Returns the score of a member of a tenant-prefixed sorted-set key.
 
@@ -704,7 +735,7 @@ class TenantRedisClient:
             prefixed_keys = _prefix_key(self._prefix, keys)
         else:
             prefixed_keys = [_prefix_key(self._prefix, k) for k in keys]
-        method = getattr(self._r, method_name)
+        method = getattr(self._r, method_name)  # ods: ignore[getattr]
         result = method(prefixed_keys, timeout=timeout)
         if result is None:
             return None
@@ -790,6 +821,54 @@ class TenantRedisClient:
                 ``-2`` if the key does not exist.
         """
         return cast(int, self._r.pttl(_prefix_key(self._prefix, name)))
+
+    def replace_if_value(
+        self,
+        name: KeyArg,
+        expected: bytes,
+        value: str | bytes | int | float,
+        ex: int | None,
+    ) -> bool:
+        """Set the current tenant's key only while it holds ``expected``."""
+        key = _prefix_key(self._prefix, name)
+        with self._r.pipeline() as pipeline:
+            try:
+                pipeline.watch(key)
+                if pipeline.get(key) != expected:
+                    return False
+                pipeline.multi()
+                pipeline.set(key, value, ex=ex)
+                return bool(pipeline.execute()[0])
+            except redis.WatchError:
+                return False
+
+    def delete_if_value(self, name: KeyArg, expected: bytes) -> bool:
+        """Delete the current tenant's key only while it holds ``expected``."""
+        key = _prefix_key(self._prefix, name)
+        with self._r.pipeline() as pipeline:
+            try:
+                pipeline.watch(key)
+                if pipeline.get(key) != expected:
+                    return False
+                pipeline.multi()
+                pipeline.delete(key)
+                return bool(pipeline.execute()[0])
+            except redis.WatchError:
+                return False
+
+    def renew_if_value(self, name: KeyArg, expected: bytes, seconds: int) -> bool:
+        """Renew only the current tenant's matching lease, without a lock wait."""
+        key = _prefix_key(self._prefix, name)
+        with self._r.pipeline() as pipeline:
+            try:
+                pipeline.watch(key)
+                if pipeline.get(key) != expected:
+                    return False
+                pipeline.multi()
+                pipeline.expire(key, seconds)
+                return bool(pipeline.execute()[0])
+            except redis.WatchError:
+                return False
 
     def expire(
         self,
@@ -1255,6 +1334,11 @@ class TenantRedisPipeline:
         self._p.delete(*(_prefix_key(self._prefix, n) for n in names))
         return self
 
+    def exists(self, name: KeyArg) -> TenantRedisPipeline:
+        """Queue EXISTS for a tenant-prefixed key."""
+        self._p.exists(_prefix_key(self._prefix, name))
+        return self
+
     def incr(self, name: KeyArg, amount: int = 1) -> TenantRedisPipeline:
         """Queues an INCRBY against a tenant-prefixed counter key.
 
@@ -1310,6 +1394,30 @@ class TenantRedisPipeline:
             ``self``, to allow chaining further pipeline commands.
         """
         self._p.sadd(_prefix_key(self._prefix, name), *values)
+        return self
+
+    def hset(self, name: KeyArg, mapping: Mapping[bytes, bytes]) -> TenantRedisPipeline:
+        """Queue hash fields under a tenant-prefixed key."""
+        self._p.hset(_prefix_key(self._prefix, name), mapping=mapping)
+        return self
+
+    # --------------------------------------------------------------------------
+    # Read commands
+    # --------------------------------------------------------------------------
+
+    def get(self, name: KeyArg) -> TenantRedisPipeline:
+        """Queue a tenant-prefixed GET."""
+        self._p.get(_prefix_key(self._prefix, name))
+        return self
+
+    def hget(self, name: KeyArg, key: str | bytes) -> TenantRedisPipeline:
+        """Queue a tenant-prefixed HGET without changing the field name."""
+        self._p.hget(_prefix_key(self._prefix, name), key)
+        return self
+
+    def hgetall(self, name: KeyArg) -> TenantRedisPipeline:
+        """Queue all hash fields under a tenant-prefixed key."""
+        self._p.hgetall(_prefix_key(self._prefix, name))
         return self
 
     # --------------------------------------------------------------------------

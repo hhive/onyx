@@ -1,3 +1,15 @@
+import { BADGE_COLORS, badgeTextClass } from "@opal/components/badge/colors";
+import type { StatusColor } from "@opal/types";
+import type { Mention } from "@/lib/chat/types";
+
+/** Value stored in a tile's `data-tile-type` for `@` mention tiles. */
+export const MENTION_TILE_TYPE = "mention";
+
+/** Whether `el` is a mention rich tile. */
+export function isMentionTile(el: Element | null): boolean {
+  return el?.getAttribute("data-tile-type") === MENTION_TILE_TYPE;
+}
+
 export const PASTE_TILE_THRESHOLD_CHARS = 200;
 export const PASTE_TILE_THRESHOLD_LINES = 3;
 
@@ -33,13 +45,58 @@ export function getPasteTileMeta(text: string): string {
 const CLIPBOARD_PATH =
   "M10.6667 2.66665H12C12.3536 2.66665 12.6927 2.80712 12.9428 3.05717C13.1928 3.30722 13.3333 3.64636 13.3333 3.99998V13.3333C13.3333 13.6869 13.1928 14.0261 12.9428 14.2761C12.6927 14.5262 12.3536 14.6666 12 14.6666H3.99999C3.64637 14.6666 3.30723 14.5262 3.05718 14.2761C2.80713 14.0261 2.66666 13.6869 2.66666 13.3333V3.99998C2.66666 3.64636 2.80713 3.30722 3.05718 3.05717C3.30723 2.80712 3.64637 2.66665 3.99999 2.66665H5.33332M10.6667 2.66665V1.99998C10.6667 1.63179 10.3682 1.33331 9.99999 1.33331H5.99999C5.6318 1.33331 5.33332 1.63179 5.33332 1.99998V2.66665M10.6667 2.66665V3.33331C10.6667 3.7015 10.3682 3.99998 9.99999 3.99998H5.99999C5.6318 3.99998 5.33332 3.7015 5.33332 3.33331V2.66665";
 
+// Mirrored from @opal/icons sparkle.tsx (viewBox 0 0 16 16) — four-pointed star.
+const SPARKLE_PATH =
+  "M1.5 8C5.11111 6.91667 6.91667 5.11111 8 1.5C9.08333 5.11111 10.8889 6.91667 14.5 8C10.8889 9.08333 9.08333 10.8889 8 14.5C6.91667 10.8889 5.11111 9.08333 1.5 8Z";
+
 const X_PATH = "M21 7L7 21M7 7L21 21";
 
+interface IconSpec {
+  paths: string[];
+  viewBox: string;
+  size: number;
+  strokeWidth: number;
+  /** Mirror the source icon's linecap (e.g. SvgSparkle uses "square"). */
+  strokeLinecap: "round" | "square";
+}
+
+interface TileSpec {
+  /** Opal Badge tint sourcing the tile's fill/text colors (single source of truth). */
+  tagColor: StatusColor;
+  icon: IconSpec;
+}
+
+const PASTE_TILE_SPEC: TileSpec = {
+  tagColor: "default",
+  icon: {
+    paths: [CLIPBOARD_PATH],
+    viewBox: "0 0 16 16",
+    size: 14,
+    strokeWidth: 1.5,
+    strokeLinecap: "round",
+  },
+};
+
+// Spec per mention kind; other tiles use the paste spec.
+const MENTION_TILE_SPECS: Record<Mention["type"], TileSpec> = {
+  skill: {
+    tagColor: "info",
+    icon: {
+      paths: [SPARKLE_PATH],
+      viewBox: "0 0 16 16",
+      size: 14,
+      strokeWidth: 1.5,
+      strokeLinecap: "square",
+    },
+  },
+};
+
 function createSvgIcon(
-  path: string,
+  paths: string[],
   viewBox: string,
   size: number,
-  strokeWidth: number
+  strokeWidth: number,
+  strokeLinecap: "round" | "square" = "round"
 ): SVGSVGElement {
   const ns = "http://www.w3.org/2000/svg";
   const svg = document.createElementNS(ns, "svg");
@@ -49,59 +106,120 @@ function createSvgIcon(
   svg.setAttribute("fill", "none");
   svg.setAttribute("stroke", "currentColor");
   svg.setAttribute("stroke-width", String(strokeWidth));
-  svg.setAttribute("stroke-linecap", "round");
+  svg.setAttribute("stroke-linecap", strokeLinecap);
   svg.setAttribute("stroke-linejoin", "round");
-  const pathEl = document.createElementNS(ns, "path");
-  pathEl.setAttribute("d", path);
-  svg.appendChild(pathEl);
+  for (const path of paths) {
+    const pathEl = document.createElementNS(ns, "path");
+    pathEl.setAttribute("d", path);
+    svg.appendChild(pathEl);
+  }
   return svg;
 }
 
-export interface RichTileConfig {
-  type: string;
+const TILE_TITLE_MAX_CHARS = 200;
+
+/** Text-derived content of a tile. */
+export interface RichTileText {
   text: string;
   preview: string;
   meta: string;
+  /** Translated accessible name of the tile. */
+  label: string;
+}
+
+export function getPasteTileText(
+  text: string,
+  formatLabel: (values: { preview: string; meta: string }) => string
+): RichTileText {
+  const preview = getPasteTilePreview(text);
+  const meta = getPasteTileMeta(text);
+  return { text, preview, meta, label: formatLabel({ preview, meta }) };
+}
+
+/** Writes a tile's text-derived attributes and preview/meta spans. Create and
+ * edit both use it so the two cannot drift. */
+export function setRichTileText(
+  tile: HTMLElement,
+  content: RichTileText
+): void {
+  tile.setAttribute("data-text", content.text);
+  tile.title =
+    content.text.length > TILE_TITLE_MAX_CHARS
+      ? content.text.slice(0, TILE_TITLE_MAX_CHARS) + "…"
+      : content.text;
+  tile.setAttribute("aria-label", content.label);
+  const previewEl = tile.querySelector(".rich-input-tile-preview");
+  if (previewEl) {
+    previewEl.textContent = content.preview;
+  }
+  const metaEl = tile.querySelector(".rich-input-tile-meta");
+  if (metaEl) {
+    metaEl.textContent = content.meta;
+  }
+}
+
+export interface RichTileConfig extends RichTileText {
+  type: string;
+  /** Set for mention tiles. Stored as data-mention-type and
+   * data-mention-name. */
+  mention?: Mention;
+  /** Translated accessible name of the remove button. */
+  removeLabel: string;
 }
 
 export function createRichInputTileNode(
   config: RichTileConfig
 ): HTMLSpanElement {
+  const { mention } = config;
+
   const tile = document.createElement("span");
   tile.contentEditable = "false";
   tile.setAttribute("data-rich-tile", "");
   tile.setAttribute("data-tile-type", config.type);
-  tile.setAttribute("data-text", config.text);
+  if (mention !== undefined) {
+    tile.setAttribute("data-mention-type", mention.type);
+    tile.setAttribute("data-mention-name", mention.name);
+  }
   tile.className = "rich-input-tile";
-  tile.title =
-    config.text.length > 200 ? config.text.slice(0, 200) + "…" : config.text;
-  tile.setAttribute(
-    "aria-label",
-    "Pasted text: " + config.preview + ", " + config.meta
-  );
+  const spec =
+    mention !== undefined ? MENTION_TILE_SPECS[mention.type] : PASTE_TILE_SPEC;
+  const tagColor = BADGE_COLORS[spec.tagColor];
+  const textClass = badgeTextClass(spec.tagColor);
+  tile.classList.add(...tagColor.bg.split(" "));
 
-  const icon = createSvgIcon(CLIPBOARD_PATH, "0 0 16 16", 14, 1.5);
+  const icon = createSvgIcon(
+    spec.icon.paths,
+    spec.icon.viewBox,
+    spec.icon.size,
+    spec.icon.strokeWidth,
+    spec.icon.strokeLinecap
+  );
   icon.classList.add("rich-input-tile-icon");
+  icon.classList.add(...textClass.split(" "));
   tile.appendChild(icon);
 
   const previewSpan = document.createElement("span");
   previewSpan.className = "rich-input-tile-preview";
-  previewSpan.textContent = config.preview;
+  previewSpan.classList.add(...textClass.split(" "));
   tile.appendChild(previewSpan);
 
-  const metaSpan = document.createElement("span");
-  metaSpan.className = "rich-input-tile-meta";
-  metaSpan.textContent = config.meta;
-  tile.appendChild(metaSpan);
+  // Mention tiles pass an empty meta — only render it when present.
+  if (config.meta) {
+    const metaSpan = document.createElement("span");
+    metaSpan.className = "rich-input-tile-meta";
+    metaSpan.classList.add(...textClass.split(" "));
+    tile.appendChild(metaSpan);
+  }
 
   const removeBtn = document.createElement("span");
   removeBtn.className = "rich-input-tile-remove";
   removeBtn.setAttribute("data-rich-tile-remove", "");
   removeBtn.setAttribute("role", "button");
-  removeBtn.setAttribute("aria-label", "Remove pasted text");
-  removeBtn.appendChild(createSvgIcon(X_PATH, "0 0 28 28", 10, 2.5));
+  removeBtn.setAttribute("aria-label", config.removeLabel);
+  removeBtn.appendChild(createSvgIcon([X_PATH], "0 0 28 28", 10, 2.5));
   tile.appendChild(removeBtn);
 
+  setRichTileText(tile, config);
   return tile;
 }
 

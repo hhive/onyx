@@ -15,33 +15,40 @@ pytest -xv backend/tests/unit
 
 ### External Dependency Unit Tests (`tests/external_dependency_unit/`)
 
-Real Postgres, Redis, MinIO, and Vespa available. Real OpenAI key when set. Real
-Kubernetes cluster when configured (`SANDBOX_BACKEND=kubernetes`) — gated by
-file-level `pytest.mark.skipif`. Onyx application processes (API server, Celery
-workers) are **not** running. Tests import and call functions directly and can
-mock selectively.
+Real Postgres, Redis, MinIO, and OpenSearch available. Real OpenAI key when set. Real
+Docker daemon when a Docker-backend test opts into it. Onyx application
+processes (API server, Celery workers) are **not** running. Tests import and
+call functions directly and can mock selectively.
 
-Conditional external dependencies (K8s, OpenAI) are gated by `skipif` at the
-top of the test file so the suite stays runnable in environments that lack
-those dependencies. Tests that need them only execute when the relevant env
-var or credential is present.
-
-There is no separate K8s integration layer. K8s-requiring tests live in
-`external_dependency_unit/` with a `skipif` gate. CI runs them in a dedicated
-job ([pr-craft-k8s-tests.yml](../../.github/workflows/pr-craft-k8s-tests.yml)).
+Conditional external dependencies such as OpenAI are gated by `skipif` at the
+top of the test file so the suite stays runnable in environments that lack the
+relevant env var or credential.
 
 Use when you need a real database or real API calls but want control over setup.
 
 ```bash
-python -m dotenv -f .vscode/.env run -- pytest backend/tests/external_dependency_unit
+uv run --env-file .vscode/.env pytest backend/tests/external_dependency_unit
 ```
 
 ### Integration Tests (`tests/integration/`)
 
-Full Onyx deployment running. No mocking. Prefer this over other test types when possible.
+Full Onyx deployment running. Do not mock Onyx code. Faking an external service
+(for example the scripted LLM server behind the `mock_llm` fixture) is fine.
+Prefer this over other test types when possible. Most integration tests exercise
+the product through HTTP API manager helpers under `tests/integration/common_utils`.
+
+Craft Kubernetes coverage lives in `tests/integration/tests/craft/k8s/` and
+runs in the dedicated Helm-installed kind job
+([pr-craft-k8s-tests.yml](../../.github/workflows/pr-craft-k8s-tests.yml)).
+That suite is a full deployed Craft integration lane: the chart provides
+Postgres, Redis, MinIO, OpenSearch, api_server, web_server, Celery workers,
+sandbox-proxy, and real sandbox pods in kind. API-facing setup goes through the
+deployed api_server; direct manager calls are reserved for low-level Kubernetes
+contracts that do not have an HTTP API. Direct task/stub checks belong in
+`tests/external_dependency_unit/craft/`.
 
 ```bash
-python -m dotenv -f .vscode/.env run -- pytest backend/tests/integration
+uv run --env-file .vscode/.env pytest backend/tests/integration
 ```
 
 ### Playwright / E2E Tests (`web/tests/e2e/`)
@@ -49,13 +56,28 @@ python -m dotenv -f .vscode/.env run -- pytest backend/tests/integration
 Full stack including web server. Use for frontend-backend coordination.
 
 ```bash
-npx playwright test <TEST_NAME>
+cd web && bun run playwright <TEST_NAME>
 ```
+
+FastAPI TestClient buffers streaming responses. Use a real HTTP connection to test
+output before completion. Browser packet fixtures test rendering, not backend persistence.
+
+Before removing duplicate tests, compare their inputs, failure cases, and assertions.
+Check expected results, not only equality between two implementation paths.
 
 ## Shared Fixtures
 
 Shared fixtures live in `backend/tests/conftest.py`. Test subdirectories can define
 their own `conftest.py` for directory-scoped fixtures.
+
+External dependency chat tests can use `make_test_user` and
+`default_llm_provider` from `backend/tests/external_dependency_unit/conftest.py`.
+The user fixture removes users and their owned chat,
+agent, tool, and MCP rows after each test. Shared agents remain intact. Set
+`Persona.user_id` when a test creates an agent that the fixture must remove.
+The provider fixture creates a unique provider, restores the previous chat
+default, and removes its provider. Use these fixtures instead of direct setup
+helpers when the test commits database changes.
 
 ## Running Tests Repeatedly (`pytest-repeat`)
 
@@ -74,6 +96,20 @@ pytest --count=10 backend/tests/unit/path/to/test_file.py
 
 ## Best Practices
 
+### Leave nothing behind
+
+A test may reset or wipe shared state before it runs. It must not leave its own
+state behind for a later test to see: rows, changed global defaults, Redis keys,
+OpenSearch indexes, running threads, or settings on a pooled database connection.
+Undo each change in a `finally` or a yield-fixture teardown.
+
+External dependency unit tests check one case of this automatically. After each
+test, an autouse fixture (`no_leaked_db_session_settings`) fails the test if it
+returned a pooled connection with a session-level Postgres setting on it, such as
+a plain `SET lock_timeout`. To change session state, use `SET LOCAL`, reset the
+setting, or run on the `isolated_engine` fixture. Migration tests that run
+migrations in-process must use `isolated_engine`.
+
 ### Use `enable_ee` fixture instead of inlining
 
 Enables EE mode for a test, with proper teardown and cache clearing.
@@ -82,10 +118,12 @@ Enables EE mode for a test, with proper teardown and cache clearing.
 # Whole file (in a test module, NOT in conftest.py)
 pytestmark = pytest.mark.usefixtures("enable_ee")
 
+
 # Whole directory — add an autouse wrapper to the directory's conftest.py
 @pytest.fixture(autouse=True)
-def _enable_ee_for_directory(enable_ee: None) -> None:  
+def _enable_ee_for_directory(enable_ee: None) -> None:
     """Wraps the shared enable_ee fixture with autouse for this directory."""
+
 
 # Single test
 def test_something(enable_ee: None) -> None: ...
@@ -96,3 +134,22 @@ directory — it only affects tests defined in the conftest itself (which is non
 Use the autouse fixture wrapper pattern shown above instead.
 
 Do NOT inline `global_version.set_ee()` — always use the fixture.
+
+### Craft sandbox network enforcement
+
+Run the deployed Kubernetes networking suite against a disposable cluster with an enforcing CNI.
+Test both `sandboxPod.netAdminLockdown=true` and `false` through the deployment's Helm values.
+Set these variables for the target deployment:
+
+```bash
+export SANDBOX_TEST_FRONTEND_URL=http://localhost:3000
+export SANDBOX_TEST_KUBE_CONTEXT=your-test-context
+export SANDBOX_TEST_IP_FAMILY=ipv4
+export SANDBOX_TEST_NET_ADMIN_LOCKDOWN=false
+uv run pytest backend/tests/integration/tests/craft/k8s/networking
+```
+
+Set the expected lockdown value to match each Helm configuration.
+The suite checks the actual pod configuration, proxy requests, and blocked direct API, public internet, and DNS connections.
+DNS and public connection checks first verify that the target responds from the proxy.
+Use an IPv6 cluster and `SANDBOX_TEST_IP_FAMILY=ipv6` to check that family.

@@ -4,16 +4,20 @@ package tui
 import (
 	"context"
 	"fmt"
+	"maps"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/bubbles/spinner"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/bubbles/v2/spinner"
+	"charm.land/bubbles/v2/textinput"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/onyx-dot-app/onyx/cli/internal/api"
+	"github.com/onyx-dot-app/onyx/cli/internal/approval"
 	"github.com/onyx-dot-app/onyx/cli/internal/config"
 	"github.com/onyx-dot-app/onyx/cli/internal/models"
+	"github.com/onyx-dot-app/onyx/cli/internal/question"
 )
 
 // Model is the root Bubble Tea model.
@@ -31,21 +35,80 @@ type Model struct {
 	startMode startMode
 
 	// Chat state
-	chatSessionID   *string
-	agentID       int
-	agentName     string
-	agents        []models.AgentSummary
-	parentMessageID *int
-	isStreaming      bool
-	streamCancel    context.CancelFunc
-	streamCh        <-chan models.StreamEvent
-	citations       map[int]string
-	attachedFiles   []models.FileDescriptorPayload
-	needsRename     bool
-	agentStarted bool
+	chatSessionID    *string
+	agentID          int
+	agentName        string
+	agents           []models.AgentSummary
+	llmModels        []modelOption
+	modelOverride    *models.LLMOverride
+	parentMessageID  *int
+	submittedMessage string
+	streamCancel     context.CancelFunc
+	streamCh         <-chan models.StreamEvent
+	streamID         *int
+	settling         bool
+	citations        map[int]string
+	attachedFiles    []models.FileDescriptorPayload
+	// approvals holds the tool approval requests whose outcome the server has
+	// not reported yet, oldest first.
+	approvals []approvalCard
+	// questions holds the agent's question requests whose outcome the server
+	// has not reported yet, oldest first.
+	questions []questionCard
+	// resolvedRequests holds the approval and question requests of the chat
+	// whose outcome showed; an older session load cannot reopen them.
+	resolvedRequests map[string]bool
+	// approvalsVersion is the session's approvals version that the cards
+	// reflect.
+	approvalsVersion string
+	// approvalsLoadVersion is the approvals version of the session load in
+	// flight, or "".
+	approvalsLoadVersion string
+	// approvalsPoll numbers the status polls that follow a background
+	// agent's decision; a newer poll replaces an older one.
+	approvalsPoll int
+	// followCancel ends the status reads that wait for a decided response
+	// to continue.
+	followCancel context.CancelFunc
+	// follow numbers the status reads that wait for a decided response; a
+	// newer read or a followed continuation replaces an older read.
+	follow int
+	// reloadedResponseID is the newest response that a status read last
+	// reloaded the session to show, and reloadingResponseID the one whose
+	// reload runs.
+	reloadedResponseID  int
+	reloadingResponseID int
+	// streams numbers the streams that the TUI starts; a decision's result
+	// no longer applies after a newer stream started.
+	streams int
+	// following marks a stream that follows a running response of the
+	// session instead of a new message.
+	following bool
+	// stopReceived marks a stream that delivered the response's stop packet.
+	stopReceived bool
+	// awaitingUser marks a stream that stopped while its response waits
+	// for decisions or answers. Nothing runs, so Stop does not apply. A
+	// decision or an answer names the stream that continues the response.
+	awaitingUser bool
+	// stopRequested marks a response that the user stopped.
+	stopRequested bool
+	// resumeCursor continues the followed response streamID after its last
+	// complete batch.
+	resumeCursor *int
+	// unbufferedStreamID is a response that the server has no stream for. It
+	// is not requested again.
+	unbufferedStreamID *int
+	// reloading keeps input blocked while the session loads again to show
+	// its response from the saved messages and the stream's start.
+	reloading bool
 
 	// Configure state
 	configState *configState
+
+	isStreaming          bool
+	readinessUnconfirmed bool
+	needsRename          bool
+	agentStarted         bool
 
 	// Quit state
 	quitPending    bool
@@ -63,8 +126,8 @@ func NewModel(cfg config.OnyxCliConfig, client api.ClientAPI) Model {
 		viewport:        newViewport(80, cfg.Features.StreamMarkdownEnabled()),
 		input:           newInputModel(),
 		status:          newStatusBar(),
-		agentID:       cfg.DefaultAgentID,
-		agentName:     "Default",
+		agentID:         cfg.DefaultAgentID,
+		agentName:       "Default",
 		parentMessageID: &parentID,
 		citations:       make(map[int]string),
 	}
@@ -77,12 +140,19 @@ func NewFirstRunModel(cfg config.OnyxCliConfig) Model {
 	return model
 }
 
+// WithSessionAgent overrides the starting agent for this chat session without
+// changing the saved default (used by chat --agent-id / --agent-name).
+func (m Model) WithSessionAgent(agentID int) Model {
+	m.agentID = agentID
+	return m
+}
+
 // Init initializes the model.
 func (m Model) Init() tea.Cmd {
 	if m.client == nil {
 		return nil
 	}
-	return loadAgentsCmd(m.client)
+	return tea.Batch(loadAgentsCmd(m.client), loadModelsCmd(m.client))
 }
 
 // Update handles messages.
@@ -102,8 +172,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.viewport.setWidth(msg.Width)
+		m.renderCards()
 		m.status.setWidth(msg.Width)
-		m.input.textInput.Width = msg.Width - 4
+		m.input.textInput.SetWidth(msg.Width - 4)
 		if !m.splashShown {
 			m.splashShown = true
 			viewportHeight := msg.Height - 4
@@ -117,17 +188,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
-	case tea.MouseMsg:
-		switch msg.Button {
-		case tea.MouseButtonWheelUp:
+	case tea.MouseWheelMsg:
+		switch msg.Mouse().Button {
+		case tea.MouseWheelUp:
 			m.viewport.scrollUp(3, m.viewportHeight())
 			return m, nil
-		case tea.MouseButtonWheelDown:
+		case tea.MouseWheelDown:
 			m.viewport.scrollDown(3)
 			return m, nil
 		}
 
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		return m.handleKey(msg)
 
 	case submitMsg:
@@ -145,8 +216,82 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case StreamDoneMsg:
 		return m.handleStreamDone(msg)
 
+	case approvalDecidedMsg:
+		return m.handleApprovalDecided(msg)
+	case questionsAnsweredMsg:
+		return m.handleQuestionsAnswered(msg)
+	case continuationMsg:
+		return m.handleContinuation(msg)
+	case approvalsLoadedMsg:
+		return m.handleApprovalsLoaded(msg)
+	case approvalsPollMsg:
+		return m.handleApprovalsPoll(msg)
+	case sessionReadyMsg:
+		if msg.channel != m.streamCh || !m.isStreaming {
+			return m, nil
+		}
+		if msg.err != nil && !api.IsRetryableReadinessError(msg.err) {
+			m.readinessUnconfirmed = true
+			m.viewport.addError("Cannot confirm conversation readiness: " + msg.err.Error())
+			return m, nil
+		}
+		var load tea.Cmd
+		if msg.err == nil {
+			m, load = m.noteApprovalsVersion(msg.status)
+		}
+		if msg.err != nil || msg.status.IsProcessing {
+			var running *int
+			if msg.status.CurrentStream != nil {
+				running = &msg.status.CurrentStream.StreamID
+			}
+			// A message that the server did not accept owns no running response.
+			owned := m.following || m.streamID != nil
+			// After its stop, only a response that another client started is followed.
+			another := running != nil && (m.streamID == nil || *m.streamID != *running)
+			if msg.err == nil && running != nil && owned && (!m.stopReceived || another) && !m.stopRequested &&
+				(m.unbufferedStreamID == nil || *m.unbufferedStreamID != *running) {
+				if m.streamID != nil && *m.streamID == *running && m.resumeCursor != nil {
+					// Continue after the last complete batch, so no event repeats.
+					m.settling = false
+					if m.streamCancel != nil {
+						m.streamCancel()
+					}
+					ctx, cancel := context.WithCancel(context.Background())
+					m.streamCancel = cancel
+					m.streamCh = m.client.ResumeChatStream(ctx, msg.sessionID, running, *m.resumeCursor)
+					return m, tea.Batch(load, WaitForStreamEvent(m.streamCh))
+				}
+				// Show the running response from its start over the saved session.
+				m.reloading = true
+				return cmdResume(m, msg.sessionID, m.streamCh)
+			}
+			if msg.err != nil && !m.readinessUnconfirmed {
+				m.readinessUnconfirmed = true
+				m.viewport.addWarning("Waiting to confirm conversation readiness.")
+			}
+			return m, tea.Batch(load, checkSessionReady(m.client, msg.sessionID, msg.channel))
+		}
+		// The saved session finishes a followed response that ended unseen.
+		if m.following && !m.stopReceived {
+			m.reloading = true
+			return cmdResume(m, msg.sessionID, m.streamCh)
+		}
+		var finish, poll, reload tea.Cmd
+		m, finish = m.finishStream(nil)
+		if msg.err == nil {
+			m, reload = m.reloadUnseenResponse(msg.sessionID, msg.status)
+		}
+		if msg.err == nil && m.watchesStatus(msg.status) {
+			m.approvalsPoll++
+			poll = pollApprovals(m.client, msg.sessionID, m.approvalsPoll, api.StatusPollInterval)
+		}
+		return m, tea.Batch(load, finish, poll, reload)
+
 	case AgentsLoadedMsg:
 		return m.handleAgentsLoaded(msg)
+
+	case ModelsLoadedMsg:
+		return m.handleModelsLoaded(msg)
 
 	case SessionsLoadedMsg:
 		return m.handleSessionsLoaded(msg)
@@ -169,9 +314,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.input.textInput.SetValue("")
 		if m.startMode == startFirstRun {
 			m, cmd := enterConfigureMode(m)
-			return m, tea.Batch(m.input.textInput.Cursor.BlinkCmd(), cmd)
+			return m, tea.Batch(textinput.Blink, cmd)
 		}
-		return m, m.input.textInput.Cursor.BlinkCmd()
+		return m, textinput.Blink
 
 	case resetQuitMsg:
 		m.quitPending = false
@@ -182,6 +327,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if m.splashShown {
 		var cmd tea.Cmd
 		m.input, cmd = m.input.update(msg)
+		if m.takesOwnAnswer() {
+			m.input.menuVisible = false
+		}
 		return m, cmd
 	}
 	return m, nil
@@ -206,9 +354,9 @@ func (m Model) viewportHeight() int {
 	return h
 }
 
-func (m Model) View() string {
+func (m Model) View() tea.View {
 	if m.width == 0 || m.height == 0 {
-		return ""
+		return appView("")
 	}
 
 	separator := lipgloss.NewStyle().Foreground(separatorColor).Render(
@@ -228,13 +376,39 @@ func (m Model) View() string {
 	parts = append(parts, separator)
 	parts = append(parts, m.status.view())
 
-	return strings.Join(parts, "\n")
+	return appView(strings.Join(parts, "\n"))
+}
+
+func appView(content string) tea.View {
+	view := tea.NewView(content)
+	view.AltScreen = true
+	view.MouseMode = tea.MouseModeCellMotion
+	return view
 }
 
 // handleKey processes keyboard input.
-func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.Type {
-	case tea.KeyEscape:
+func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	if m.configState == nil && !m.viewport.pickerActive && !m.input.menuVisible {
+		// A root question takes its keys before a background agent's
+		// approval card; the agent's shortcuts still reach that card, except
+		// while the user types an answer after Other.
+		if updated, cmd, handled := m.handleQuestionKey(msg); handled {
+			return updated, cmd
+		}
+		if m.activeApproval() >= 0 && !m.takesOwnAnswer() {
+			if updated, cmd, handled := m.handleApprovalKey(msg); handled {
+				return updated, cmd
+			}
+		}
+	}
+
+	switch msg.String() {
+	case "ctrl+c":
+		if m.isStreaming && !m.awaitingUser {
+			return m.cancelStream()
+		}
+
+	case "esc":
 		if m.input.menuVisible {
 			m.input.menuVisible = false
 			return m, nil
@@ -243,6 +417,10 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m.cancelConfigure()
 		}
 		if m.isStreaming {
+			if m.awaitingUser {
+				// Only the decisions end a wait; Stop is for running work.
+				return m, nil
+			}
 			return m.cancelStream()
 		}
 		if m.viewport.pickerActive {
@@ -251,15 +429,15 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
-	case tea.KeyCtrlD:
+	case "ctrl+d":
 		if m.configState != nil {
 			return m.cancelConfigure()
 		}
-		if m.isStreaming {
-			return m.cancelStream()
-		}
 		if m.quitPending {
 			return m, tea.Quit
+		}
+		if m.isStreaming && !m.awaitingUser {
+			m, _ = m.cancelStream()
 		}
 		m.quitPending = true
 		m.viewport.addInfo("Press Ctrl+D again to quit.")
@@ -267,11 +445,11 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return resetQuitMsg{}
 		})
 
-	case tea.KeyCtrlO:
+	case "ctrl+o":
 		m.viewport.showSources = !m.viewport.showSources
 		return m, nil
 
-	case tea.KeyEnter:
+	case "enter":
 		if m.configState != nil {
 			text := strings.TrimSpace(m.input.textInput.Value())
 			m.input.textInput.SetValue("")
@@ -286,15 +464,23 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.viewport.pickerActive = false
 				switch m.viewport.pickerType {
 				case pickerSession:
-					return cmdResume(m, item.id)
+					return cmdResume(m, item.id, nil)
 				case pickerAgent:
-					return cmdSelectAgent(m, item.id)
+					return cmdSelectAgentByID(m, item.id)
+				case pickerModel:
+					return cmdSelectModel(m, item.id)
 				}
 			}
 			return m, nil
 		}
+		if m.isStreaming && !strings.HasPrefix(strings.TrimSpace(m.input.textInput.Value()), "/") {
+			if active := m.activeApproval(); active >= 0 && m.approvals[active].request.AgentName == "" && m.input.textInput.Value() != "" {
+				m.viewport.addWarning("Approve or reject the tool call first. Your draft is kept.")
+			}
+			return m, nil
+		}
 
-	case tea.KeyUp:
+	case "up":
 		if m.viewport.pickerActive {
 			if m.viewport.pickerIndex > 0 {
 				m.viewport.pickerIndex--
@@ -302,7 +488,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
-	case tea.KeyDown:
+	case "down":
 		if m.viewport.pickerActive {
 			if m.viewport.pickerIndex < len(m.viewport.pickerItems)-1 {
 				m.viewport.pickerIndex++
@@ -310,19 +496,19 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
-	case tea.KeyPgUp:
+	case "pgup":
 		m.viewport.scrollUp(m.viewportHeight()/2, m.viewportHeight())
 		return m, nil
 
-	case tea.KeyPgDown:
+	case "pgdown":
 		m.viewport.scrollDown(m.viewportHeight() / 2)
 		return m, nil
 
-	case tea.KeyShiftUp:
+	case "shift+up":
 		m.viewport.scrollUp(3, m.viewportHeight())
 		return m, nil
 
-	case tea.KeyShiftDown:
+	case "shift+down":
 		m.viewport.scrollDown(3)
 		return m, nil
 	}
@@ -330,6 +516,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Pass to input
 	var cmd tea.Cmd
 	m.input, cmd = m.input.update(msg)
+	if m.takesOwnAnswer() {
+		m.input.menuVisible = false
+	}
 	return m, cmd
 }
 
@@ -345,16 +534,23 @@ func (m Model) handleFileDrop(path string) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) cancelStream() (Model, tea.Cmd) {
+	// While a stream is open, its API owner sends Stop once the stream names
+	// its response; after the stream ends, this client sends it.
+	if m.settling && m.streamID != nil && m.chatSessionID != nil {
+		sessionID, streamID := *m.chatSessionID, *m.streamID
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			m.client.StopChatSession(ctx, sessionID, streamID)
+		}()
+	}
+	m.stopRequested = true
 	if m.streamCancel != nil {
 		m.streamCancel()
 	}
-	if m.chatSessionID != nil {
-		sid := *m.chatSessionID
-		go m.client.StopChatSession(context.Background(), sid)
-	}
-	m, cmd := m.finishStream(nil)
-	m.viewport.addInfo("Generation stopped.")
-	return m, cmd
+	// The API stream owner sends Stop after acknowledgement. Keep input blocked.
+	m.viewport.addInfo("Stopping generation…")
+	return m, nil
 }
 
 func (m Model) sendMessage(message string) (Model, tea.Cmd) {
@@ -362,6 +558,7 @@ func (m Model) sendMessage(message string) (Model, tea.Cmd) {
 		return m, nil
 	}
 
+	m.submittedMessage = message
 	m.viewport.addUserMessage(message)
 	m.viewport.startAgent()
 
@@ -371,40 +568,75 @@ func (m Model) sendMessage(message string) (Model, tea.Cmd) {
 	m.attachedFiles = nil
 	m.input.clearFiles()
 
+	return m.startStream(func(ctx context.Context) <-chan models.StreamEvent {
+		return m.client.SendMessageStream(ctx, message, m.chatSessionID, m.agentID, m.parentMessageID, fileDescs, m.modelOverride)
+	})
+}
+
+// startStream follows a response stream, either a new message or a running
+// response of this session.
+func (m Model) startStream(open func(context.Context) <-chan models.StreamEvent) (Model, tea.Cmd) {
+	// An earlier decision's status read can no longer replace this stream.
+	if m.followCancel != nil {
+		m.followCancel()
+	}
+	m.follow++
+	m.streams++
+	if m.streamCancel != nil {
+		m.streamCancel()
+	}
+	m.streamID = nil
+	m.settling = false
+	m.following = false
+	m.stopReceived = false
+	m.awaitingUser = false
+	m.stopRequested = false
+	m.resumeCursor = nil
 	m.isStreaming = true
+	m.readinessUnconfirmed = false
 	m.agentStarted = false
 	m.citations = make(map[int]string)
 	m.status.setStreaming(true)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	m.streamCancel = cancel
+	m.streamCh = open(ctx)
+	return m, WaitForStreamEvent(m.streamCh)
+}
 
-	ch := m.client.SendMessageStream(
-		ctx,
-		message,
-		m.chatSessionID,
-		m.agentID,
-		m.parentMessageID,
-		fileDescs,
-	)
-	m.streamCh = ch
-
-	return m, WaitForStreamEvent(ch)
+// followRunningResponse shows the session's running response again from its
+// start. A nil streamID follows whichever response runs.
+func (m Model) followRunningResponse(streamID *int) (Model, tea.Cmd) {
+	sessionID := *m.chatSessionID
+	m, cmd := m.startStream(func(ctx context.Context) <-chan models.StreamEvent {
+		return m.client.ResumeChatStream(ctx, sessionID, streamID, 0)
+	})
+	m.following = true
+	m.streamID = streamID
+	return m, cmd
 }
 
 func (m Model) handleStreamEvent(msg StreamEventMsg) (tea.Model, tea.Cmd) {
 	// Ignore stale events after cancellation
-	if !m.isStreaming {
+	if !m.isStreaming || msg.Channel != m.streamCh {
 		return m, nil
 	}
 	switch e := msg.Event.(type) {
 	case models.SessionCreatedEvent:
 		m.chatSessionID = &e.ChatSessionID
-		m.needsRename = true
+		// A followed response replays the creation of a session that has a name.
+		if !m.following {
+			m.needsRename = true
+		}
 		m.status.setSession(e.ChatSessionID)
 
 	case models.MessageIDEvent:
+		// A followed stream's message ID names its response, not the stream.
+		if !m.following {
+			m.streamID = &e.ReservedAgentMessageID
+		}
 		m.parentMessageID = &e.ReservedAgentMessageID
+		m.viewport.showResponse(e.ReservedAgentMessageID)
 
 	case models.MessageStartEvent:
 		m.agentStarted = true
@@ -465,30 +697,105 @@ func (m Model) handleStreamEvent(msg StreamEventMsg) (tea.Model, tea.Cmd) {
 	case models.IntermediateReportDeltaEvent:
 		m.viewport.appendToken(e.Content)
 
+	case models.ToolApprovalRequestEvent:
+		// A replay shows a card that this client already shows at its place.
+		if m.approvalIndex(e.ApprovalID) < 0 {
+			m.approvals = append(m.approvals, approvalCard{request: e, responseID: *m.parentMessageID})
+		}
+		m.renderCards()
+
+	case models.ToolApprovalResolvedEvent:
+		if index := m.approvalIndex(e.ApprovalID); index >= 0 {
+			m = m.resolveApproval(index, approval.OutcomeLabel(e.Outcome))
+		}
+
+	case models.ToolQuestionRequestEvent:
+		// A replay shows a card that this client already shows at its place.
+		if m.questionIndex(e.QuestionRequestID) < 0 {
+			m.questions = append(m.questions, questionCard{request: e, responseID: *m.parentMessageID})
+		}
+		m.renderCards()
+
+	case models.ToolQuestionResolvedEvent:
+		if index := m.questionIndex(e.QuestionRequestID); index >= 0 {
+			m = m.resolveQuestion(index, question.Outcome(m.questions[index].request, e), e.Message)
+		}
+
 	case models.StopEvent:
-		return m.finishStream(nil)
+		// Delivery completion does not confirm the save. Drain the stream.
+		m.stopReceived = true
+		m.awaitingUser = e.AwaitingUser()
+		m.renderCards()
+
+	case models.StreamUnavailableEvent:
+		if m.streamID != nil {
+			m.unbufferedStreamID = m.streamID
+		}
+
+	case models.StreamCursorEvent:
+		if m.streamID == nil {
+			m.streamID = &e.StreamID
+		}
+		if *m.streamID == e.StreamID {
+			m.resumeCursor = &e.NextCursor
+		}
 
 	case models.ErrorEvent:
-		m.viewport.addError(e.Error)
-		return m.finishStream(nil)
+		if m.input.textInput.Value() == "" {
+			m.input.textInput.SetValue(m.submittedMessage)
+		}
+		if e.ErrorCode != api.ErrorCodeApprovalPending {
+			m.viewport.addError(e.Error)
+			break
+		}
+		// The server did not accept the message; the draft keeps it.
+		m.viewport.withdrawUserMessage()
+		m.viewport.addWarning("The response in this session waits for an approval or an answer. Answer it, then send again.")
+		if m.chatSessionID != nil {
+			// The session load shows the request that waits.
+			return m, tea.Batch(loadApprovals(m.client, *m.chatSessionID), WaitForStreamEvent(m.streamCh))
+		}
 	}
 
 	return m, WaitForStreamEvent(m.streamCh)
 }
 
-func (m Model) handleStreamDone(msg StreamDoneMsg) (tea.Model, tea.Cmd) {
-	// Ignore if already cancelled
-	if !m.isStreaming {
-		return m, nil
-	}
-	return m.finishStream(msg.Err)
+type sessionReadyMsg struct {
+	sessionID string
+	channel   <-chan models.StreamEvent
+	status    models.ChatSessionStatus
+	err       error
 }
 
+func checkSessionReady(client api.ClientAPI, sessionID string, channel <-chan models.StreamEvent) tea.Cmd {
+	return func() tea.Msg {
+		time.Sleep(api.StatusPollInterval)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		status, err := client.ChatSessionStatus(ctx, sessionID)
+		return sessionReadyMsg{sessionID, channel, status, err}
+	}
+}
+
+func (m Model) handleStreamDone(msg StreamDoneMsg) (tea.Model, tea.Cmd) {
+	if !m.isStreaming || msg.Channel != m.streamCh {
+		return m, nil
+	}
+	if m.chatSessionID == nil {
+		return m.finishStream(msg.Err)
+	}
+	m.settling = true
+	return m, checkSessionReady(m.client, *m.chatSessionID, m.streamCh)
+}
+
+// finishStream ends the display of a response. Its cards wait for the
+// server's outcome.
 func (m Model) finishStream(err error) (Model, tea.Cmd) {
 	m.viewport.finishAgent()
 	if m.agentStarted && len(m.citations) > 0 {
 		m.viewport.addCitations(m.citations)
 	}
+	m.viewport.endResponse()
 	m.isStreaming = false
 	m.agentStarted = false
 	m.status.setStreaming(false)
@@ -497,6 +804,10 @@ func (m Model) finishStream(err error) (Model, tea.Cmd) {
 	}
 	m.streamCancel = nil
 	m.streamCh = nil
+	m.streamID = nil
+	m.settling = false
+	m.reloading = false
+	m.renderCards()
 
 	// Auto-rename new sessions
 	if m.needsRename && m.chatSessionID != nil {
@@ -563,6 +874,73 @@ func (m Model) handleAgentsLoaded(msg AgentsLoadedMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m Model) handleModelsLoaded(msg ModelsLoadedMsg) (tea.Model, tea.Cmd) {
+	if msg.Err != nil {
+		// Startup fetch failures are silent — the status bar just omits the
+		// model segment. Only report when the user asked for the picker.
+		if msg.ShowPicker {
+			m.viewport.addError("Could not load models: " + msg.Err.Error())
+		}
+		return m, nil
+	}
+
+	// A startup response that lands while the model picker is open must not
+	// replace the list the picker's indices point into.
+	if !msg.ShowPicker && m.viewport.pickerActive && m.viewport.pickerType == pickerModel {
+		return m, nil
+	}
+
+	m.llmModels = flattenModelOptions(msg.Response)
+	m.status.setModel(m.currentModelLabel())
+
+	if !msg.ShowPicker {
+		return m, nil
+	}
+	if len(m.llmModels) == 0 {
+		m.viewport.addInfo("No models available.")
+		return m, nil
+	}
+
+	m.viewport.addInfo("Select a model (Enter to select, Esc to cancel):")
+
+	var items []pickerItem
+	for i, opt := range m.llmModels {
+		label := opt.label
+		if m.isCurrentModel(opt) {
+			label += " *"
+		}
+		items = append(items, pickerItem{
+			id:     strconv.Itoa(i),
+			label:  label,
+			detail: opt.providerLabel,
+		})
+	}
+	m.viewport.showPicker(pickerModel, items)
+	return m, nil
+}
+
+// isCurrentModel reports whether opt is the model in effect: the explicit
+// override when one is set, otherwise the workspace default.
+func (m Model) isCurrentModel(opt modelOption) bool {
+	if m.modelOverride == nil {
+		return opt.isDefault
+	}
+	if m.modelOverride.ModelConfigurationID != nil && opt.configID != nil {
+		return *m.modelOverride.ModelConfigurationID == *opt.configID
+	}
+	return m.modelOverride.ModelVersion != nil && *m.modelOverride.ModelVersion == opt.name
+}
+
+// currentModelLabel returns the display label of the model in effect.
+func (m Model) currentModelLabel() string {
+	for _, opt := range m.llmModels {
+		if m.isCurrentModel(opt) {
+			return opt.label
+		}
+	}
+	return ""
+}
+
 func (m Model) handleSessionsLoaded(msg SessionsLoadedMsg) (tea.Model, tea.Cmd) {
 	if msg.Err != nil {
 		m.viewport.addError("Could not load sessions: " + msg.Err.Error())
@@ -605,18 +983,75 @@ func (m Model) handleSessionsLoaded(msg SessionsLoadedMsg) (tea.Model, tea.Cmd) 
 }
 
 func (m Model) handleSessionResumed(msg SessionResumedMsg) (tea.Model, tea.Cmd) {
-	if msg.Err != nil {
-		m.viewport.addError("Could not load session: " + msg.Err.Error())
+	if msg.Origin != nil && (!m.reloading || msg.Origin != m.streamCh) {
+		// The chat moved on from the stream that asked for this reload.
 		return m, nil
+	}
+	if reload := msg.Reload; reload != nil {
+		if m.reloadingResponseID == reload.responseID {
+			m.reloadingResponseID = 0
+		}
+		if m.chatSessionID == nil || *m.chatSessionID != reload.sessionID || m.isStreaming || reload.streams != m.streams {
+			// The user left the chat, or a newer stream shows it.
+			return m, nil
+		}
+		if msg.Err != nil {
+			if api.IsRetryableReadinessError(msg.Err) {
+				// The next status read loads the session again.
+				m.approvalsPoll++
+				return m, pollApprovals(m.client, reload.sessionID, m.approvalsPoll, api.StatusPollInterval)
+			}
+			m.reloadedResponseID = reload.responseID
+			m.viewport.addError("Could not load session: " + msg.Err.Error())
+			return m, nil
+		}
+		if reload.responseID != 0 {
+			m.reloadedResponseID = reload.responseID
+		}
+	}
+	if msg.Err != nil {
+		if msg.Origin != nil && api.IsRetryableReadinessError(msg.Err) {
+			// The response can still wait for approval: check again and retry.
+			m.reloading = false
+			if !m.readinessUnconfirmed {
+				m.readinessUnconfirmed = true
+				m.viewport.addWarning("Waiting to confirm conversation readiness.")
+			}
+			return m, checkSessionReady(m.client, *m.chatSessionID, m.streamCh)
+		}
+		m.viewport.addError("Could not load session: " + msg.Err.Error())
+		if msg.Origin != nil {
+			return m.finishStream(nil)
+		}
+		return m, nil
+	}
+
+	if m.isStreaming && m.chatSessionID != nil && *m.chatSessionID == msg.Detail.ChatSessionID {
+		if !m.reloading {
+			// The current stream owns newer messages than this saved snapshot.
+			return m, nil
+		}
+		m, _ = m.finishStream(nil)
 	}
 
 	// Cancel any in-progress stream before replacing the session
 	if m.isStreaming {
 		m, _ = m.cancelStream()
+		m, _ = m.finishStream(nil)
 	}
 
+	if m.chatSessionID == nil || *m.chatSessionID != msg.Detail.ChatSessionID {
+		if m.followCancel != nil {
+			m.followCancel()
+		}
+		m.resolvedRequests = nil
+	}
 	detail := msg.Detail
 	m.chatSessionID = &detail.ChatSessionID
+	m.approvals = nil
+	m.questions = nil
+	m.approvalsVersion = detail.ApprovalsVersion
+	m.approvalsLoadVersion = ""
 	m.viewport.clearDisplay()
 	m.status.setSession(detail.ChatSessionID)
 
@@ -628,17 +1063,36 @@ func (m Model) handleSessionResumed(msg SessionResumedMsg) (tea.Model, tea.Cmd) 
 		m.agentID = *detail.AgentID
 	}
 
-	// Replay messages
+	// Replay messages. The questions that a response asked and that ended
+	// show as records before its text.
+	saved := readSavedRequests(detail)
+	recorded := maps.Clone(m.resolvedRequests)
+	if recorded == nil {
+		recorded = map[string]bool{}
+	}
 	for _, chatMsg := range detail.Messages {
 		switch chatMsg.MessageType {
 		case "user":
 			m.viewport.addUserMessage(chatMsg.Message)
 		case "assistant":
+			for _, card := range saved.questions {
+				resolved, ok := saved.answered[card.request.QuestionRequestID]
+				if card.responseID != chatMsg.MessageID || !ok {
+					continue
+				}
+				m.viewport.setCard(card.request.QuestionRequestID, questionRecord(question.Outcome(card.request, resolved), resolved.Message))
+				recorded[card.request.QuestionRequestID] = true
+			}
+			// A replay of a running response replaces its saved copy.
 			m.viewport.startAgent()
+			m.viewport.showResponse(chatMsg.MessageID)
 			m.viewport.appendToken(chatMsg.Message)
 			m.viewport.finishAgent()
+			m.viewport.endResponse()
 		}
 	}
+
+	m.resolvedRequests = recorded
 
 	// Set parent to last message
 	if len(detail.Messages) > 0 {
@@ -651,6 +1105,21 @@ func (m Model) handleSessionResumed(msg SessionResumedMsg) (tea.Model, tea.Cmd) 
 		desc = *detail.Description
 	}
 	m.viewport.addInfo("Resumed session: " + desc)
+	// The saved replay shows every request that waits, also those of a
+	// response that waits for decisions and has no stream.
+	m = m.showSavedRequests(detail.ApprovalsVersion, saved)
+	if msg.Status.IsProcessing {
+		m.viewport.startAgent()
+		var streamID *int
+		if msg.Status.CurrentStream != nil {
+			streamID = &msg.Status.CurrentStream.StreamID
+		}
+		return m.followRunningResponse(streamID)
+	}
+	if m.watchesStatus(msg.Status) {
+		m.approvalsPoll++
+		return m, pollApprovals(m.client, detail.ChatSessionID, m.approvalsPoll, api.StatusPollInterval)
+	}
 	return m, nil
 }
 
@@ -667,4 +1136,3 @@ func (m Model) handleFileUploaded(msg FileUploadedMsg) (tea.Model, tea.Cmd) {
 
 type inputReadyMsg struct{}
 type resetQuitMsg struct{}
-

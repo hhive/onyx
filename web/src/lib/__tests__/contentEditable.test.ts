@@ -2,11 +2,17 @@
  * @jest-environment jsdom
  */
 
-import { getTextContent } from "@/lib/contentEditable";
+import {
+  getTextContent,
+  getTextAroundCursor,
+  deleteTokenAtCursor,
+  stripLeadingBr,
+} from "@/lib/contentEditable";
 import {
   shouldCreatePasteTile,
   getPasteTilePreview,
   getPasteTileMeta,
+  createRichInputTileNode,
   PASTE_TILE_THRESHOLD_CHARS,
 } from "@/lib/richInputTile";
 
@@ -176,5 +182,207 @@ describe("getTextContent", () => {
     el.appendChild(p2);
     el.appendChild(p3);
     expect(getTextContent(el)).toBe("line1\nline2\nline3");
+  });
+});
+
+describe("createRichInputTileNode: mention tiles", () => {
+  function mentionTile() {
+    return createRichInputTileNode({
+      type: "mention",
+      text: "@pptx",
+      preview: "@pptx",
+      meta: "",
+      mention: { type: "skill", name: "pptx" },
+      label: "@pptx",
+      removeLabel: "Remove @pptx",
+    });
+  }
+
+  it("marks the tile type and stores the mention", () => {
+    const tile = mentionTile();
+    expect(tile.getAttribute("data-tile-type")).toBe("mention");
+    expect(tile.getAttribute("data-mention-type")).toBe("skill");
+    expect(tile.getAttribute("data-mention-name")).toBe("pptx");
+  });
+
+  it("serializes to its `@name` via getTextContent", () => {
+    const el = document.createElement("div");
+    el.appendChild(document.createTextNode("make me "));
+    el.appendChild(mentionTile());
+    el.appendChild(document.createTextNode(" about cats"));
+    expect(getTextContent(el)).toBe("make me @pptx about cats");
+  });
+
+  it("renders the `@name` preview and omits the meta when empty", () => {
+    const tile = mentionTile();
+    expect(tile.querySelector(".rich-input-tile-preview")?.textContent).toBe(
+      "@pptx"
+    );
+    expect(tile.querySelector(".rich-input-tile-meta")).toBeNull();
+  });
+});
+
+// Caret/selection helpers — only the text-node fast paths are exercised here;
+// the Selection.modify node-boundary fallback isn't implemented by jsdom and is
+// left to e2e (the helpers guard on `typeof sel.modify !== "function"`).
+function caretAt(node: Node, offset: number): void {
+  const sel = window.getSelection()!;
+  const r = document.createRange();
+  r.setStart(node, offset);
+  r.collapse(true);
+  sel.removeAllRanges();
+  sel.addRange(r);
+}
+
+function mount(html: string): HTMLDivElement {
+  const el = document.createElement("div");
+  el.contentEditable = "true";
+  el.innerHTML = html;
+  document.body.appendChild(el);
+  return el;
+}
+
+describe("getTextAroundCursor", () => {
+  it("ends `after` at the first whitespace in the caret's text node", () => {
+    const el = mount("hi @co de now");
+    caretAt(el.firstChild as Text, "hi @co".length);
+    expect(getTextAroundCursor(el)).toEqual({ before: "hi @co", after: "" });
+    caretAt(el.firstChild as Text, "hi @c".length);
+    expect(getTextAroundCursor(el)).toEqual({ before: "hi @c", after: "o" });
+    el.remove();
+  });
+
+  it("follows the word across nodes and reads a tile as one placeholder", () => {
+    const el = mount("@c<b>od</b>e");
+    el.appendChild(
+      createRichInputTileNode({
+        type: "paste",
+        text: "tile",
+        preview: "tile",
+        meta: "",
+        label: "tile",
+        removeLabel: "Remove tile",
+      })
+    );
+    el.appendChild(document.createTextNode("x y"));
+    caretAt(el.firstChild as Text, 1);
+    expect(getTextAroundCursor(el)).toEqual({
+      before: "@",
+      after: "code\uFFFCx",
+    });
+    caretAt(el.lastChild as Text, 1);
+    expect(getTextAroundCursor(el)).toEqual({
+      before: "@code\uFFFCx",
+      after: "",
+    });
+    el.remove();
+  });
+});
+
+describe("deleteTokenAtCursor", () => {
+  it("removes the exact token before the caret and returns true", () => {
+    const el = mount("hi /pptx");
+    const text = el.firstChild as Text;
+    caretAt(text, text.length);
+    expect(deleteTokenAtCursor(el, { before: "/pptx", after: "" })).toBe(true);
+    expect(getTextContent(el)).toBe("hi ");
+    el.remove();
+  });
+
+  it("removes the whole token around a caret inside it", () => {
+    const el = mount("hi /pptx now");
+    caretAt(el.firstChild as Text, 6);
+    expect(deleteTokenAtCursor(el, { before: "/pp", after: "tx" })).toBe(true);
+    expect(getTextContent(el)).toBe("hi  now");
+    el.remove();
+  });
+
+  it("returns false when the chars after the caret don't match", () => {
+    const el = mount("hi /pptx");
+    caretAt(el.firstChild as Text, 6);
+    expect(deleteTokenAtCursor(el, { before: "/pp", after: "ty" })).toBe(false);
+    expect(getTextContent(el)).toBe("hi /pptx");
+    el.remove();
+  });
+
+  it("returns false (and deletes nothing) when the chars don't match", () => {
+    const el = mount("hello");
+    const text = el.firstChild as Text;
+    caretAt(text, text.length);
+    expect(deleteTokenAtCursor(el, { before: "/x", after: "" })).toBe(false);
+    expect(getTextContent(el)).toBe("hello");
+    el.remove();
+  });
+
+  it("returns false for an empty token", () => {
+    const el = mount("hi");
+    caretAt(el.firstChild as Text, 2);
+    expect(deleteTokenAtCursor(el, { before: "", after: "" })).toBe(false);
+    el.remove();
+  });
+
+  it("returns false when fewer chars than the token precede the caret", () => {
+    const el = mount("/x");
+    caretAt(el.firstChild as Text, 1);
+    expect(deleteTokenAtCursor(el, { before: "/x", after: "" })).toBe(false);
+    expect(getTextContent(el)).toBe("/x");
+    el.remove();
+  });
+
+  it("returns false (no mutation) for a non-collapsed selection", () => {
+    const el = mount("hi /pptx");
+    const text = el.firstChild as Text;
+    const sel = window.getSelection()!;
+    const r = document.createRange();
+    r.setStart(text, 3);
+    r.setEnd(text, text.length);
+    sel.removeAllRanges();
+    sel.addRange(r);
+    expect(deleteTokenAtCursor(el, { before: "/pptx", after: "" })).toBe(false);
+    expect(getTextContent(el)).toBe("hi /pptx");
+    el.remove();
+  });
+
+  it("returns false when the caret is outside the element", () => {
+    const el = mount("hi /pptx");
+    const outside = mount("/pptx");
+    caretAt(outside.firstChild as Text, 5);
+    expect(deleteTokenAtCursor(el, { before: "/pptx", after: "" })).toBe(false);
+    expect(getTextContent(el)).toBe("hi /pptx");
+    el.remove();
+    outside.remove();
+  });
+});
+
+describe("stripLeadingBr", () => {
+  function tileHtml(): string {
+    return '<span data-rich-tile data-tile-type="mention">@x</span>';
+  }
+
+  it("removes a leading <br> that precedes a rich tile", () => {
+    const el = mount(`<br>${tileHtml()}`);
+    expect(stripLeadingBr(el)).toBe(true);
+    expect(el.firstChild?.nodeName).toBe("SPAN");
+    el.remove();
+  });
+
+  it("leaves a leading <br> that precedes text (user newline) untouched", () => {
+    const el = mount("<br>hello");
+    expect(stripLeadingBr(el)).toBe(false);
+    expect(el.firstChild?.nodeName).toBe("BR");
+    el.remove();
+  });
+
+  it("returns false when the first child is not a <br>", () => {
+    const el = mount(`${tileHtml()}`);
+    expect(stripLeadingBr(el)).toBe(false);
+    el.remove();
+  });
+
+  it("leaves a leading <br> that precedes a non-tile element untouched", () => {
+    const el = mount("<br><span>text</span>");
+    expect(stripLeadingBr(el)).toBe(false);
+    expect(el.firstChild?.nodeName).toBe("BR");
+    el.remove();
   });
 });

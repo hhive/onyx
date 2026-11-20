@@ -5,8 +5,7 @@ This file contains constants moved from model_server to support the gradual migr
 of API-based calls to bypass the model server.
 """
 
-from shared_configs.enums import EmbeddingProvider
-from shared_configs.enums import EmbedTextType
+from shared_configs.enums import EmbeddingProvider, EmbedTextType
 
 # Default model names for different providers
 DEFAULT_OPENAI_MODEL = "text-embedding-3-small"
@@ -28,6 +27,11 @@ class EmbeddingModelTextType:
             EmbedTextType.PASSAGE: "document",
         },
         EmbeddingProvider.GOOGLE: {
+            EmbedTextType.QUERY: "RETRIEVAL_QUERY",
+            EmbedTextType.PASSAGE: "RETRIEVAL_DOCUMENT",
+        },
+        # Bifrost's `task_type`, forwarded only to Gemini / Vertex models
+        EmbeddingProvider.BIFROST: {
             EmbedTextType.QUERY: "RETRIEVAL_QUERY",
             EmbedTextType.PASSAGE: "RETRIEVAL_DOCUMENT",
         },

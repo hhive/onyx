@@ -5,19 +5,21 @@ from unittest.mock import patch
 import pytest
 
 from onyx.document_index.opensearch.constants import OpenSearchSearchType
-from onyx.server.metrics.opensearch_search import _client_duration
-from onyx.server.metrics.opensearch_search import _client_server_overhead
-from onyx.server.metrics.opensearch_search import _search_errors
-from onyx.server.metrics.opensearch_search import _search_total
-from onyx.server.metrics.opensearch_search import _searches_in_progress
-from onyx.server.metrics.opensearch_search import _server_duration
-from onyx.server.metrics.opensearch_search import observe_opensearch_search
-from onyx.server.metrics.opensearch_search import record_opensearch_search_error
-from onyx.server.metrics.opensearch_search import track_opensearch_search
+from onyx.server.metrics.opensearch_search import (
+    _client_duration,
+    _client_server_overhead,
+    _search_errors,
+    _search_total,
+    _searches_in_progress,
+    _server_duration,
+    observe_opensearch_search,
+    record_opensearch_search_error,
+    track_opensearch_search,
+)
 
 
 class TestRecordOpenSearchSearchError:
-    def test_increments_error_counter_with_exception_class_name(self) -> None:
+    def test_increments_error_counter_with_error_type(self) -> None:
         # Precondition.
         search_type = OpenSearchSearchType.HYBRID
         error_type = "ValueError"
@@ -26,7 +28,7 @@ class TestRecordOpenSearchSearchError:
         )._value.get()
 
         # Under test.
-        record_opensearch_search_error(search_type, ValueError("boom"))
+        record_opensearch_search_error(search_type, "ValueError")
 
         # Postcondition.
         after = _search_errors.labels(
@@ -45,8 +47,8 @@ class TestRecordOpenSearchSearchError:
         )._value.get()
 
         # Under test.
-        record_opensearch_search_error(search_type, ValueError("a"))
-        record_opensearch_search_error(search_type, RuntimeError("b"))
+        record_opensearch_search_error(search_type, "ValueError")
+        record_opensearch_search_error(search_type, "RuntimeError")
 
         # Postcondition.
         after_value = _search_errors.labels(
@@ -71,9 +73,7 @@ class TestRecordOpenSearchSearchError:
 
             # Under test and postcondition.
             # Should not raise.
-            record_opensearch_search_error(
-                search_type, ValueError("simulated search failure")
-            )
+            record_opensearch_search_error(search_type, "ValueError")
 
             # Sanity check: the production code reached the fully-labeled child
             # for this specific error_type.

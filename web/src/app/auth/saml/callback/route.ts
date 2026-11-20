@@ -1,5 +1,4 @@
 import { authErrorRedirect } from "@/app/auth/libSS";
-import { validateInternalRedirect } from "@/lib/auth/redirectValidation";
 import { getDomain } from "@/lib/redirectSS";
 import { buildUrl } from "@/lib/utilsSS";
 import { NextRequest, NextResponse } from "next/server";
@@ -11,31 +10,28 @@ async function handleSamlCallback(
   request: NextRequest,
   method: "GET" | "POST"
 ) {
-  // Wrapper around the FastAPI endpoint /auth/saml/callback,
-  // which adds back a redirect to the main app.
+  // Wrapper around the FastAPI endpoint /auth/saml/callback. The backend
+  // validates the response and answers with a 303 to /auth/saml/complete,
+  // which the browser must follow itself so its login cookie travels with it.
   const url = new URL(buildUrl("/auth/saml/callback"));
   url.search = request.nextUrl.search;
 
   const fetchOptions: RequestInit = {
     method,
     headers: {},
+    redirect: "manual",
   };
-
-  let relayState: string | null = null;
 
   // For POST requests, include form data
   if (method === "POST") {
-    const formData = await request.formData();
-    const relayStateValue = formData.get("RelayState");
-    relayState = typeof relayStateValue === "string" ? relayStateValue : null;
-    fetchOptions.body = formData;
+    fetchOptions.body = await request.formData();
   }
 
   // OneLogin python toolkit only supports HTTP-POST binding for SAMLResponse.
   // If the IdP returned SAMLResponse via query parameters (GET), convert to POST.
   if (method === "GET") {
     const samlResponse = request.nextUrl.searchParams.get("SAMLResponse");
-    relayState = request.nextUrl.searchParams.get("RelayState");
+    const relayState = request.nextUrl.searchParams.get("RelayState");
     if (samlResponse) {
       const formData = new FormData();
       formData.set("SAMLResponse", samlResponse);
@@ -50,21 +46,16 @@ async function handleSamlCallback(
   }
 
   const response = await fetch(url.toString(), fetchOptions);
-  const setCookieHeader = response.headers.get("set-cookie");
 
-  if (!setCookieHeader) {
+  const location = response.headers.get("location");
+  if (response.status !== SEE_OTHER_REDIRECT_STATUS || !location) {
     return authErrorRedirect(request, response, SEE_OTHER_REDIRECT_STATUS);
   }
 
-  const validatedRelayState = validateInternalRedirect(relayState);
-  const redirectDestination = validatedRelayState ?? "/";
-
-  const redirectResponse = NextResponse.redirect(
-    new URL(redirectDestination, getDomain(request)),
+  return NextResponse.redirect(
+    new URL(location, getDomain(request)),
     SEE_OTHER_REDIRECT_STATUS
   );
-  redirectResponse.headers.set("set-cookie", setCookieHeader);
-  return redirectResponse;
 }
 
 export const GET = async (request: NextRequest) => {

@@ -10,12 +10,24 @@ These tests pin the contract that MCPTool.tool_definition() always returns
 a JSON-Schema-valid `parameters` dict with a `properties` key.
 """
 
-from unittest.mock import MagicMock
+from unittest.mock import patch
 
 import pytest
+from mcp.types import CallToolResult, TextContent
 
-from onyx.tools.tool_implementations.mcp.mcp_tool import _normalize_parameters_schema
-from onyx.tools.tool_implementations.mcp.mcp_tool import MCPTool
+from onyx.agents.tools import ToolInvocation
+from onyx.integrations.call_credentials import CallCredentials
+from onyx.llm.cancellation import CancellationSignal
+from onyx.llm.models import ToolDefinition, ToolResult
+from onyx.tools.interface import Tool
+from onyx.tools.models import CodeModeExposure, ToolContext
+from onyx.tools.tool_implementations.code_mode.stubs import build_tool_stubs
+from onyx.tools.tool_implementations.custom.custom_tool import CustomTool
+from onyx.tools.tool_implementations.custom.openapi_parsing import MethodSpec
+from onyx.tools.tool_implementations.mcp.mcp_tool import (
+    MCPTool,
+    _normalize_parameters_schema,
+)
 
 
 class TestNormalizeParametersSchema:
@@ -67,16 +79,66 @@ class TestNormalizeParametersSchema:
         assert _normalize_parameters_schema(schema) == schema
 
 
-def _make_tool(input_schema: dict) -> MCPTool:
-    mcp_server = MagicMock()
-    mcp_server.name = "aws-knowledge"
+class _StaticTool(Tool):
+    def __init__(self, name: str) -> None:
+        self._name = name
+
+    @property
+    def id(self) -> int:
+        return 2
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def description(self) -> str:
+        return "Static tool"
+
+    @property
+    def display_name(self) -> str:
+        return self._name
+
+    @property
+    def code_mode_exposure(self) -> CodeModeExposure:
+        return CodeModeExposure.IMMEDIATE
+
+    def tool_definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name=self._name,
+            description=self.description,
+            parameters={"type": "object", "properties": {}},
+        )
+
+    def emit_start(self, invocation: ToolInvocation) -> None:
+        pass
+
+    def _run(self, invocation: ToolInvocation, context: ToolContext) -> ToolResult:
+        raise NotImplementedError
+
+
+def _make_tool(
+    input_schema: dict,
+    tool_name: str = "aws___list_regions",
+    server_name: str = "aws-knowledge",
+    server_id: int = 1,
+) -> MCPTool:
     return MCPTool(
-        tool_id=1,
-        emitter=MagicMock(),
-        mcp_server=mcp_server,
-        tool_name="aws___list_regions",
+        integration_id=server_id,
+        integration_name=server_name,
+        server_url="http://mcp.example",
+        transport=None,
+        tool_name=tool_name,
         tool_description="List AWS regions",
         tool_definition=input_schema,
+        acting_user_id=None,
+        credentials=CallCredentials(
+            integration_id=server_id,
+            auth_method=None,
+            connection_id=None,
+            connection_user_id=None,
+            headers={},
+        ),
     )
 
 
@@ -87,14 +149,14 @@ class TestMCPToolDefinition:
         # rejected. The parameters field must always include `properties`.
         tool = _make_tool({"type": "object"})
 
-        params = tool.tool_definition()["function"]["parameters"]
+        params = tool.tool_definition().parameters
 
         assert params == {"type": "object", "properties": {}}
 
     def test_empty_input_schema_emits_valid_openai_schema(self) -> None:
         tool = _make_tool({})
 
-        params = tool.tool_definition()["function"]["parameters"]
+        params = tool.tool_definition().parameters
 
         assert params == {"type": "object", "properties": {}}
 
@@ -106,7 +168,7 @@ class TestMCPToolDefinition:
         }
         tool = _make_tool(input_schema)
 
-        params = tool.tool_definition()["function"]["parameters"]
+        params = tool.tool_definition().parameters
 
         assert params == input_schema
 
@@ -121,5 +183,110 @@ class TestMCPToolDefinition:
         assert stored == {"type": "object"}
 
 
+class TestMCPToolLLMNames:
+    def test_external_names_are_stable_and_distinct(self) -> None:
+        method = MethodSpec(
+            name="shared",
+            raw_name="shared",
+            summary="Shared operation",
+            path="/shared",
+            method="get",
+            spec={},
+        )
+        custom_tools = [
+            CustomTool(
+                integration_id=id, method_spec=method, base_url="https://example.com"
+            )
+            for id in (1, 2)
+        ]
+        mcp_tools = [
+            _make_tool({}, tool_name="shared", server_name="same name", server_id=id)
+            for id in (1, 2)
+        ]
+        tools: list[Tool] = [_StaticTool("shared"), *custom_tools, *mcp_tools]
+        names = [tool.name for tool in tools]
+        assert names == [
+            "shared",
+            "custom__1__shared",
+            "custom__2__shared",
+            "mcp__1__same_name__shared",
+            "mcp__2__same_name__shared",
+        ]
+        assert [tool.tool_definition().name for tool in tools] == names
+        assert all(tool.display_name == "shared" for tool in tools)
+        assert method.name == "shared"
+        assert method.raw_name == "shared"
+        stubs = build_tool_stubs(tools)
+        assert set(stubs.functions) == set(names)
+        assert all(
+            function.tool.name == name for name, function in stubs.functions.items()
+        )
+
+    @pytest.mark.parametrize("names", [("a" * 58, "a" * 57 + "b"), ("a.b", "a_b")])
+    def test_qualified_names_fit_provider_limits_without_collisions(
+        self, names: tuple[str, str]
+    ) -> None:
+        tools: list[Tool] = []
+        for name in names:
+            method = MethodSpec(
+                name=name.replace(".", "_"),
+                raw_name=name,
+                summary="Operation",
+                path="/shared",
+                method="get",
+                spec={},
+            )
+            tools.extend(
+                [
+                    CustomTool(
+                        integration_id=1,
+                        method_spec=method,
+                        base_url="https://example.com",
+                    ),
+                    _make_tool({}, tool_name=name, server_name="server" * 20),
+                ]
+            )
+        assert len({tool.name for tool in tools}) == len(tools)
+        for tool in tools:
+            assert len(tool.name) <= 64
+            assert tool.tool_definition().name == tool.name
+            assert tool.name.isascii()
+            assert all(char.isalnum() or char in "_-" for char in tool.name)
+
+    def test_disambiguated_mcp_tool_calls_server_with_original_name(self) -> None:
+        mcp_tool = _make_tool({"type": "object"}, tool_name="shared")
+
+        with (
+            patch(
+                "onyx.tools.tool_implementations.mcp.mcp_tool.call_mcp_tool",
+                return_value=CallToolResult(
+                    content=[TextContent(type="text", text='{"ok": true}')]
+                ),
+            ) as mock_call_mcp_tool,
+        ):
+            mcp_tool.run(
+                ToolInvocation(
+                    call_id="test",
+                    arguments={},
+                    cancellation=CancellationSignal(),
+                    update=lambda _progress: None,
+                ),
+                ToolContext(),
+            )
+
+        mock_call_mcp_tool.assert_called_once()
+        assert mock_call_mcp_tool.call_args.args[1] == "shared"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-xv"])
+
+
+def test_external_schema_keeps_open_objects_and_non_strict_default() -> None:
+    schema = {
+        "type": "object",
+        "properties": {"metadata": {"type": "object", "properties": {}}},
+    }
+    definition = _make_tool(schema).tool_definition()
+    assert not definition.strict
+    assert definition.parameters == schema

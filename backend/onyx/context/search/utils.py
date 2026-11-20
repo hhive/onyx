@@ -4,28 +4,29 @@ from typing import TypeVar
 
 from sqlalchemy.orm import Session
 
-from onyx.configs.app_configs import QUERY_EMBEDDING_CACHE_ENABLED
-from onyx.configs.app_configs import QUERY_EMBEDDING_CACHE_TTL_S
-from onyx.context.search.models import InferenceChunk
-from onyx.context.search.models import InferenceSection
-from onyx.context.search.models import SavedSearchDoc
-from onyx.context.search.models import SavedSearchDocWithContent
-from onyx.context.search.models import SearchDoc
+from onyx.chat.incognito import current_turn_persists_content
+from onyx.configs.app_configs import (
+    QUERY_EMBEDDING_CACHE_ENABLED,
+    QUERY_EMBEDDING_CACHE_TTL_S,
+)
+from onyx.context.search.models import (
+    InferenceChunk,
+    InferenceSection,
+    SavedSearchDoc,
+    SavedSearchDocWithContent,
+    SearchDoc,
+)
 from onyx.db.document import get_document_id_to_file_id_map
-from onyx.db.models import SearchSettings
 from onyx.db.search_settings import get_current_search_settings
 from onyx.natural_language_processing.query_embedding_cache import (
     cache_query_embeddings,
-)
-from onyx.natural_language_processing.query_embedding_cache import (
     get_cached_query_embeddings,
+    record_cache_skipped,
 )
-from onyx.natural_language_processing.query_embedding_cache import record_cache_skipped
 from onyx.natural_language_processing.search_nlp_models import EmbeddingModel
 from onyx.utils.logger import setup_logger
 from onyx.utils.timing import log_function_time
-from shared_configs.configs import MODEL_SERVER_HOST
-from shared_configs.configs import MODEL_SERVER_PORT
+from shared_configs.configs import MODEL_SERVER_HOST, MODEL_SERVER_PORT
 from shared_configs.enums import EmbedTextType
 from shared_configs.model_server_models import Embedding
 
@@ -85,7 +86,6 @@ def get_query_embeddings(
     db_session: Session | None = None,
     embedding_model: EmbeddingModel | None = None,
 ) -> list[Embedding]:
-    search_settings: SearchSettings | None = None
     if embedding_model is None:
         if db_session is None:
             raise ValueError("Either db_session or embedding_model must be provided")
@@ -95,28 +95,28 @@ def get_query_embeddings(
             server_host=MODEL_SERVER_HOST,
             server_port=MODEL_SERVER_PORT,
         )
-    elif db_session is not None:
-        # Cache key needs search_settings.id even when the caller already
-        # supplied an embedding_model.
-        search_settings = get_current_search_settings(db_session)
 
     result: list[Embedding] = []
-    cache_usable: bool = (
-        QUERY_EMBEDDING_CACHE_ENABLED and bool(queries) and search_settings is not None
-    )
-    if not cache_usable:
+    model_cache_key = embedding_model.query_embedding_cache_key
+    if (
+        not QUERY_EMBEDDING_CACHE_ENABLED
+        or not queries
+        or model_cache_key is None
+        or embedding_model.retrim_content
+        or not current_turn_persists_content()
+    ):
         if queries:
             record_cache_skipped(embedding_model.provider_type, count=len(queries))
         result = embedding_model.encode(queries, text_type=EmbedTextType.QUERY)
-        assert len(result) == len(queries), (
-            "Bug: The length of embeddings does not match the length of queries."
-        )
+        if len(result) != len(queries):
+            raise RuntimeError(
+                "Bug: The length of embeddings does not match the length of queries."
+            )
         return result
-    assert search_settings is not None, "Bug: search_settings is None."
 
     cached = get_cached_query_embeddings(
         queries=queries,
-        search_settings_id=search_settings.id,
+        model_cache_key=model_cache_key,
         provider_type=embedding_model.provider_type,
         ttl_seconds=QUERY_EMBEDDING_CACHE_TTL_S,
     )
@@ -124,9 +124,10 @@ def get_query_embeddings(
     miss_indices = [i for i, value in enumerate(cached) if value is None]
     if not miss_indices:
         result = [emb for emb in cached if emb is not None]
-        assert len(result) == len(queries), (
-            "Bug: The length of embeddings does not match the length of queries."
-        )
+        if len(result) != len(queries):
+            raise RuntimeError(
+                "Bug: The length of embeddings does not match the length of queries."
+            )
         return result
 
     miss_queries = [queries[i] for i in miss_indices]
@@ -137,7 +138,7 @@ def get_query_embeddings(
     cache_query_embeddings(
         queries=miss_queries,
         embeddings=fresh_embeddings,
-        search_settings_id=search_settings.id,
+        model_cache_key=model_cache_key,
         provider_type=embedding_model.provider_type,
         ttl_seconds=QUERY_EMBEDDING_CACHE_TTL_S,
     )
@@ -148,13 +149,14 @@ def get_query_embeddings(
             result.append(next(fresh_iter))
         else:
             result.append(value)
-    assert len(result) == len(queries), (
-        "Bug: The length of embeddings does not match the length of queries."
-    )
+    if len(result) != len(queries):
+        raise RuntimeError(
+            "Bug: The length of embeddings does not match the length of queries."
+        )
     return result
 
 
-@log_function_time(print_only=True, debug_only=True)
+@log_function_time(debug_only=True)
 def get_query_embedding(
     query: str,
     db_session: Session | None = None,

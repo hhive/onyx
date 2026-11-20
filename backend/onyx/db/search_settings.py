@@ -1,17 +1,29 @@
-from sqlalchemy import and_
-from sqlalchemy import delete
+from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy import inspect as sa_inspect
-from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from onyx.configs.model_configs import DEFAULT_DOCUMENT_ENCODER_MODEL
-from onyx.configs.model_configs import DOCUMENT_ENCODER_MODEL
+from onyx.configs.model_configs import (
+    DEFAULT_DOCUMENT_ENCODER_MODEL,
+    DOCUMENT_ENCODER_MODEL,
+    PREVIOUS_DEFAULT_DOCUMENT_ENCODER_MODEL,
+)
 from onyx.context.search.models import SavedSearchSettings
+from onyx.db.enums import (
+    ConnectorCredentialPairStatus,
+    IndexingStatus,
+    VectorQuantization,
+)
 from onyx.db.llm import fetch_embedding_provider
-from onyx.db.models import CloudEmbeddingProvider
-from onyx.db.models import IndexAttempt
-from onyx.db.models import IndexModelStatus
-from onyx.db.models import SearchSettings
+from onyx.db.models import (
+    CloudEmbeddingProvider,
+    ConnectorCredentialPair,
+    IndexAttempt,
+    IndexModelStatus,
+    IndexReclaimStatus,
+    SearchSettings,
+)
+from onyx.error_handling.error_codes import OnyxErrorCode
+from onyx.error_handling.exceptions import OnyxError
 from onyx.server.manage.embedding.models import (
     CloudEmbeddingProvider as ServerCloudEmbeddingProvider,
 )
@@ -20,6 +32,11 @@ from shared_configs.configs import PRESERVED_SEARCH_FIELDS
 from shared_configs.enums import EmbeddingProvider
 
 logger = setup_logger()
+
+# search_settings columns that are NOT NULL but whose Pydantic source fields are
+# typed str | None. Registry-less cloud providers (e.g. Bedrock/LiteLLM/Azure)
+# can arrive without prefixes; coerce None -> "" to avoid a NotNullViolation.
+_NOT_NULL_STR_FIELDS = {"query_prefix", "passage_prefix"}
 
 
 class ActiveSearchSettings:
@@ -37,26 +54,42 @@ def create_search_settings(
     search_settings: SavedSearchSettings,
     db_session: Session,
     status: IndexModelStatus = IndexModelStatus.FUTURE,
+    # Default used only when the saved model omits use_port_flow (None). The reindex
+    # request never carries the flag (not a request field), so the endpoint opts in
+    # via this param; an explicit value on the saved model wins (e.g. a round-trip).
+    use_port_flow: bool = False,
+    # False flushes instead of committing, so the caller can commit this row
+    # atomically with its port seeds (a seedless FUTURE makes workers re-scan).
+    commit: bool = True,
 ) -> SearchSettings:
     embedding_model = SearchSettings(
         model_name=search_settings.model_name,
         model_dim=search_settings.model_dim,
         normalize=search_settings.normalize,
-        query_prefix=search_settings.query_prefix,
-        passage_prefix=search_settings.passage_prefix,
+        # See _NOT_NULL_STR_FIELDS: coerce None -> "" to avoid a NotNullViolation.
+        query_prefix=search_settings.query_prefix or "",
+        passage_prefix=search_settings.passage_prefix or "",
         status=status,
         index_name=search_settings.index_name,
         provider_type=search_settings.provider_type,
         multipass_indexing=search_settings.multipass_indexing,
-        embedding_precision=search_settings.embedding_precision,
         reduced_dimension=search_settings.reduced_dimension,
+        vector_quantization=search_settings.vector_quantization,
         enable_contextual_rag=search_settings.enable_contextual_rag,
         contextual_rag_model_configuration_id=search_settings.contextual_rag_model_configuration_id,
         switchover_type=search_settings.switchover_type,
+        use_port_flow=(
+            search_settings.use_port_flow
+            if search_settings.use_port_flow is not None
+            else use_port_flow
+        ),
     )
 
     db_session.add(embedding_model)
-    db_session.commit()
+    if commit:
+        db_session.commit()
+    else:
+        db_session.flush()  # populate id without committing
 
     return embedding_model
 
@@ -68,7 +101,7 @@ def get_embedding_provider_from_provider_type(
         CloudEmbeddingProvider.provider_type == provider_type
     )
     provider = db_session.execute(query).scalars().first()
-    return provider if provider else None
+    return provider or None
 
 
 def get_current_db_embedding_provider(
@@ -94,10 +127,19 @@ def get_current_db_embedding_provider(
 
 
 def delete_search_settings(db_session: Session, search_settings_id: int) -> None:
+    from onyx.db.port_attempt import is_active_port_backfill_source
+
     current_settings = get_current_search_settings(db_session)
 
     if current_settings.id == search_settings_id:
         raise ValueError("Cannot delete currently active search settings")
+
+    # A promoted index may still be backfilling its port from this one; deleting it
+    # would strand that port (SET NULL drops the source out from under it).
+    if is_active_port_backfill_source(db_session, search_settings_id):
+        raise ValueError(
+            "Cannot delete search settings: a reindex port is still backfilling from it"
+        )
 
     # First, delete associated index attempts
     index_attempts_query = delete(IndexAttempt).where(
@@ -117,12 +159,16 @@ def delete_search_settings(db_session: Session, search_settings_id: int) -> None
     db_session.commit()
 
 
-def get_current_search_settings(db_session: Session) -> SearchSettings:
+def get_current_search_settings(
+    db_session: Session, *, for_update: bool = False
+) -> SearchSettings:
     query = (
         select(SearchSettings)
         .where(SearchSettings.status == IndexModelStatus.PRESENT)
         .order_by(SearchSettings.id.desc())
     )
+    if for_update:
+        query = query.with_for_update()
     result = db_session.execute(query)
     latest_settings = result.scalars().first()
 
@@ -141,6 +187,96 @@ def get_secondary_search_settings(db_session: Session) -> SearchSettings | None:
     latest_settings = result.scalars().first()
 
     return latest_settings
+
+
+def get_search_settings_by_id(
+    db_session: Session, search_settings_id: int
+) -> SearchSettings | None:
+    return db_session.get(SearchSettings, search_settings_id)
+
+
+def lock_search_settings_for_share(
+    db_session: Session, search_settings_id: int
+) -> SearchSettings | None:
+    """The row under a share lock (SELECT ... FOR SHARE) until the transaction ends.
+    A swap's status flip waits for every holder, so a caller that reads `status`
+    here either commits before the flip or sees the post-flip status. Readers do
+    not block each other. The row is refreshed from the locked read: sessions keep
+    loaded rows across commits, and a stale PRESENT would defeat the lock."""
+    return (
+        db_session.execute(
+            select(SearchSettings)
+            .where(SearchSettings.id == search_settings_id)
+            .with_for_update(read=True)
+            .execution_options(populate_existing=True)
+        )
+        .scalars()
+        .first()
+    )
+
+
+REINDEX_BLOCKS_FULL_RUN_MESSAGE = (
+    "A re-index of the search index is in progress. Full re-index and backfill "
+    "requests are blocked until it completes."
+)
+
+
+def port_reindex_in_progress(db_session: Session) -> bool:
+    """A port-flow reindex is building a FUTURE index. A full re-index or a
+    backfill must not run then: it would add documents with old timestamps that
+    FUTURE's incremental polls never fetch. INSTANT and legacy reindexes do not
+    count. A request that slips in anyway waits in the beat, untouched, until
+    the swap (see _kickoff_indexing_tasks)."""
+    return active_secondary_port_target(db_session) is not None
+
+
+def raise_if_port_reindex_in_progress(db_session: Session) -> None:
+    """Refuse a full re-index or backfill during a port-flow reindex."""
+    if port_reindex_in_progress(db_session):
+        raise OnyxError(OnyxErrorCode.CONFLICT, REINDEX_BLOCKS_FULL_RUN_MESSAGE)
+
+
+def cc_pairs_with_full_run_in_progress(
+    db_session: Session, present_search_settings_id: int
+) -> list[tuple[int, str]]:
+    """(id, name) of cc_pairs with a running or queued PRESENT attempt from the
+    beginning, or a backfill attempt. A reindex started now could never catch up
+    with them (their documents carry old source timestamps), so
+    `set_new_search_settings` refuses while any exist. A queued request (REINDEX
+    trigger, full re-index or prune-after-reindex request, pending backfill) does
+    not count: the beat holds it until the swap (see port_reindex_in_progress)."""
+    rows = db_session.execute(
+        select(ConnectorCredentialPair.id, ConnectorCredentialPair.name)
+        .join(
+            IndexAttempt,
+            IndexAttempt.connector_credential_pair_id == ConnectorCredentialPair.id,
+        )
+        .where(
+            ConnectorCredentialPair.status != ConnectorCredentialPairStatus.DELETING,
+            IndexAttempt.search_settings_id == present_search_settings_id,
+            IndexAttempt.is_synthetic_seed.is_(False),
+            or_(
+                IndexAttempt.from_beginning.is_(True),
+                IndexAttempt.is_backfill.is_(True),
+            ),
+            IndexAttempt.status.in_(
+                [IndexingStatus.NOT_STARTED, IndexingStatus.IN_PROGRESS]
+            ),
+        )
+        .distinct()
+        .order_by(ConnectorCredentialPair.id)
+    )
+    return [(cc_pair_id, name or f"CC pair {cc_pair_id}") for cc_pair_id, name in rows]
+
+
+def active_secondary_port_target(db_session: Session) -> SearchSettings | None:
+    """The secondary index a reindex-port is populating (the dual-write target), or None.
+    Pure — never unpins a drained INSTANT source (unlike _resolve_port_target_settings).
+    None after an INSTANT swap: FUTURE was promoted to current, so the live pass covers it."""
+    secondary = get_secondary_search_settings(db_session)
+    if secondary is not None and secondary.use_port_flow:
+        return secondary
+    return None
 
 
 def get_active_search_settings(db_session: Session) -> ActiveSearchSettings:
@@ -183,6 +319,10 @@ def update_search_settings(
     mapped_columns = {c.key for c in sa_inspect(SearchSettings).mapper.columns}
     for field, value in updated_settings.model_dump().items():
         if field not in preserved_fields and field in mapped_columns:
+            # A client that explicitly sends null for a NOT NULL prefix column
+            # must not write NULL (NotNullViolation). See _NOT_NULL_STR_FIELDS.
+            if value is None and field in _NOT_NULL_STR_FIELDS:
+                value = ""
             setattr(current_settings, field, value)
 
 
@@ -218,12 +358,198 @@ def update_secondary_search_settings(
     logger.info("Secondary search settings updated successfully")
 
 
-def update_search_settings_status(
+def update_search_settings_status__no_commit(
     search_settings: SearchSettings, new_status: IndexModelStatus, db_session: Session
 ) -> None:
     search_settings.status = new_status
+    # Flush now so callers control the UPDATE order: the unique PRESENT index rejects
+    # a new PRESENT row while the old one is still PRESENT.
+    db_session.flush()
+
+
+def update_search_settings_status(
+    search_settings: SearchSettings, new_status: IndexModelStatus, db_session: Session
+) -> None:
+    update_search_settings_status__no_commit(search_settings, new_status, db_session)
+    db_session.commit()
+
+
+def update_search_settings_vector_quantization(
+    search_settings: SearchSettings,
+    vector_quantization: VectorQuantization,
+    db_session: Session,
+) -> None:
+    """Quantization is part of the index mapping: change it only before the
+    index of these settings exists."""
+    search_settings.vector_quantization = vector_quantization
     db_session.commit()
 
 
 def user_has_overridden_embedding_model() -> bool:
-    return DOCUMENT_ENCODER_MODEL != DEFAULT_DOCUMENT_ENCODER_MODEL
+    """True if env DOCUMENT_ENCODER_MODEL names a non-default model, for the alembic
+    seed (dbaa756c2ccf). nomic, the previous default, counts as a default so that
+    DOCUMENT_ENCODER_MODEL=nomic seeds the same rows as an install before granite."""
+    return DOCUMENT_ENCODER_MODEL not in (
+        DEFAULT_DOCUMENT_ENCODER_MODEL,
+        PREVIOUS_DEFAULT_DOCUMENT_ENCODER_MODEL,
+    )
+
+
+# Old-index reclamation (post-reindex deletion of the now-PAST index).
+# Reclaim lifecycle lives as columns on SearchSettings (see models.py). The mutation
+# helpers only touch the row; the caller owns the commit. The reclaim beat task drives
+# the state machine one step per tick.
+
+# States the beat task still acts on. BLOCKED is parked (alerted) and excluded.
+_ACTIONABLE_RECLAIM_STATUSES = [
+    IndexReclaimStatus.PENDING,
+    IndexReclaimStatus.SOAKING,
+    IndexReclaimStatus.DELETING,
+]
+# States whose index may still hold data.
+_NOT_RECLAIMED_STATUSES = [
+    status for status in IndexReclaimStatus if status != IndexReclaimStatus.RECLAIMED
+]
+
+
+def set_reclaim_intent_on_current__no_commit(
+    db_session: Session, consented_cc_pair_ids: list[int]
+) -> None:
+    """Mark the current PRESENT index (the future PAST) for reclamation at reindex
+    submit. Stores the consented not-ported cc_pairs. No-op if there is no PRESENT.
+    Caller commits (atomically with FUTURE creation)."""
+    # Nothing enforces a single PRESENT row any more, so this has to order like
+    # get_current_search_settings or it stamps the consent set on a row that never
+    # becomes the old index.
+    present = db_session.scalar(
+        select(SearchSettings)
+        .where(SearchSettings.status == IndexModelStatus.PRESENT)
+        .order_by(SearchSettings.id.desc())
+    )
+    if present is None:
+        return
+    present.reclaim_status = IndexReclaimStatus.PENDING
+    present.pending_cc_pair_deletions = consented_cc_pair_ids or None
+    present.reclaim_attempts = 0
+    present.reclaim_last_error = None
+
+
+def clear_reclaim_intent__no_commit(
+    db_session: Session, search_settings_id: int
+) -> None:
+    """Undo reclaim intent (e.g. reindex canceled before swap). Caller commits."""
+    ss = db_session.get(SearchSettings, search_settings_id)
+    if ss is None:
+        return
+    ss.reclaim_status = None
+    ss.reclaim_stopped_reading_at = None
+    ss.reclaim_attempts = 0
+    ss.reclaim_last_error = None
+    ss.pending_cc_pair_deletions = None
+
+
+def mark_abandoned_future_for_reclaim__no_commit(
+    abandoned_future: SearchSettings,
+) -> None:
+    """Mark a PAST index for immediate reclamation — a reverted/superseded FUTURE, or an
+    unreclaimed occupant whose index name a new reindex now needs. Jumps straight to
+    DELETING: the soak window + `_new_index_can_serve` gate exist for swapping out a *live*
+    index, which doesn't apply here (the data was never the live read path, or its name is
+    being reclaimed on demand). Caller commits."""
+    abandoned_future.reclaim_status = IndexReclaimStatus.DELETING
+    abandoned_future.reclaim_stopped_reading_at = None
+    abandoned_future.reclaim_attempts = 0
+    abandoned_future.reclaim_last_error = None
+    abandoned_future.pending_cc_pair_deletions = None
+
+
+def fetch_reclaimable_past_settings(
+    db_session: Session, limit: int
+) -> list[SearchSettings]:
+    """PAST indices still needing reclamation (PENDING/SOAKING/DELETING), oldest
+    first, capped at `limit`. BLOCKED rows are excluded (parked + alerted)."""
+    stmt = (
+        select(SearchSettings)
+        .where(
+            SearchSettings.status == IndexModelStatus.PAST,
+            SearchSettings.reclaim_status.in_(_ACTIONABLE_RECLAIM_STATUSES),
+        )
+        .order_by(SearchSettings.id)
+        .limit(limit)
+    )
+    return list(db_session.scalars(stmt))
+
+
+def advance_to_soaking__no_commit(search_settings: SearchSettings) -> bool:
+    """PENDING -> SOAKING: the index stopped being read; start the soak clock.
+    Anchors `reclaim_stopped_reading_at` to now (DB clock). No-op returning False
+    unless currently PENDING, so a repeat/out-of-order call can't re-stamp the anchor
+    and extend the soak. Caller commits."""
+    if search_settings.reclaim_status != IndexReclaimStatus.PENDING:
+        return False
+    search_settings.reclaim_status = IndexReclaimStatus.SOAKING
+    search_settings.reclaim_stopped_reading_at = func.now()
+    search_settings.reclaim_attempts = 0
+    search_settings.reclaim_last_error = None
+    return True
+
+
+def advance_to_deleting__no_commit(search_settings: SearchSettings) -> bool:
+    """SOAKING -> DELETING: soak elapsed + new index healthy. No-op returning False
+    unless currently SOAKING, so a call can't skip the soak. Caller commits."""
+    if search_settings.reclaim_status != IndexReclaimStatus.SOAKING:
+        return False
+    search_settings.reclaim_status = IndexReclaimStatus.DELETING
+    search_settings.reclaim_attempts = 0
+    search_settings.reclaim_last_error = None
+    return True
+
+
+def advance_to_reclaimed__no_commit(search_settings: SearchSettings) -> bool:
+    """DELETING -> RECLAIMED: the old index's data is gone. Terminal success — the PAST
+    row is KEPT as the durable record (we only delete the OpenSearch index, not the row).
+    No-op returning False unless currently DELETING. Caller commits."""
+    if search_settings.reclaim_status != IndexReclaimStatus.DELETING:
+        return False
+    search_settings.reclaim_status = IndexReclaimStatus.RECLAIMED
+    search_settings.reclaim_attempts = 0
+    search_settings.reclaim_last_error = None
+    return True
+
+
+def record_failure__no_commit(
+    search_settings: SearchSettings,
+    error: str,
+    max_attempts: int,
+) -> bool:
+    """Record a reclaim-step failure. Bumps the attempt counter; parks the row as
+    BLOCKED once it reaches `max_attempts`. Returns True if it is now BLOCKED.
+    Caller commits."""
+    search_settings.reclaim_attempts = (search_settings.reclaim_attempts or 0) + 1
+    search_settings.reclaim_last_error = error[:2000]
+    if search_settings.reclaim_attempts >= max_attempts:
+        search_settings.reclaim_status = IndexReclaimStatus.BLOCKED
+        return True
+    return False
+
+
+def find_unreclaimed_past_by_index_name(
+    db_session: Session, index_name: str
+) -> list[SearchSettings]:
+    """PAST rows whose index_name still holds data, so a new reindex must not take that
+    name. ALT_INDEX_SUFFIX alternation can hand a new FUTURE the same name as an old PAST,
+    and several generations can share one physical index.
+
+    A NULL reclaim_status counts too — those are rows from before reclamation existed,
+    whose index was never deleted. Only RECLAIMED means the data is confirmed gone.
+    RECLAIMED has two stored forms (see IndexReclaimStatusType), so this lists the
+    other statuses instead of comparing with RECLAIMED."""
+    stmt = select(SearchSettings).where(
+        SearchSettings.status == IndexModelStatus.PAST,
+        SearchSettings.index_name == index_name,
+        or_(
+            SearchSettings.reclaim_status.is_(None),
+            SearchSettings.reclaim_status.in_(_NOT_RECLAIMED_STATUSES),
+        ),
+    )
+    return list(db_session.scalars(stmt))

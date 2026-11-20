@@ -5,46 +5,22 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 )
 
-// Known container names for PostgreSQL in order of preference
-var postgresContainerNames = []string{
-	"onyx_postgres",                  // From restart_containers.sh
-	"onyx-relational_db-1",           // Docker compose default project name
-	"onyx-stack-relational_db-1",     // Docker compose with stack project name
-	"docker_compose-relational_db-1", // Legacy docker compose naming
-	"relational_db",                  // Service name only
-}
-
-// FindPostgresContainer finds a running PostgreSQL container.
-// It tries known container names first, then falls back to searching.
-func FindPostgresContainer() (string, error) {
-	// Try known names first
-	for _, name := range postgresContainerNames {
-		if isContainerRunning(name) {
-			return name, nil
-		}
+// FindPostgresContainer finds only the selected project's PostgreSQL container.
+func FindPostgresContainer(projectName string) (string, error) {
+	if strings.TrimSpace(projectName) == "" {
+		return "", fmt.Errorf("a PostgreSQL project must be selected")
+	}
+	projectName = NormalizeProjectName(projectName)
+	projectContainer := ContainerName(projectName, "relational_db")
+	if isContainerRunning(projectContainer) {
+		return projectContainer, nil
 	}
 
-	// Fall back to searching for any postgres container by image name
-	// Try multiple filters since the image name may vary (postgres, postgres:15.2-alpine, etc.)
-	cmd := exec.Command("docker", "ps", "--format", "{{.Names}}\t{{.Image}}")
-	output, err := cmd.Output()
-	if err == nil {
-		lines := strings.Split(strings.TrimSpace(string(output)), "\n")
-		for _, line := range lines {
-			parts := strings.Split(line, "\t")
-			if len(parts) >= 2 {
-				name, image := parts[0], parts[1]
-				if strings.Contains(image, "postgres") {
-					return name, nil
-				}
-			}
-		}
-	}
-
-	return "", fmt.Errorf("no running PostgreSQL container found. Try one of: %s", strings.Join(postgresContainerNames, ", "))
+	return "", fmt.Errorf("no running PostgreSQL container found for project %q; try: ods compose dev", projectName)
 }
 
 // isContainerRunning checks if a container with the given name is running.
@@ -67,7 +43,8 @@ func Exec(container string, args ...string) error {
 	return cmd.Run()
 }
 
-// ExecWithEnv runs a command inside a Docker container with environment variables.
+// ExecWithEnv runs a command inside a Docker container with environment
+// variables.
 func ExecWithEnv(container string, env map[string]string, args ...string) error {
 	dockerArgs := []string{"exec", "-i"}
 	for k, v := range env {
@@ -113,10 +90,11 @@ func CopyToContainer(container, src, dst string) error {
 	return cmd.Run()
 }
 
-// GetContainerIP returns the IP address of a container.
-// It returns the first available network IP if the container has multiple networks.
+// GetContainerIP returns the IP address of a container. It returns the first
+// available network IP if the container has multiple networks.
 func GetContainerIP(container string) (string, error) {
-	// Get IPs from the container's network settings (space-separated if multiple)
+	// Get IPs from the container's network settings (space-separated if
+	// multiple).
 	cmd := exec.Command("docker", "inspect", "-f",
 		"{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}", container)
 	output, err := cmd.Output()
@@ -133,30 +111,26 @@ func GetContainerIP(container string) (string, error) {
 	return ips[0], nil
 }
 
-// GetExposedPort returns the host port that maps to a container port, if any.
-// Returns empty string if the port is not exposed.
-func GetExposedPort(container string, containerPort string) string {
-	cmd := exec.Command("docker", "port", container, containerPort)
-	output, err := cmd.Output()
+// GetHostPort runs "docker port <container> <containerPort>" and returns the
+// host-side port number. Returns an error if the container is not running or the
+// port is not mapped.
+func GetHostPort(container string, containerPort int) (int, error) {
+	cmd := exec.Command("docker", "port", container, strconv.Itoa(containerPort))
+	out, err := cmd.Output()
 	if err != nil {
-		return ""
+		return 0, fmt.Errorf("docker port %s %d: %w", container, containerPort, err)
 	}
-
-	// Output format: "0.0.0.0:5432" or ":::5432"
-	result := strings.TrimSpace(string(output))
-	if result == "" {
-		return ""
+	line := strings.SplitN(strings.TrimSpace(string(out)), "\n", 2)[0]
+	if line == "" {
+		return 0, fmt.Errorf("port %d not exposed on %s", containerPort, container)
 	}
-
-	// Extract just the port number from "0.0.0.0:5432"
-	parts := strings.Split(result, ":")
-	if len(parts) >= 2 {
-		return parts[len(parts)-1]
+	parts := strings.Split(line, ":")
+	if len(parts) < 2 {
+		return 0, fmt.Errorf("unexpected docker port output: %s", line)
 	}
-	return ""
-}
-
-// IsPortExposed checks if a container port is exposed to the host.
-func IsPortExposed(container string, containerPort string) bool {
-	return GetExposedPort(container, containerPort) != ""
+	port, err := strconv.Atoi(parts[len(parts)-1])
+	if err != nil {
+		return 0, fmt.Errorf("invalid port number in docker port output: %s", line)
+	}
+	return port, nil
 }

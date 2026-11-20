@@ -13,13 +13,16 @@ Key features tested:
 - Edge cases (unicode, code blocks, invalid citations, etc.)
 """
 
+import time
 from datetime import datetime
 
 import pytest
 
-from onyx.chat.citation_processor import CitationMapping
-from onyx.chat.citation_processor import CitationMode
-from onyx.chat.citation_processor import DynamicCitationProcessor
+from onyx.chat.citation_processor import (
+    CitationMapping,
+    DynamicCitationProcessor,
+)
+from onyx.chat.models import CitationMode
 from onyx.configs.constants import DocumentSource
 from onyx.context.search.models import SearchDoc
 from onyx.server.query_and_chat.streaming_models import CitationInfo
@@ -355,8 +358,7 @@ def test_formatted_citation_yielded_separately(
 
     results = []
     for token in ["Text [", "1", "] here."]:
-        for result in processor.process_token(token):
-            results.append(result)
+        results.extend(processor.process_token(token))
 
     # Should have text chunks and formatted citation
     text_results = [r for r in results if isinstance(r, str)]
@@ -787,20 +789,177 @@ def test_citation_inside_code_block_not_processed(
 
     # Citation inside code block should not be processed
     assert len(citations) == 0
-    # Code block should have plaintext added
-    assert "```plaintext" in output
+    assert "```plaintext" not in output
 
 
-def test_code_block_plaintext_added(
+def test_bare_fences_left_untouched(
     mock_search_docs: CitationMapping,  # noqa: ARG001
 ) -> None:
-    """Test that code blocks with ``` followed by \\n get 'plaintext' added."""
+    """Fences pass through unchanged; the frontend labels bare openers."""
     processor = DynamicCitationProcessor()
 
-    tokens: list[str | None] = ["Code:\n```\n", "def test():\n    pass\n", "```\n"]
-    output, _ = process_tokens(processor, tokens)
+    text = "A:\n```\nx\n```\nB:\n```bash\necho hi\n```\nDone.\n"
+    output, _ = process_tokens(processor, [text[:20], text[20:]])
 
-    assert "```plaintext" in output
+    assert output == text
+
+
+def test_inline_backticks_in_prose_do_not_flip_code_state(
+    mock_search_docs: CitationMapping,
+) -> None:
+    """Inline ``` in prose must not make later closing fences look like
+    openers or suppress citations in prose."""
+    processor = DynamicCitationProcessor()
+    processor.update_citation_mapping({1: mock_search_docs[1]})
+
+    text = (
+        "Wrap code in ``` fences. Example:\n"
+        "```python\nprint('a')\n```\n"
+        "Prose between blocks [1].\n"
+        "```python\nprint('b')\n```\n"
+        "Done.\n"
+    )
+    # Stream character by character to exercise every split point.
+    output, citations = process_tokens(processor, list(text))
+
+    assert "```plaintext" not in output
+    assert output.count("```python\n") == 2
+    assert "print('a')\n```\nProse between blocks" in output
+    assert "print('b')\n```\nDone." in output
+    assert "[[1]](https://example.com/doc1)" in output
+    assert len(citations) == 1
+
+
+def test_longer_fence_wraps_triple_backticks(
+    mock_search_docs: CitationMapping,
+) -> None:
+    """A ```` fence stays open across inner ``` lines."""
+    processor = DynamicCitationProcessor()
+    processor.update_citation_mapping({1: mock_search_docs[1]})
+
+    text = "````markdown\n```\ninner [1]\n```\nstill code [1]\n````\nAfter [1].\n"
+    output, citations = process_tokens(processor, list(text))
+
+    assert "```plaintext" not in output
+    assert "inner [1]\n" in output
+    assert "still code [1]\n" in output
+    assert "After [[1]](https://example.com/doc1)" in output
+    assert len(citations) == 1
+
+
+def test_closing_fence_without_newline_resets_between_steps(
+    mock_search_docs: CitationMapping,
+) -> None:
+    """A step ending on a bare closing fence must not leave the reused
+    processor in code-block state for the next step."""
+    processor = DynamicCitationProcessor()
+    processor.update_citation_mapping({1: mock_search_docs[1]})
+
+    first, _ = process_tokens(processor, ["```python\nx = 1\n", "```"])
+    second, citations = process_tokens(processor, ["See [1]."])
+
+    assert first == "```python\nx = 1\n```"
+    assert second == "See [[1]](https://example.com/doc1)."
+    assert len(citations) == 1
+
+
+def test_code_state_is_decided_per_citation_in_one_chunk(
+    mock_search_docs: CitationMapping,
+) -> None:
+    """One chunk holding a code citation, the closing fence and a prose
+    citation must handle each citation by its own position."""
+    processor = DynamicCitationProcessor()
+    processor.update_citation_mapping({1: mock_search_docs[1]})
+
+    output, citations = process_tokens(
+        processor,
+        ["```\n", "print('[1]')\n```\nReal [1].\n```\nlate [1]\n```\n"],
+    )
+
+    assert output == (
+        "```\nprint('[1]')\n```\nReal [[1]](https://example.com/doc1).\n"
+        "```\nlate [1]\n```\n"
+    )
+    assert len(citations) == 1
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "1. Step:\n   ```\n   code [1]\n   ```\nAfter [1].\n",
+        "- ```python\n  code [1]\n  ```\nAfter [1].\n",
+        "> ```\n> code [1]\n> ```\nAfter [1].\n",
+        "~~~python\n```\ncode [1]\n```\n~~~\nAfter [1].\n",
+        "- item\n\n    ```\n    code [1]\n\n    ```\nAfter [1].\n",
+        "> ```\n> code [1]\nAfter [1].\n",
+        "- ```\n  code [1]\nAfter [1].\n",
+    ],
+    ids=[
+        "list-continuation",
+        "list-marker",
+        "blockquote",
+        "tilde",
+        "list-blank-line",
+        "blockquote-ends-block",
+        "list-outdent-ends-block",
+    ],
+)
+def test_container_and_tilde_fences(
+    mock_search_docs: CitationMapping, text: str
+) -> None:
+    processor = DynamicCitationProcessor()
+    processor.update_citation_mapping({1: mock_search_docs[1]})
+
+    output, citations = process_tokens(processor, list(text))
+
+    assert "code [1]\n" in output
+    assert "After [[1]](https://example.com/doc1)." in output
+    assert len(citations) == 1
+
+
+def test_tab_indented_code_in_list_item_stays_in_block(
+    mock_search_docs: CitationMapping,
+) -> None:
+    """Tabs expand to 4-column stops, so tab-indented code stays inside a
+    list item's fence."""
+    processor = DynamicCitationProcessor()
+    processor.update_citation_mapping({1: mock_search_docs[1]})
+
+    text = "- ```go\n\tfunc main() {\n\t\ta[1]\n\t}\n  ```\nAfter [1].\n"
+    output, citations = process_tokens(processor, list(text))
+
+    assert "\t\ta[1]\n" in output
+    assert "After [[1]](https://example.com/doc1)." in output
+    assert len(citations) == 1
+
+
+def test_unclosed_block_at_end_of_step_does_not_leak(
+    mock_search_docs: CitationMapping,
+) -> None:
+    """A step cut off inside a code block must not keep the next step's
+    citations raw."""
+    processor = DynamicCitationProcessor()
+    processor.update_citation_mapping({1: mock_search_docs[1]})
+
+    process_tokens(processor, ["```python\n", "x = [1]\n"])
+    second, citations = process_tokens(processor, ["See [1]."])
+
+    assert second == "See [[1]](https://example.com/doc1)."
+    assert len(citations) == 1
+
+
+def test_four_space_indented_fence_is_not_a_fence(
+    mock_search_docs: CitationMapping,
+) -> None:
+    """At top level, 4+ spaces of indent make an indented code block, not a
+    fence, so it must not flip code state."""
+    processor = DynamicCitationProcessor()
+    processor.update_citation_mapping({1: mock_search_docs[1]})
+
+    output, citations = process_tokens(processor, list("    ```\n    x\nAfter [1].\n"))
+
+    assert "After [[1]](https://example.com/doc1)." in output
+    assert len(citations) == 1
 
 
 def test_citation_outside_code_block_processed(
@@ -849,7 +1008,7 @@ def test_multiple_code_blocks(mock_search_docs: CitationMapping) -> None:
     ]
     output, citations = process_tokens(processor, tokens)
 
-    assert "```plaintext" in output
+    assert "```plaintext" not in output
     assert len(citations) == 1
 
 
@@ -865,12 +1024,10 @@ def test_stop_token_detection_stops_processing() -> None:
 
     results = []
     for token in ["Text ", "ST", "OP"]:
-        for result in processor.process_token(token):
-            results.append(result)
+        results.extend(processor.process_token(token))
 
     # Try to add more text after stop token
-    for result in processor.process_token(" more text"):
-        results.append(result)
+    results.extend(processor.process_token(" more text"))
 
     # Processing should stop at STOP token - no results after STOP
     output = "".join(r for r in results if isinstance(r, str))
@@ -885,8 +1042,7 @@ def test_partial_stop_token_held_back() -> None:
 
     results = []
     for token in ["Text ", "ST"]:
-        for result in processor.process_token(token):
-            results.append(result)
+        results.extend(processor.process_token(token))
 
     # Partial stop token should be held back
     output = "".join(r for r in results if isinstance(r, str))
@@ -902,8 +1058,7 @@ def test_stop_token_at_different_positions() -> None:
     processor1 = DynamicCitationProcessor(stop_stream=stop_stream)
     results1 = []
     for token in ["END"]:
-        for result in processor1.process_token(token):
-            results1.append(result)
+        results1.extend(processor1.process_token(token))
     # Stop token detection returns early, so no results
     output1 = "".join(r for r in results1 if isinstance(r, str))
     assert output1 == ""  # Stop token detected, no output
@@ -912,8 +1067,7 @@ def test_stop_token_at_different_positions() -> None:
     processor2 = DynamicCitationProcessor(stop_stream=stop_stream)
     results2 = []
     for token in ["Start ", "EN", "D"]:
-        for result in processor2.process_token(token):
-            results2.append(result)
+        results2.extend(processor2.process_token(token))
     output2 = "".join(r for r in results2 if isinstance(r, str))
     # "Start " should be processed before stop token is detected
     assert "Start " in output2
@@ -945,12 +1099,10 @@ def test_none_token_flushes_remaining_segment(
 
     results = []
     for token in ["Remaining ", "text"]:
-        for result in processor.process_token(token):
-            results.append(result)
+        results.extend(processor.process_token(token))
 
     # Flush with None
-    for result in processor.process_token(None):
-        results.append(result)
+    results.extend(processor.process_token(None))
 
     output = "".join(r for r in results if isinstance(r, str))
     assert "Remaining text" in output
@@ -1160,7 +1312,7 @@ def test_complex_text_mixed_citations_code_blocks(
     assert "[[1]](https://example.com/doc1)" in output
     assert "[[2]](https://example.com/doc2)" in output
     assert "[[3]]()" in output
-    assert "```plaintext" in output
+    assert "```plaintext" not in output
     assert len(citations) == 3
 
 
@@ -2419,3 +2571,87 @@ class TestKeepMarkersEdgeCases:
         assert len(citations) == 0
         # Should not be in seen citations
         assert 99 not in processor.get_seen_citations()
+
+
+class TestPossibleCitationPatternReDoS:
+    """Regression tests for catastrophic backtracking (ReDoS) in the
+    `possible_citation_pattern` used to hold back partial citations.
+
+    The original pattern `([\\[【［]+(?:\\d+,? ?)*$)` nested an unbounded `\\d+`
+    inside an unbounded `(?:...)*` with optional separators. A long run of digits
+    that fails the trailing `$` anchor (e.g. an opening bracket followed by many
+    digits and then a non-citation character) forced the engine to backtrack
+    through O(2^n) ways of splitting the digits, pinning a CPU core. An LLM can
+    emit such a token stream, so this is a remotely-triggerable DoS.
+    """
+
+    def test_long_digit_run_does_not_hang(self) -> None:
+        """A bracket followed by a long digit run + trailing junk must match
+        in well under a second. With the vulnerable pattern this took many
+        seconds and grew exponentially with the number of digits."""
+        processor = DynamicCitationProcessor()
+        # Opening bracket, 60 digits, then a char that defeats the `$` anchor.
+        # 60 digits => 2^59 paths for the vulnerable regex (effectively never
+        # finishes); the fixed regex is linear.
+        malicious = "[" + "1" * 60 + "!"
+
+        start = time.perf_counter()
+        match = processor.possible_citation_pattern.search(malicious)
+        elapsed = time.perf_counter() - start
+
+        # The fixed pattern resolves in microseconds; allow generous headroom
+        # for slow CI while still catching exponential blowup.
+        assert elapsed < 1.0, f"regex took {elapsed:.3f}s (possible ReDoS)"
+        # Trailing '!' means this is not a (closeable) partial citation.
+        assert match is None
+
+    def test_long_digit_run_in_token_stream_does_not_hang(self) -> None:
+        """End-to-end: feeding the malicious sequence through process_token
+        (which calls the regex on the accumulated segment) stays fast."""
+        processor = DynamicCitationProcessor()
+        tokens: list[str | None] = ["[" + "9" * 60 + "!"]
+
+        start = time.perf_counter()
+        output, citations = process_tokens(processor, tokens)
+        elapsed = time.perf_counter() - start
+
+        assert elapsed < 1.0, f"processing took {elapsed:.3f}s (possible ReDoS)"
+        # Not a real citation, so the text passes through unchanged.
+        assert output == "[" + "9" * 60 + "!"
+        assert citations == []
+
+    def test_partial_citations_still_detected(self) -> None:
+        """The fix must not regress detection of genuine partial citations
+        (the ones that could still be completed into a real citation)."""
+        partials = [
+            "text [",
+            "text [[",
+            "text [1",
+            "text [[1",
+            "text [1,",
+            "text [1, ",
+            "text [1, 2",
+            "text [12, 34, 5",
+            "text 【",
+            "text 【1",
+            "text ［1",
+        ]
+        for segment in partials:
+            assert (
+                DynamicCitationProcessor().possible_citation_pattern.search(segment)
+                is not None
+            ), f"expected {segment!r} to be treated as a possible citation"
+
+    def test_non_citations_not_matched(self) -> None:
+        """Text that can never become a citation must not be held back."""
+        non_partials = [
+            "no citation here",
+            "ends with a number 5",
+            "[1]",  # already complete, handled by citation_pattern
+            "[1, 2]",
+        ]
+        for segment in non_partials:
+            assert (
+                DynamicCitationProcessor().possible_citation_pattern.search(segment)
+                is None
+            ), f"expected {segment!r} to NOT be treated as a possible citation"

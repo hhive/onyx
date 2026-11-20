@@ -1,58 +1,53 @@
-import mimetypes
 import os
 import time
-from collections.abc import Mapping
-from datetime import datetime
-from datetime import timezone
-from io import BytesIO
+from collections.abc import Iterator, Mapping
+from datetime import datetime, timezone
 from numbers import Integral
-from typing import Any
-from typing import Optional
+from typing import TYPE_CHECKING, Any, Optional
 from urllib.parse import quote
 
 import boto3
 from botocore.client import Config
 from botocore.credentials import RefreshableCredentials
-from botocore.exceptions import ClientError
-from botocore.exceptions import NoCredentialsError
-from botocore.exceptions import PartialCredentialsError
+from botocore.exceptions import ClientError, NoCredentialsError, PartialCredentialsError
 from botocore.session import get_session
-from mypy_boto3_s3 import S3Client
 
-from onyx.configs.app_configs import BLOB_STORAGE_SIZE_THRESHOLD
-from onyx.configs.app_configs import INDEX_BATCH_SIZE
-from onyx.configs.constants import BlobType
-from onyx.configs.constants import DocumentSource
-from onyx.configs.constants import FileOrigin
-from onyx.connectors.cross_connector_utils.miscellaneous_utils import (
-    process_onyx_metadata,
+from onyx.configs.app_configs import (
+    BLOB_STORAGE_SIZE_THRESHOLD,
+    INDEX_BATCH_SIZE,
 )
-from onyx.connectors.cross_connector_utils.tabular_section_utils import (
-    extract_and_stage_tabular_file,
+from onyx.configs.constants import BlobType, DocumentSource
+from onyx.connectors.cross_connector_utils.storage_file_document import (
+    build_storage_file_document,
 )
-from onyx.connectors.cross_connector_utils.tabular_section_utils import is_tabular_file
-from onyx.connectors.cross_connector_utils.tabular_section_utils import (
-    tabular_file_to_sections,
+from onyx.connectors.exceptions import (
+    ConnectorValidationError,
+    CredentialExpiredError,
+    InsufficientPermissionsError,
+    UnexpectedValidationError,
 )
-from onyx.connectors.exceptions import ConnectorValidationError
-from onyx.connectors.exceptions import CredentialExpiredError
-from onyx.connectors.exceptions import InsufficientPermissionsError
-from onyx.connectors.exceptions import UnexpectedValidationError
-from onyx.connectors.interfaces import GenerateDocumentsOutput
-from onyx.connectors.interfaces import LoadConnector
-from onyx.connectors.interfaces import PollConnector
-from onyx.connectors.interfaces import SecondsSinceUnixEpoch
-from onyx.connectors.models import ConnectorMissingCredentialError
-from onyx.connectors.models import Document
-from onyx.connectors.models import HierarchyNode
-from onyx.connectors.models import ImageSection
-from onyx.connectors.models import TabularSection
-from onyx.connectors.models import TextSection
-from onyx.file_processing.extract_file_text import extract_text_and_images
+from onyx.connectors.interfaces import (
+    GenerateDocumentsOutput,
+    GenerateSlimDocumentOutput,
+    LoadConnector,
+    PollConnector,
+    SecondsSinceUnixEpoch,
+    SlimConnector,
+)
+from onyx.connectors.models import (
+    ConnectorMissingCredentialError,
+    Document,
+    HierarchyNode,
+    SlimDocument,
+    TextSection,
+)
 from onyx.file_processing.extract_file_text import get_file_ext
 from onyx.file_processing.file_types import OnyxFileExtensions
-from onyx.file_processing.image_utils import store_image_and_create_section
+from onyx.indexing.indexing_heartbeat import IndexingHeartbeatInterface
 from onyx.utils.logger import setup_logger
+
+if TYPE_CHECKING:
+    from mypy_boto3_s3 import S3Client
 
 logger = setup_logger()
 
@@ -61,7 +56,7 @@ DOWNLOAD_CHUNK_SIZE = 1024 * 1024
 SIZE_THRESHOLD_BUFFER = 64
 
 
-class BlobStorageConnector(LoadConnector, PollConnector):
+class BlobStorageConnector(LoadConnector, PollConnector, SlimConnector):
     def __init__(
         self,
         bucket_type: str,
@@ -69,16 +64,23 @@ class BlobStorageConnector(LoadConnector, PollConnector):
         prefix: str = "",
         batch_size: int = INDEX_BATCH_SIZE,
         european_residency: bool = False,
+        region_name: str | None = None,
     ) -> None:
         self.bucket_type: BlobType = BlobType(bucket_type)
         self.bucket_name = bucket_name.strip()
         self.prefix = prefix if not prefix or prefix.endswith("/") else prefix + "/"
         self.batch_size = batch_size
-        self.s3_client: Optional[S3Client] = None
+        self.s3_client: Optional["S3Client"] = None
         self._allow_images: bool | None = None
         self.size_threshold: int | None = BLOB_STORAGE_SIZE_THRESHOLD
         self.bucket_region: Optional[str] = None
         self.european_residency: bool = european_residency
+        # Explicit AWS region for the S3 (and STS) clients. Required for buckets in
+        # non-default partitions (e.g. GovCloud's us-gov-west-1) — without it boto3
+        # falls back to the commercial partition and credentials fail to validate.
+        self.region_name: str | None = (
+            region_name.strip() if region_name and region_name.strip() else None
+        )
 
     def set_allow_images(  # ty: ignore[invalid-method-override]
         self, allow_images: bool
@@ -170,7 +172,7 @@ class BlobStorageConnector(LoadConnector, PollConnector):
                     aws_access_key_id=credentials["aws_access_key_id"],
                     aws_secret_access_key=credentials["aws_secret_access_key"],
                 )
-                self.s3_client = session.client("s3")
+                self.s3_client = session.client("s3", region_name=self.region_name)
             elif authentication_method == "iam_role":
                 # If using IAM roles, we assume the role and let boto3 handle the credentials.
                 role_arn = credentials.get("aws_role_arn")
@@ -182,7 +184,9 @@ class BlobStorageConnector(LoadConnector, PollConnector):
 
                 def _refresh_credentials() -> dict[str, str]:
                     """Refreshes the credentials for the assumed role."""
-                    sts_client = boto3.client("sts")
+                    # STS endpoints are partition-specific, so the region must be
+                    # forwarded here as well or GovCloud role assumption fails.
+                    sts_client = boto3.client("sts", region_name=self.region_name)
                     assumed_role_object = sts_client.assume_role(
                         RoleArn=role_arn,
                         RoleSessionName=f"onyx_blob_storage_{int(time.time())}",
@@ -205,11 +209,11 @@ class BlobStorageConnector(LoadConnector, PollConnector):
                     refreshable
                 )
                 session = boto3.Session(botocore_session=botocore_session)
-                self.s3_client = session.client("s3")
+                self.s3_client = session.client("s3", region_name=self.region_name)
             elif authentication_method == "assume_role":
                 # We will assume the instance role to access S3.
                 logger.debug("Using instance role authentication for S3 bucket.")
-                self.s3_client = boto3.client("s3")
+                self.s3_client = boto3.client("s3", region_name=self.region_name)
             else:
                 raise ConnectorValidationError("Invalid authentication method for S3. ")
 
@@ -323,6 +327,9 @@ class BlobStorageConnector(LoadConnector, PollConnector):
 
         elif self.bucket_type == BlobType.S3:
             region = self.bucket_region or self.s3_client.meta.region_name
+            # GovCloud has its own console domain
+            if region and region.startswith("us-gov-"):
+                return f"https://console.amazonaws-us-gov.com/s3/object/{self.bucket_name}?region={region}&prefix={encoded_key}"
             return f"https://s3.console.aws.amazon.com/s3/object/{self.bucket_name}?region={region}&prefix={encoded_key}"
 
         elif self.bucket_type == BlobType.GOOGLE_CLOUD_STORAGE:
@@ -382,197 +389,96 @@ class BlobStorageConnector(LoadConnector, PollConnector):
 
         return None
 
+    def _document_id(self, key: str) -> str:
+        return f"{self.bucket_type}:{self.bucket_name}:{key}"
+
+    def _iter_object_pages(self) -> Iterator[list[Mapping[str, Any]]]:
+        """Each listing page of file objects under the prefix."""
+        if self.s3_client is None:
+            raise ConnectorMissingCredentialError("Blob storage")
+
+        paginator = self.s3_client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=self.bucket_name, Prefix=self.prefix):
+            yield [
+                obj for obj in page.get("Contents", []) if not obj["Key"].endswith("/")
+            ]
+
+    def _is_indexable_object(self, obj: Mapping[str, Any]) -> bool:
+        """The skips that need only listing metadata, shared by indexing and
+        pruning so both see the same set of objects."""
+        key: str = obj["Key"]
+        file_name = os.path.basename(key)
+
+        size_bytes = self._extract_size_bytes(obj)
+        if (
+            self.size_threshold is not None
+            and isinstance(size_bytes, int)
+            and size_bytes > self.size_threshold
+        ):
+            logger.warning(
+                "%s exceeds size threshold of %s. Skipping.",
+                file_name,
+                self.size_threshold,
+            )
+            return False
+
+        if (
+            get_file_ext(file_name) in OnyxFileExtensions.IMAGE_EXTENSIONS
+            and not self._allow_images
+        ):
+            logger.debug(
+                "Skipping image file: %s (image processing not enabled)",
+                key,
+            )
+            return False
+
+        return True
+
     def _yield_blob_objects(
         self,
         start: datetime,
         end: datetime,
     ) -> GenerateDocumentsOutput:
-        if self.s3_client is None:
-            raise ConnectorMissingCredentialError("Blob storage")
-
-        paginator = self.s3_client.get_paginator("list_objects_v2")
-        pages = paginator.paginate(Bucket=self.bucket_name, Prefix=self.prefix)
-
         batch: list[Document | HierarchyNode] = []
-        for page in pages:
-            if "Contents" not in page:
-                continue
-
-            for obj in page["Contents"]:
-                if obj["Key"].endswith("/"):
-                    continue
-
+        for objects in self._iter_object_pages():
+            for obj in objects:
                 last_modified = obj["LastModified"].replace(tzinfo=timezone.utc)
 
                 if not start <= last_modified <= end:
                     continue
 
-                file_name = os.path.basename(obj["Key"])
-                file_ext = get_file_ext(file_name)
+                if not self._is_indexable_object(obj):
+                    continue
+
                 key = obj["Key"]
+                file_name = os.path.basename(key)
                 link = self._get_blob_link(key)
 
-                size_bytes = self._extract_size_bytes(obj)
-                if (
-                    self.size_threshold is not None
-                    and isinstance(size_bytes, int)
-                    and self.size_threshold is not None
-                    and size_bytes > self.size_threshold
-                ):
-                    logger.warning(
-                        "%s exceeds size threshold of %s. Skipping.",
-                        file_name,
-                        self.size_threshold,
-                    )
-                    continue
-
-                # Handle image files
-                if file_ext in OnyxFileExtensions.IMAGE_EXTENSIONS:
-                    if not self._allow_images:
-                        logger.debug(
-                            "Skipping image file: %s (image processing not enabled)",
-                            key,
-                        )
-                        continue
-
-                    # Process the image file
-                    try:
-                        downloaded_file = self._download_object(key)
-                        if downloaded_file is None:
-                            continue
-
-                        # TODO: Refactor to avoid direct DB access in connector
-                        # This will require broader refactoring across the codebase
-                        image_section, _ = store_image_and_create_section(
-                            image_data=downloaded_file,
-                            file_id=f"{self.bucket_type}_{self.bucket_name}_{key.replace('/', '_')}",
-                            display_name=file_name,
-                            link=link,
-                            file_origin=FileOrigin.CONNECTOR,
-                        )
-
-                        batch.append(
-                            Document(
-                                id=f"{self.bucket_type}:{self.bucket_name}:{key}",
-                                sections=[image_section],
-                                source=DocumentSource(self.bucket_type.value),
-                                semantic_identifier=file_name,
-                                doc_updated_at=last_modified,
-                                metadata={},
-                            )
-                        )
-
-                        if len(batch) == self.batch_size:
-                            yield batch
-                            batch = []
-                    except Exception:
-                        logger.exception("Error processing image %s", key)
-                    continue
-
-                # Handle tabular files (xlsx, csv, tsv) — produce one
-                # TabularSection per sheet (or per file for csv/tsv)
-                # instead of a flat TextSection.
-                if is_tabular_file(file_name):
-                    try:
-                        downloaded_file = self._download_object(key)
-                        if downloaded_file is None:
-                            continue
-                        tabular_sections: list[TabularSection] = []
-                        staged_file_id: str | None = None
-                        if self.raw_file_callback is not None:
-                            content_type, _ = mimetypes.guess_type(file_name)
-                            result = extract_and_stage_tabular_file(
-                                file=BytesIO(downloaded_file),
-                                file_name=file_name,
-                                content_type=content_type or "application/octet-stream",
-                                raw_file_callback=self.raw_file_callback,
-                                link=link,
-                            )
-                            tabular_sections = result.sections
-                            staged_file_id = result.staged_file_id
-                        else:
-                            tabular_sections = tabular_file_to_sections(
-                                BytesIO(downloaded_file),
-                                file_name=file_name,
-                                link=link,
-                            )
-                        batch.append(
-                            Document(
-                                id=f"{self.bucket_type}:{self.bucket_name}:{key}",
-                                sections=(
-                                    tabular_sections
-                                    if tabular_sections
-                                    else [TabularSection(link=link, text="")]
-                                ),
-                                source=DocumentSource(self.bucket_type.value),
-                                semantic_identifier=file_name,
-                                doc_updated_at=last_modified,
-                                metadata={},
-                                file_id=staged_file_id,
-                            )
-                        )
-                        if len(batch) == self.batch_size:
-                            yield batch
-                            batch = []
-                    except Exception:
-                        logger.exception("Error processing tabular file %s", key)
-                    continue
-
-                # Handle text and document files
                 try:
                     downloaded_file = self._download_object(key)
                     if downloaded_file is None:
                         continue
-                    extraction_result = extract_text_and_images(
-                        BytesIO(downloaded_file), file_name=file_name
+                    document = build_storage_file_document(
+                        file_bytes=downloaded_file,
+                        file_name=file_name,
+                        document_id=self._document_id(key),
+                        source=DocumentSource(self.bucket_type.value),
+                        link=link,
+                        last_modified=last_modified,
+                        image_file_id=f"{self.bucket_type}_{self.bucket_name}_{key.replace('/', '_')}",
+                        raw_file_callback=self.raw_file_callback,
+                        include_embedded_images=False,
                     )
-
-                    onyx_metadata, custom_tags = process_onyx_metadata(
-                        extraction_result.metadata
-                    )
-                    file_display_name = onyx_metadata.file_display_name or file_name
-                    time_updated = onyx_metadata.doc_updated_at or last_modified
-                    link = onyx_metadata.link or link
-                    primary_owners = onyx_metadata.primary_owners
-                    secondary_owners = onyx_metadata.secondary_owners
-                    source_type = onyx_metadata.source_type or DocumentSource(
-                        self.bucket_type.value
-                    )
-
-                    sections: list[TextSection | ImageSection] = []
-                    if extraction_result.text_content.strip():
-                        logger.debug(
-                            "Creating TextSection for %s with link: %s", file_name, link
-                        )
-                        sections.append(
-                            TextSection(
-                                link=link,
-                                text=extraction_result.text_content.strip(),
-                            )
-                        )
-
-                    batch.append(
-                        Document(
-                            id=f"{self.bucket_type}:{self.bucket_name}:{key}",
-                            sections=(
-                                sections
-                                if sections
-                                else [TextSection(link=link, text="")]
-                            ),
-                            source=source_type,
-                            semantic_identifier=file_display_name,
-                            doc_updated_at=time_updated,
-                            metadata=custom_tags,
-                            primary_owners=primary_owners,
-                            secondary_owners=secondary_owners,
-                        )
-                    )
-                    if len(batch) == self.batch_size:
-                        yield batch
-                        batch = []
-
                 except Exception:
-                    logger.exception("Error decoding object %s as UTF-8", key)
+                    logger.exception("Error processing object %s", key)
+                    continue
+                if document is None:
+                    continue
+
+                batch.append(document)
+                if len(batch) == self.batch_size:
+                    yield batch
+                    batch = []
         if batch:
             yield batch
 
@@ -596,6 +502,29 @@ class BlobStorageConnector(LoadConnector, PollConnector):
             yield batch
 
         return None
+
+    def retrieve_all_slim_docs(
+        self,
+        start: SecondsSinceUnixEpoch | None = None,  # noqa: ARG002
+        end: SecondsSinceUnixEpoch | None = None,  # noqa: ARG002
+        callback: IndexingHeartbeatInterface | None = None,
+    ) -> GenerateSlimDocumentOutput:
+        """Every indexable object under the prefix, from the key listing only.
+
+        Ignores the window: a prune deletes each indexed document this does not
+        list. Objects that fail to download stay listed, so they are kept.
+        """
+        for objects in self._iter_object_pages():
+            # A partial listing would read as deleted objects, so stopping raises.
+            if callback is not None and callback.should_stop():
+                raise RuntimeError("Blob storage slim listing: stop signal detected")
+            batch: list[SlimDocument | HierarchyNode] = [
+                SlimDocument(id=self._document_id(obj["Key"]))
+                for obj in objects
+                if self._is_indexable_object(obj)
+            ]
+            if batch:
+                yield batch
 
     def validate_connector_settings(self) -> None:
         if self.s3_client is None:
@@ -627,10 +556,20 @@ class BlobStorageConnector(LoadConnector, PollConnector):
             error_code = e.response["Error"].get("Code", "")
             status_code = e.response["ResponseMetadata"].get("HTTPStatusCode")
 
+            # Credential rejections. These commonly mean the request reached the
+            # wrong AWS partition (e.g. a GovCloud bucket addressed through the
+            # commercial endpoint due to a missing/incorrect region) rather than
+            # a bucket-policy problem, so don't lump them in with AccessDenied.
+            if error_code in ["InvalidAccessKeyId", "InvalidToken"]:
+                raise CredentialExpiredError(
+                    f"Blob storage credentials were rejected (code={error_code}). "
+                    "Verify the credentials and that the configured AWS region matches "
+                    "the bucket's partition (e.g. us-gov-west-1 for GovCloud buckets)."
+                )
+
             # Most common S3 error cases
             if error_code in [
                 "AccessDenied",
-                "InvalidAccessKeyId",
                 "SignatureDoesNotMatch",
             ]:
                 if status_code == 403 or error_code == "AccessDenied":

@@ -1,34 +1,34 @@
 import re
 from datetime import datetime
 from enum import Enum
-from typing import Any
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+from uuid import UUID
 
-from pydantic import BaseModel
-from pydantic import ConfigDict
-from pydantic import Field
-from pydantic import field_validator
-from pydantic import model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from onyx.auth.schemas import UserRole
-from onyx.configs.app_configs import TRACK_EXTERNAL_IDP_EXPIRY
-from onyx.configs.constants import AuthType
-from onyx.context.search.models import SavedSearchSettings
-from onyx.db.enums import DefaultAppMode
-from onyx.db.enums import ThemePreference
+from onyx.auth.permissions import SCOPED_MANAGER_PERMISSIONS_EXPANDED
+from onyx.configs.constants import FASTAPI_USERS_AUTH_COOKIE_NAME
+from onyx.context.search.models import CCPairAccessMode, SavedSearchSettings
+from onyx.db.enums import (
+    AccountType,
+    DefaultAppMode,
+    SSOProviderType,
+    SupportedLanguage,
+    ThemePreference,
+    VectorQuantization,
+)
 from onyx.db.memory import MAX_MEMORIES_PER_USER
-from onyx.db.models import AllowedAnswerFilters
-from onyx.db.models import ChannelConfig
+from onyx.db.models import AllowedAnswerFilters, ChannelConfig, User
 from onyx.db.models import SlackBot as SlackAppModel
 from onyx.db.models import SlackChannelConfig as SlackChannelConfigModel
 from onyx.db.models import StandardAnswer as StandardAnswerModel
 from onyx.db.models import StandardAnswerCategory as StandardAnswerCategoryModel
-from onyx.db.models import User
+from onyx.db.port_attempt import ReindexProgressCounts
+from onyx.db.skill_models import PluginRename
+from onyx.llm.models import ReasoningEffort
 from onyx.onyxbot.slack.config import VALID_SLACK_FILTERS
-from onyx.server.features.persona.models import FullPersonaSnapshot
-from onyx.server.features.persona.models import PersonaSnapshot
-from onyx.server.models import FullUserSnapshot
-from onyx.server.models import InvitedUserSnapshot
+from onyx.server.features.persona.models import FullPersonaSnapshot, PersonaSnapshot
+from onyx.server.models import FullUserSnapshot, InvitedUserSnapshot
 
 if TYPE_CHECKING:
     pass
@@ -46,24 +46,88 @@ class BulkInviteResponse(BaseModel):
     email_invite_status: EmailInviteStatus
 
 
+class UserPermissionsResponse(BaseModel):
+    # The user's global effective permissions (implication-expanded).
+    permissions: list[str]
+    # Whether the user manages any group, plus the ids of those groups — lets the
+    # frontend reveal manager nav. Not a security boundary (backend GATE 2 enforces).
+    is_manager: bool
+    managed_group_ids: list[int]
+
+
 class VersionResponse(BaseModel):
     backend_version: str
 
 
-class AuthTypeResponse(BaseModel):
-    auth_type: AuthType
+class SSOProviderOption(BaseModel):
+    # No sensitive config. Allowed domains stay server-side so the public login
+    # page does not enumerate the participating companies' domains.
+    name: str
+    display_name: str
+    provider_type: SSOProviderType
+    authorize_url: str
+    # The authorize URL takes the native-app SSO parameters (desktop, mobile), so
+    # an app can sign in through the system browser. SAML cannot yet.
+    native_app_sso: bool
+
+
+class AuthConfigResponse(BaseModel):
+    # Cloud (multi-tenant) signup provisions a tenant and offers Google login.
+    multi_tenant: bool
     # specifies whether the current auth setup requires
     # users to have verified emails
     requires_verification: bool
     anonymous_user_enabled: bool | None = None
     password_min_length: int
+    password_max_length: int
+    password_require_uppercase: bool = False
+    password_require_lowercase: bool = False
+    password_require_digit: bool = False
+    password_require_special_char: bool = False
     # whether there are any users in the system
     has_users: bool = True
     oauth_enabled: bool = False
+    # Kill switch (single-tenant). UI hint only, the backend guards enforce.
+    password_auth_enabled: bool = True
+    # Enabled DB-backed SSO providers, one login button each. Empty on cloud and
+    # on instances with no provider rows, so the page falls back to the built-in
+    # password (and Google when oauth_enabled) login.
+    sso_providers: list[SSOProviderOption] = []
+    # The session cookie's name (AUTH_COOKIE_NAME). Native apps sign in with a
+    # bearer token and hand it to their embedded web UI under this name.
+    auth_cookie_name: str = FASTAPI_USERS_AUTH_COOKIE_NAME
+    # Workspace UI language for signed-out pages, which cannot read GET /settings
+    # unless anonymous access is on. None on cloud, which has no tenant yet.
+    default_language: SupportedLanguage | None = None
 
 
 class UserSpecificAssistantPreference(BaseModel):
-    disabled_tool_ids: list[int]
+    # The built-in tools and the integrations that the user turned off for
+    # the agent. None on a write keeps the saved list.
+    disabled_tool_ids: list[int] | None = None
+    disabled_integration_ids: list[int] | None = None
+    # The integration ids as text, for the released mobile app. A write
+    # reads it when disabled_integration_ids is not sent and each value is
+    # an integration id.
+    disabled_plugin_ids: list[str] | None = None
+
+    @model_validator(mode="after")
+    def _one_list_of_integrations(self) -> "UserSpecificAssistantPreference":
+        # A plugin id from before the upgrade (a UUID) maps to no integration.
+        # Then the write keeps the saved list rather than replace it in part.
+        if (
+            self.disabled_integration_ids is None
+            and self.disabled_plugin_ids is not None
+            and all(value.isdecimal() for value in self.disabled_plugin_ids)
+        ):
+            self.disabled_integration_ids = [
+                int(value) for value in self.disabled_plugin_ids
+            ]
+        if self.disabled_integration_ids is not None:
+            self.disabled_plugin_ids = [
+                str(value) for value in self.disabled_integration_ids
+            ]
+        return self
 
 
 UserSpecificAssistantPreferences = dict[int, UserSpecificAssistantPreference]
@@ -74,18 +138,24 @@ class UserPreferences(BaseModel):
     hidden_assistants: list[int] = []
     visible_assistants: list[int] = []
     default_model: str | None = None
-    pinned_assistants: list[int] | None = None
+    # Always a list. A user with no pins has an empty one; there is no
+    # meaningful null here, and the frontend used to branch on it.
+    pinned_assistants: list[int] = []
     shortcut_enabled: bool | None = None
 
     # These will default to workspace settings on the frontend if not set
     auto_scroll: bool | None = None
     temperature_override_enabled: bool | None = None
+    temperature_default: float | None = None
+    reasoning_effort_default: ReasoningEffort | None = None
     theme_preference: ThemePreference | None = None
+    language: str | None = None
     chat_background: str | None = None
     default_app_mode: DefaultAppMode = DefaultAppMode.CHAT
 
     # Input preferences
     paste_as_tile: bool | None = None
+    interrupt_on_send: bool = False
 
     # Voice preferences
     voice_auto_send: bool | None = None
@@ -120,36 +190,53 @@ class TenantInfo(BaseModel):
     new_tenant: TenantSnapshot | None = None
 
 
+def _admin_capabilities(
+    effective_permissions: list[str], is_group_manager: bool
+) -> list[str]:
+    """Admin-area reach = effective tokens plus the scoped manager bundle when the user
+    manages any group. ``effective_permissions`` itself stays global-only, so org-wide
+    gates that read it still exclude managers. Affordance hint, never an authz input."""
+    caps = set(effective_permissions)
+    if is_group_manager:
+        caps |= SCOPED_MANAGER_PERMISSIONS_EXPANDED
+    return sorted(caps)
+
+
 class UserInfo(BaseModel):
     id: str
     email: str
     is_active: bool
     is_superuser: bool
     is_verified: bool
-    role: UserRole
+    account_type: AccountType = AccountType.STANDARD
     preferences: UserPreferences
     personalization: UserPersonalization = Field(default_factory=UserPersonalization)
-    oidc_expiry: datetime | None = None
-    current_token_created_at: datetime | None = None
-    current_token_expiry_length: int | None = None
+    token_expires_at: datetime | None = None
     is_cloud_superuser: bool = False
     team_name: str | None = None
     is_anonymous_user: bool | None = None
     password_configured: bool | None = None
     tenant_info: TenantInfo | None = None
+    effective_permissions: list[str] = Field(default_factory=list)
+    # True if the user manages any group — lets the client reveal manager nav.
+    # Not a security boundary (backend GATE 2 enforces scope).
+    is_group_manager: bool = False
+    # effective tokens plus the scoped bundle for a manager; drives admin-nav reveal
+    admin_capabilities: list[str] = Field(default_factory=list)
 
     @classmethod
     def from_model(
         cls,
         user: User,
-        current_token_created_at: datetime | None = None,
-        expiry_length: int | None = None,
+        *,
+        token_expires_at: datetime | None = None,
         is_cloud_superuser: bool = False,
         team_name: str | None = None,
         is_anonymous_user: bool | None = None,
         tenant_info: TenantInfo | None = None,
         assistant_specific_configs: UserSpecificAssistantPreferences | None = None,
         memories: list[MemoryItem] | None = None,
+        effective_permissions: list[str] | None = None,
     ) -> "UserInfo":
         return cls(
             id=str(user.id),
@@ -157,7 +244,7 @@ class UserInfo(BaseModel):
             is_active=user.is_active,
             is_superuser=user.is_superuser,
             is_verified=user.is_verified,
-            role=user.role,
+            account_type=user.account_type,
             password_configured=user.password_configured,
             preferences=(
                 UserPreferences(
@@ -165,14 +252,20 @@ class UserInfo(BaseModel):
                     chosen_assistants=user.chosen_assistants,
                     default_model=user.default_model,
                     hidden_assistants=user.hidden_assistants,
-                    pinned_assistants=user.pinned_assistants,
+                    pinned_assistants=[
+                        pinned.persona_id for pinned in user.pinned_personas
+                    ],
                     visible_assistants=user.visible_assistants,
                     auto_scroll=user.auto_scroll,
                     temperature_override_enabled=user.temperature_override_enabled,
+                    temperature_default=user.temperature_default,
+                    reasoning_effort_default=user.reasoning_effort_default,
                     theme_preference=user.theme_preference,
+                    language=user.language,
                     chat_background=user.chat_background,
                     default_app_mode=user.default_app_mode,
                     paste_as_tile=user.paste_as_tile,
+                    interrupt_on_send=user.interrupt_on_send,
                     voice_auto_send=user.voice_auto_send,
                     voice_auto_playback=user.voice_auto_playback,
                     voice_playback_speed=user.voice_playback_speed,
@@ -180,16 +273,15 @@ class UserInfo(BaseModel):
                 )
             ),
             team_name=team_name,
-            # set to None if TRACK_EXTERNAL_IDP_EXPIRY is False so that we avoid cases
-            # where they previously had this set + used OIDC, and now they switched to
-            # basic auth are now constantly getting redirected back to the login page
-            # since their "oidc_expiry is old"
-            oidc_expiry=user.oidc_expiry if TRACK_EXTERNAL_IDP_EXPIRY else None,
-            current_token_created_at=current_token_created_at,
-            current_token_expiry_length=expiry_length,
+            token_expires_at=token_expires_at,
             is_cloud_superuser=is_cloud_superuser,
             is_anonymous_user=is_anonymous_user,
             tenant_info=tenant_info,
+            effective_permissions=effective_permissions or [],
+            is_group_manager=user.is_group_manager,
+            admin_capabilities=_admin_capabilities(
+                effective_permissions or [], user.is_group_manager
+            ),
             personalization=UserPersonalization(
                 name=user.personal_name or "",
                 role=user.personal_role or "",
@@ -205,14 +297,26 @@ class UserByEmail(BaseModel):
     user_email: str
 
 
-class UserRoleUpdateRequest(BaseModel):
+class TransferPrivatePluginsRequest(BaseModel):
     user_email: str
-    new_role: UserRole
-    explicit_override: bool = False
+    new_owner_user_id: UUID
 
 
-class UserRoleResponse(BaseModel):
-    role: str
+class TransferPrivatePluginsResponse(BaseModel):
+    plugin_ids: list[UUID]
+    renames: list[PluginRename]
+
+
+class UserAdminAccessUpdateRequest(BaseModel):
+    user_email: str
+    is_admin: bool
+
+
+class UserCraftAccessUpdateRequest(BaseModel):
+    user_emails: list[str] = Field(min_length=1)
+    # True/False = explicit override; None = clear the override (follow the
+    # workspace default).
+    craft_enabled: bool | None
 
 
 class BoostDoc(BaseModel):
@@ -239,6 +343,11 @@ class AutoScrollRequest(BaseModel):
 
 class ThemePreferenceRequest(BaseModel):
     theme_preference: ThemePreference
+
+
+class LanguageRequest(BaseModel):
+    # None clears the preference so the user follows the workspace default.
+    language: SupportedLanguage | None
 
 
 class DefaultAppModeRequest(BaseModel):
@@ -543,3 +652,60 @@ class AllVersions(BaseModel):
     stable: ContainerVersions
     dev: ContainerVersions
     migration: ContainerVersions
+
+
+class UnstructuredApiKeyRequest(BaseModel):
+    unstructured_api_key: str = Field(min_length=1, pattern=r"\S")
+
+
+class ReindexProgress(ReindexProgressCounts):
+    """Port progress, and whether the port re-embeds chunks or copies their
+    stored vectors."""
+
+    reembeds: bool
+
+
+class CCPairIdsBackfillStatus(BaseModel):
+    """Progress of the backfill that sets cc_pair_ids on the chunks of the
+    current index, and the search access mode that the backfill gates.
+    Document counts are current counts, so they can move while the backfill
+    runs. They are None when the backfill has not started or is complete."""
+
+    index_name: str
+    started: bool
+    completed: bool
+    # None when the stored progress has no snapshot (stored before it existed).
+    total_cc_pairs: int | None
+    pending_cc_pairs: int | None
+    total_documents: int | None
+    completed_documents: int | None
+    remaining_documents: int | None
+    current_cc_pair_name: str | None
+    access_mode: CCPairAccessMode
+    filter_enabled: bool
+    enforce_requested: bool
+    # False in multi-tenant deployments, where operators own the mode.
+    mode_editable: bool
+
+
+class CCPairAccessModeUpdateRequest(BaseModel):
+    mode: CCPairAccessMode
+
+
+class VectorQuantizationLevelSupport(BaseModel):
+    """Whether the OpenSearch cluster can index one vector quantization level."""
+
+    vector_quantization: VectorQuantization
+    supported: bool
+    # "major.minor" of the oldest OpenSearch that can index this level, or None
+    # when any version can.
+    min_opensearch_version: str | None
+
+
+class VectorQuantizationSupport(BaseModel):
+    """The cluster's OpenSearch version and the quantization levels it supports.
+    A null version means the cluster does not report one, so nothing is
+    restricted."""
+
+    opensearch_version: str | None
+    levels: list[VectorQuantizationLevelSupport]

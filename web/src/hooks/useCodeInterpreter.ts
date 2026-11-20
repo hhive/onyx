@@ -4,8 +4,14 @@ import { errorHandlingFetcher } from "@/lib/fetcher";
 const HEALTH_ENDPOINT = "/api/admin/code-interpreter/health";
 const STATUS_ENDPOINT = "/api/admin/code-interpreter";
 
+export type CodeInterpreterHealthStatus =
+  | "healthy"
+  | "unhealthy"
+  | "connection_lost";
+
 interface CodeInterpreterHealth {
-  healthy: boolean;
+  connected: boolean;
+  error: string;
 }
 
 interface CodeInterpreterStatus {
@@ -15,7 +21,7 @@ interface CodeInterpreterStatus {
 export default function useCodeInterpreter() {
   const {
     data: healthData,
-    error: healthError,
+    error: healthFetchError,
     isLoading: isHealthLoading,
     mutate: refetchHealth,
   } = useSWR<CodeInterpreterHealth>(HEALTH_ENDPOINT, errorHandlingFetcher, {
@@ -29,16 +35,27 @@ export default function useCodeInterpreter() {
     mutate: refetchStatus,
   } = useSWR<CodeInterpreterStatus>(STATUS_ENDPOINT, errorHandlingFetcher);
 
-  function refetch() {
-    refetchHealth();
-    refetchStatus();
+  /** Fetches health and status again; resolves when both have answered. */
+  async function refetch(): Promise<void> {
+    await Promise.all([refetchHealth(), refetchStatus()]);
   }
 
+  const status: CodeInterpreterHealthStatus = healthFetchError
+    ? "connection_lost"
+    : !healthData?.connected
+      ? "connection_lost"
+      : healthData.error
+        ? "unhealthy"
+        : "healthy";
+
+  const error = healthFetchError?.message || healthData?.error || undefined;
+
   return {
-    isHealthy: healthData?.healthy ?? false,
+    status: isHealthLoading || isStatusLoading ? undefined : status,
+    error,
     isEnabled: statusData?.enabled ?? false,
     isLoading: isHealthLoading || isStatusLoading,
-    error: healthError || statusError,
+    fetchError: healthFetchError || statusError,
     refetch,
   };
 }

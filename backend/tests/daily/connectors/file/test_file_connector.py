@@ -1,14 +1,13 @@
 import io
-from datetime import datetime
-from datetime import timezone
-from unittest.mock import MagicMock
-from unittest.mock import patch
+from datetime import datetime, timezone
+from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
 import pytest
 
 from onyx.connectors.file.connector import LocalFileConnector
 from onyx.connectors.models import HierarchyNode
+from tests.daily.connectors.utils import set_test_staging_callback
 
 
 @pytest.fixture
@@ -27,6 +26,9 @@ def mock_filestore_record() -> MagicMock:
     record = MagicMock()
     record.file_id = uuid4()
     record.display_name = "test.txt"
+    # Real columns: Document validates the MIME type and size read from them.
+    record.file_type = "text/plain"
+    record.file_size = 20
     return record
 
 
@@ -95,8 +97,18 @@ def test_two_text_files_with_zip_metadata(
     mock_get_filestore = MagicMock()
     mock_get_filestore.return_value = mock_file_store
     mock_file_store.read_file_record.side_effect = [
-        MagicMock(file_id=str(uuid4()), display_name="file1.txt"),
-        MagicMock(file_id=str(uuid4()), display_name="file2.txt"),
+        MagicMock(
+            file_id=str(uuid4()),
+            display_name="file1.txt",
+            file_type="text/plain",
+            file_size=20,
+        ),
+        MagicMock(
+            file_id=str(uuid4()),
+            display_name="file2.txt",
+            file_type="text/plain",
+            file_size=20,
+        ),
     ]
     mock_file_store.read_file.side_effect = [file1_content, file2_content]
     zip_metadata = {
@@ -191,6 +203,7 @@ def test_tabular_file_sets_file_id_on_document(
         connector = LocalFileConnector(
             file_locations=[file_id], file_names=["data.csv"], zip_metadata={}
         )
+        set_test_staging_callback(connector)
         batches = list(connector.load_from_state())
 
     assert len(batches) == 1
@@ -273,6 +286,7 @@ def test_mixed_batch_only_tabular_gets_file_id(
             file_names=["data.csv", "notes.txt"],
             zip_metadata={},
         )
+        set_test_staging_callback(connector)
         batches = list(connector.load_from_state())
 
     assert len(batches) == 1

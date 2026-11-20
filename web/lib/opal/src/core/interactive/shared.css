@@ -19,7 +19,7 @@
 
 /* Shared timing tokens — used by .interactive and other surfaces (e.g. table rows) */
 :root {
-  --interactive-duration: 150ms;
+  --interactive-duration: var(--duration-interactive);
   --interactive-easing: ease-in-out;
 }
 
@@ -40,7 +40,7 @@
 
 /* Container — structural box */
 .interactive-container {
-  @apply flex items-center justify-center overflow-clip;
+  @apply flex shrink-0 items-center justify-center overflow-clip;
 }
 .interactive-container[data-border="true"] {
   @apply border;

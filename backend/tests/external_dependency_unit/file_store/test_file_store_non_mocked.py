@@ -2,27 +2,28 @@ import os
 import time
 import uuid
 from collections.abc import Generator
-from concurrent.futures import as_completed
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
-from typing import Any
-from typing import cast
-from typing import Dict
-from typing import List
-from typing import Tuple
-from typing import TypedDict
+from typing import TYPE_CHECKING, Any, Dict, List, Tuple, TypedDict, cast
 from unittest.mock import patch
 
 import pytest
 from botocore.exceptions import ClientError
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from onyx.configs.constants import FileOrigin
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.file_store.file_store import S3BackedFileStore
 from onyx.utils.logger import setup_logger
+from shared_configs.configs import POSTGRES_DEFAULT_SCHEMA_STANDARD_VALUE
 from shared_configs.contextvars import CURRENT_TENANT_ID_CONTEXTVAR
-from tests.external_dependency_unit.constants import TEST_TENANT_ID
+from tests.external_dependency_unit.file_store.legacy_store_helpers import (
+    object_exists,
+)
+
+if TYPE_CHECKING:
+    from mypy_boto3_s3.type_defs import ObjectIdentifierTypeDef
 
 logger = setup_logger()
 
@@ -57,8 +58,7 @@ class WorkerResult(TypedDict):
 
 def _get_all_backend_configs() -> List[BackendConfig]:
     """Get configurations for all available backends"""
-    from onyx.configs.app_configs import AWS_REGION_NAME
-    from onyx.configs.app_configs import S3_ENDPOINT_URL
+    from onyx.configs.app_configs import AWS_REGION_NAME, S3_ENDPOINT_URL
 
     s3_aws_access_key_id = os.environ.get("S3_AWS_ACCESS_KEY_ID_FOR_TEST")
     s3_aws_secret_access_key = os.environ.get("S3_AWS_SECRET_ACCESS_KEY_FOR_TEST")
@@ -147,7 +147,9 @@ def file_store(
         )
 
         if "Contents" in response:
-            objects_to_delete = [{"Key": obj["Key"]} for obj in response["Contents"]]
+            objects_to_delete: list["ObjectIdentifierTypeDef"] = [
+                {"Key": obj["Key"]} for obj in response["Contents"]
+            ]
             s3_client.delete_objects(
                 Bucket=actual_bucket_name,
                 Delete={"Objects": objects_to_delete},
@@ -212,8 +214,47 @@ class TestS3BackedFileStore:
             file_record.bucket_name == file_store._get_bucket_name()
         )  # Use actual bucket name
         # The object key should include the tenant ID
-        expected_object_key = f"{file_store._s3_prefix}/{TEST_TENANT_ID}/{file_id}"
+        expected_object_key = f"{file_store._s3_prefix}/{POSTGRES_DEFAULT_SCHEMA_STANDARD_VALUE}/{file_id}"
         assert file_record.object_key == expected_object_key
+
+    def test_change_file_id_is_metadata_only(
+        self, file_store: S3BackedFileStore
+    ) -> None:
+        """Renaming a file repoints the DB record without moving the S3 object."""
+        old_id = f"{uuid.uuid4()}.txt"
+        new_id = f"{uuid.uuid4()}.txt"
+        content = b"rename me without copying"
+
+        file_store.save_file(
+            content=BytesIO(content),
+            display_name="rename.txt",
+            file_origin=FileOrigin.OTHER,
+            file_type="text/plain",
+            file_id=old_id,
+        )
+        original_object_key = file_store.read_file_record(old_id).object_key
+
+        file_store.change_file_id(old_id, new_id)
+
+        # Old id is gone; new id resolves to the same content.
+        assert not file_store.has_file(old_id, FileOrigin.OTHER, "text/plain")
+        assert file_store.has_file(new_id, FileOrigin.OTHER, "text/plain")
+        assert file_store.read_file(new_id).read() == content
+
+        # The S3 object never moved: the new record still points at the
+        # original object key (derived from the OLD file_id), not a new one.
+        new_record = file_store.read_file_record(new_id)
+        assert new_record.object_key == original_object_key
+        assert new_record.object_key.endswith(old_id)
+
+        # And nothing was copied to the key the new file_id would derive —
+        # guards against a "copy AND repoint" regression that leaks an object.
+        with pytest.raises(ClientError) as exc_info:
+            file_store._get_s3_client().head_object(
+                Bucket=file_store._get_bucket_name(),
+                Key=file_store._get_s3_key(new_id),
+            )
+        assert exc_info.value.response["Error"]["Code"] in ("404", "NoSuchKey")
 
     def test_save_and_read_binary_file(self, file_store: S3BackedFileStore) -> None:
         """Test saving and reading a binary file"""
@@ -806,6 +847,127 @@ class TestS3BackedFileStore:
         read_content = read_content_io.read().decode("utf-8")
         assert read_content == content  # Original content, not the failed update
 
+    def test_failed_record_write_deletes_the_object(
+        self, file_store: S3BackedFileStore
+    ) -> None:
+        file_id = f"{uuid.uuid4()}.txt"
+        s3_key = file_store._get_s3_key(file_id)
+
+        # Postgres rejects NUL characters in text, so the record write fails.
+        with pytest.raises(ValueError, match="NUL"):
+            file_store.save_file(
+                content=BytesIO(b"never recorded"),
+                display_name="bad\x00name",
+                file_origin=FileOrigin.OTHER,
+                file_type="text/plain",
+                file_id=file_id,
+            )
+
+        with pytest.raises(RuntimeError, match="does not exist or was deleted"):
+            file_store.read_file_record(file_id)
+        assert not object_exists(
+            file_store._get_s3_client(), s3_key, file_store._get_bucket_name()
+        )
+
+    def test_failed_commit_deletes_the_object(
+        self, file_store: S3BackedFileStore, db_session: Session
+    ) -> None:
+        file_id = f"{uuid.uuid4()}.txt"
+        s3_key = file_store._get_s3_key(file_id)
+        commit_error = OperationalError("COMMIT", {}, Exception("connection lost"))
+
+        with patch.object(db_session, "commit", side_effect=commit_error):
+            with pytest.raises(OperationalError) as raised:
+                file_store.save_file(
+                    content=BytesIO(b"never committed"),
+                    display_name="commit-fails.txt",
+                    file_origin=FileOrigin.OTHER,
+                    file_type="text/plain",
+                    file_id=file_id,
+                    db_session=db_session,
+                )
+        db_session.rollback()
+
+        assert raised.value is commit_error
+        with pytest.raises(RuntimeError, match="does not exist or was deleted"):
+            file_store.read_file_record(file_id)
+        assert not object_exists(
+            file_store._get_s3_client(), s3_key, file_store._get_bucket_name()
+        )
+
+    def test_failed_cleanup_still_raises_the_record_error(
+        self, file_store: S3BackedFileStore
+    ) -> None:
+        s3_client = file_store._get_s3_client()
+        cleanup_error = ClientError({"Error": {"Code": "500"}}, "DeleteObject")
+
+        with patch.object(
+            s3_client, "delete_object", side_effect=cleanup_error
+        ) as delete_object:
+            with pytest.raises(ValueError, match="NUL"):
+                file_store.save_file(
+                    content=BytesIO(b"cleanup fails"),
+                    display_name="bad\x00name",
+                    file_origin=FileOrigin.OTHER,
+                    file_type="text/plain",
+                    file_id=f"{uuid.uuid4()}.txt",
+                )
+
+        delete_object.assert_called_once()
+
+    def test_failed_overwrite_keeps_the_recorded_object(
+        self, file_store: S3BackedFileStore
+    ) -> None:
+        """Guards against a cleanup that deletes the object unconditionally."""
+        file_id = f"{uuid.uuid4()}.txt"
+        file_store.save_file(
+            content=BytesIO(b"original"),
+            display_name="overwrite.txt",
+            file_origin=FileOrigin.OTHER,
+            file_type="text/plain",
+            file_id=file_id,
+        )
+
+        with pytest.raises(ValueError, match="NUL"):
+            file_store.save_file(
+                content=BytesIO(b"replacement"),
+                display_name="bad\x00name",
+                file_origin=FileOrigin.OTHER,
+                file_type="text/plain",
+                file_id=file_id,
+            )
+
+        file_store.read_file_record(file_id)
+        file_store.read_file(file_id)
+
+    def test_failed_save_keeps_the_object_of_a_renamed_record(
+        self, file_store: S3BackedFileStore
+    ) -> None:
+        """Guards against a cleanup that checks the file ID, not the object."""
+        old_file_id = f"{uuid.uuid4()}.txt"
+        new_file_id = f"{uuid.uuid4()}.txt"
+        file_store.save_file(
+            content=BytesIO(b"renamed"),
+            display_name="renamed.txt",
+            file_origin=FileOrigin.OTHER,
+            file_type="text/plain",
+            file_id=old_file_id,
+        )
+        assert file_store.change_file_id(old_file_id, new_file_id)
+
+        # The renamed record still reads the object at the old ID's key.
+        with pytest.raises(ValueError, match="NUL"):
+            file_store.save_file(
+                content=BytesIO(b"replacement"),
+                display_name="bad\x00name",
+                file_origin=FileOrigin.OTHER,
+                file_type="text/plain",
+                file_id=old_file_id,
+            )
+
+        file_store.read_file_record(new_file_id)
+        file_store.read_file(new_file_id)
+
     def test_concurrent_file_operations(self, file_store: S3BackedFileStore) -> None:
         """Test handling of concurrent file operations on the same file"""
         base_file_name: str = str(uuid.uuid4())
@@ -827,7 +989,9 @@ class TestS3BackedFileStore:
             """Worker function to save a file with its own database session"""
             try:
                 # Set up tenant context for this worker
-                token = CURRENT_TENANT_ID_CONTEXTVAR.set(TEST_TENANT_ID)
+                token = CURRENT_TENANT_ID_CONTEXTVAR.set(
+                    POSTGRES_DEFAULT_SCHEMA_STANDARD_VALUE
+                )
                 try:
                     # Create a new database session for each worker to avoid conflicts
                     with get_session_with_current_tenant() as worker_session:

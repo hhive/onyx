@@ -1,5 +1,8 @@
+import os
 import subprocess
 import threading
+
+BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def monitor_process(process_name: str, process: subprocess.Popen) -> None:
@@ -41,7 +44,7 @@ def run_jobs() -> None:
         "--loglevel=INFO",
         "--hostname=light@%n",
         "-Q",
-        "vespa_metadata_sync,connector_deletion,doc_permissions_upsert,checkpoint_cleanup,index_attempt_cleanup,opensearch_migration",
+        "vespa_metadata_sync,connector_deletion,doc_permissions_upsert,checkpoint_cleanup,index_attempt_cleanup,index_reclaim,capability_checks_draft",
     ]
 
     cmd_worker_docprocessing = [
@@ -54,7 +57,20 @@ def run_jobs() -> None:
         "--prefetch-multiplier=1",
         "--loglevel=INFO",
         "--hostname=docprocessing@%n",
-        "--queues=docprocessing",
+        "--queues=docprocessing,port",
+    ]
+
+    cmd_worker_docconversion = [
+        "celery",
+        "-A",
+        "onyx.background.celery.versioned_apps.docconversion",
+        "worker",
+        "--pool=threads",
+        "--concurrency=2",
+        "--prefetch-multiplier=1",
+        "--loglevel=INFO",
+        "--hostname=docconversion@%n",
+        "--queues=docconversion",
     ]
 
     cmd_worker_docfetching = [
@@ -81,7 +97,7 @@ def run_jobs() -> None:
         "--loglevel=INFO",
         "--hostname=heavy@%n",
         "-Q",
-        "connector_pruning,connector_doc_permissions_sync,connector_external_group_sync,csv_generation,sandbox",
+        "connector_pruning,connector_doc_permissions_sync,connector_external_group_sync,csv_generation,sandbox,capability_checks",
     ]
 
     cmd_worker_monitoring = [
@@ -109,7 +125,7 @@ def run_jobs() -> None:
         "--loglevel=INFO",
         "--hostname=user_file_processing@%n",
         "-Q",
-        "user_file_processing,user_file_project_sync,user_file_delete",
+        "user_file_processing,user_file_project_sync,user_file_delete,user_file_port",
     ]
 
     cmd_worker_scheduled_tasks = [
@@ -139,6 +155,7 @@ def run_jobs() -> None:
         ("LIGHT", cmd_worker_light),
         ("DOCPROCESSING", cmd_worker_docprocessing),
         ("DOCFETCHING", cmd_worker_docfetching),
+        ("DOCCONVERSION", cmd_worker_docconversion),
         ("HEAVY", cmd_worker_heavy),
         ("MONITORING", cmd_worker_monitoring),
         ("USER_FILE_PROCESSING", cmd_worker_user_file_processing),
@@ -146,10 +163,28 @@ def run_jobs() -> None:
         ("BEAT", cmd_beat),
     ]
 
+    # onyx isn't installed into the venv, and celery keeps the cwd on
+    # sys.path only transiently while importing the app. Spawn-context
+    # children (SimpleJobClient) inherit the worker's sys.path, so pin the
+    # backend dir via PYTHONPATH, mirroring the Dockerfile's PYTHONPATH=/app.
+    _inherited_pythonpath = os.environ.get("PYTHONPATH")
+    worker_env = {
+        **os.environ,
+        "PYTHONPATH": (
+            f"{BACKEND_DIR}{os.pathsep}{_inherited_pythonpath}"
+            if _inherited_pythonpath
+            else BACKEND_DIR
+        ),
+    }
+
     processes = []
     for name, cmd in all_workers:
         process = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+            cmd,
+            env=worker_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
         )
         processes.append((name, process))
 

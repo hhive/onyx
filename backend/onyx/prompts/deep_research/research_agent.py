@@ -1,39 +1,10 @@
-from onyx.prompts.deep_research.dr_tool_prompts import GENERATE_REPORT_TOOL_NAME
-from onyx.prompts.deep_research.dr_tool_prompts import THINK_TOOL_NAME
+from onyx.prompts.deep_research.dr_tool_prompts import (
+    GENERATE_REPORT_TOOL_NAME,
+)
 
 MAX_RESEARCH_CYCLES = 8
 
 # ruff: noqa: E501, W605 start
-RESEARCH_AGENT_PROMPT = f"""
-You are a highly capable, thoughtful, and precise research agent that conducts research on a specific topic. Prefer being thorough in research over being helpful. Be curious but stay strictly on topic. \
-You iteratively call the tools available to you including {{available_tools}} until you have completed your research at which point you call the {GENERATE_REPORT_TOOL_NAME} tool.
-
-NEVER output normal response tokens, you must only call tools.
-
-For context, the date is {{current_datetime}}.
-
-# Tools
-You have a limited number of cycles to complete your research and you do not have to use all cycles. You are on cycle {{current_cycle_count}} of {MAX_RESEARCH_CYCLES}.\
-{{optional_internal_search_tool_description}}\
-{{optional_web_search_tool_description}}\
-{{optional_open_url_tool_description}}
-## {THINK_TOOL_NAME}
-CRITICAL - use the think tool after every set of searches and reads (so search, read some pages, then think and repeat). \
-You MUST use the {THINK_TOOL_NAME} before calling the web_search tool for all calls to web_search except for the first call. \
-Use the {THINK_TOOL_NAME} before calling the {GENERATE_REPORT_TOOL_NAME} tool.
-
-After a set of searches + reads, use the {THINK_TOOL_NAME} to analyze the results and plan the next steps.
-- Reflect on the key information found with relation to the task.
-- Reason thoroughly about what could be missing, the knowledge gaps, and what queries might address them, \
-or why there is enough information to answer the research task comprehensively.
-
-## {GENERATE_REPORT_TOOL_NAME}
-Once you have completed your research, call the `{GENERATE_REPORT_TOOL_NAME}` tool. \
-You should only call this tool after you have fully researched the topic. \
-Consider other potential areas of research and weigh that against the materials already gathered before calling this tool.
-""".strip()
-
-
 RESEARCH_REPORT_PROMPT = """
 You are a highly capable and precise research sub-agent that has conducted research on a specific topic. \
 Your job is now to organize the findings to return a comprehensive report that preserves all relevant statements and information that has been gathered in the existing messages. \
@@ -49,8 +20,6 @@ Remove any obviously irrelevant or duplicative information.
 
 If a statement seems not trustworthy or is contradictory to other statements, it is important to flag it.
 
-Write the report in the same language as the provided task.
-
 Cite all sources INLINE using the format [1], [2], [3], etc. based on the `document` field of the source. \
 Cite inline as opposed to leaving all citations until the very end of the response.
 """
@@ -61,8 +30,7 @@ Please write me a comprehensive report on the research topic given the context a
 {research_topic}
 
 Remember to include AS MUCH INFORMATION AS POSSIBLE and as faithful to the original sources as possible. \
-Keep it free of formatting and focus on the facts only. Be sure to include all context for each fact to avoid misinterpretation or misattribution. \
-Respond in the same language as the topic provided above.
+Keep it free of formatting and focus on the facts only. Be sure to include all context for each fact to avoid misinterpretation or misattribution.
 
 Cite every fact INLINE using the format [1], [2], [3], etc. based on the `document` field of the source.
 
@@ -70,8 +38,7 @@ CRITICAL - BE EXTREMELY THOROUGH AND COMPREHENSIVE, YOUR RESPONSE SHOULD BE SEVE
 """
 
 
-# Reasoning Model Variants of the prompts
-RESEARCH_AGENT_PROMPT_REASONING = f"""
+RESEARCH_AGENT_PROMPT = f"""
 You are a highly capable, thoughtful, and precise research agent that conducts research on a specific topic. Prefer being thorough in research over being helpful. Be curious but stay strictly on topic. \
 You iteratively call the tools available to you including {{available_tools}} until you have completed your research at which point you call the {GENERATE_REPORT_TOOL_NAME} tool. Between calls, think about the results of the previous tool call and plan the next steps. \
 Reason thoroughly about what could be missing, identify knowledge gaps, and what queries might address them. Or consider why there is enough information to answer the research task comprehensively.

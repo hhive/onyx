@@ -34,13 +34,15 @@ async function createFreshAdmin(
 ): Promise<{ email: string; password: string }> {
   // First, log in as the existing admin so we can promote the new user
   await page.context().clearCookies();
-  const { email, password } = await loginAsRandomUser(page);
+  const { email, password } = await loginAsRandomUser(page, {
+    setDisplayName: false,
+  });
 
   // Now promote the new user to admin via the existing admin
   await page.context().clearCookies();
   await loginAs(page, "admin");
   const adminClient = new OnyxApiClient(page.request);
-  await adminClient.setUserRole(email, "admin");
+  await adminClient.addUserToAdminGroup(email);
 
   // Log back in as the new admin
   await page.context().clearCookies();
@@ -53,7 +55,7 @@ async function createFreshUser(
   page: Page
 ): Promise<{ email: string; password: string }> {
   await page.context().clearCookies();
-  return await loginAsRandomUser(page);
+  return await loginAsRandomUser(page, { setDisplayName: false });
 }
 
 test.describe("Onboarding Flow @exclusive", () => {
@@ -86,9 +88,7 @@ test.describe("Onboarding Flow @exclusive", () => {
 
       const header = page.locator('[data-label="onboarding-header"]');
       await expect(header).toBeVisible();
-      await expect(
-        header.getByRole("button", { name: "Let's Go" })
-      ).toBeVisible();
+      await expect(header.getByRole("button", { name: "Next" })).toBeVisible();
 
       await expectElementScreenshot(header, {
         name: "onboarding-welcome-step",
@@ -105,8 +105,10 @@ test.describe("Onboarding Flow @exclusive", () => {
 
       const chatInput = page.locator("#onyx-chat-input");
       await expect(chatInput).toBeVisible();
-      // Disabled wrapper is the parent div with data-opal-disabled
-      const disabledWrapper = chatInput.locator("..");
+      // The Disabled region that contains the input, however deep it sits.
+      const disabledWrapper = page
+        .locator("[data-opal-disabled]")
+        .filter({ has: chatInput });
       await expect(disabledWrapper).toHaveAttribute(
         "data-opal-disabled",
         "true"
@@ -123,7 +125,7 @@ test.describe("Onboarding Flow @exclusive", () => {
 
       const header = page.locator('[data-label="onboarding-header"]');
       await expect(header).toBeVisible({ timeout: 15000 });
-      await header.getByRole("button", { name: "Let's Go" }).click();
+      await header.getByRole("button", { name: "Next" }).click();
 
       const nameStep = page.locator('[aria-label="onboarding-name-step"]');
       await expect(nameStep).toBeVisible({ timeout: 10000 });
@@ -193,11 +195,10 @@ test.describe("Onboarding Flow @exclusive", () => {
       });
 
       const chatInput = page.locator("#onyx-chat-input");
-      const chatInputParent = chatInput.locator("..");
-      await expect(chatInputParent).not.toHaveAttribute(
-        "aria-disabled",
-        "true"
-      );
+      // No disabled region contains the input.
+      await expect(
+        page.locator('[aria-disabled="true"]').filter({ has: chatInput })
+      ).toHaveCount(0);
     });
   });
 
@@ -249,8 +250,10 @@ test.describe("Onboarding Flow @exclusive", () => {
       });
 
       const chatInput = page.locator("#onyx-chat-input");
-      // Disabled wrapper is the parent div with data-opal-disabled
-      const disabledWrapper = chatInput.locator("..");
+      // The Disabled region that contains the input, however deep it sits.
+      const disabledWrapper = page
+        .locator("[data-opal-disabled]")
+        .filter({ has: chatInput });
       await expect(disabledWrapper).toHaveAttribute(
         "data-opal-disabled",
         "true"
@@ -299,11 +302,10 @@ test.describe("Onboarding Flow @exclusive", () => {
       });
 
       const chatInput = page.locator("#onyx-chat-input");
-      const chatInputParent = chatInput.locator("..");
-      await expect(chatInputParent).not.toHaveAttribute(
-        "aria-disabled",
-        "true"
-      );
+      // No disabled region contains the input.
+      await expect(
+        page.locator('[aria-disabled="true"]').filter({ has: chatInput })
+      ).toHaveCount(0);
     });
 
     test("after setting name, shows confirmation then no onboarding UI", async ({

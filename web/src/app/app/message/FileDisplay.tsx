@@ -1,13 +1,14 @@
 "use client";
 
-import { ReactNode, useState } from "react";
+import { ReactNode, useMemo, useState } from "react";
 import { cn } from "@opal/utils";
-import { ChatFileType, FileDescriptor } from "@/app/app/interfaces";
+import { useCreateModal } from "@opal/components";
+import { ChatFileType, FileDescriptor } from "@/app/app/types";
 import Attachment from "@/refresh-components/Attachment";
 import { InMessageImage } from "@/app/app/components/files/images/InMessageImage";
-import CsvContent from "@/components/tools/CSVContent";
+import SpreadsheetContent from "@/components/tools/SpreadsheetContent";
 import PreviewModal from "@/sections/modals/PreviewModal";
-import { MinimalOnyxDocument } from "@/lib/search/interfaces";
+import { MinimalOnyxDocument } from "@/lib/search/types";
 import ExpandableContentWrapper from "@/components/tools/ExpandableContentWrapper";
 
 interface FileContainerProps {
@@ -36,32 +37,37 @@ export default function FileDisplay({ files }: FileDisplayProps) {
   const [previewingFile, setPreviewingFile] = useState<FileDescriptor | null>(
     null
   );
+  const previewModal = useCreateModal();
   const textFiles = files.filter(
     (file) =>
       file.type === ChatFileType.PLAIN_TEXT ||
       file.type === ChatFileType.DOCUMENT
   );
   const imageFiles = files.filter((file) => file.type === ChatFileType.IMAGE);
-  // TODO(danelegend): XLSX files are binary (OOXML) and will fail to parse in CsvContent.
-  // The backend should convert XLSX to CSV text before serving via /api/chat/file,
-  // or XLSX should be split into a separate ChatFileType and rendered as an Attachment.
   const tabularFiles = files.filter(
     (file) => file.type === ChatFileType.TABULAR
   );
 
-  const presentingDocument: MinimalOnyxDocument = {
-    document_id: previewingFile?.id ?? "",
-    semantic_identifier: previewingFile?.name ?? "",
-  };
+  // Stable per file: PreviewModal refetches when this object changes, which
+  // would reload the closing card on every rerender.
+  const presentingDocument = useMemo<MinimalOnyxDocument>(
+    () => ({
+      document_id: previewingFile?.id ?? "",
+      semantic_identifier: previewingFile?.name ?? "",
+    }),
+    [previewingFile]
+  );
 
   return (
     <>
-      {previewingFile && (
-        <PreviewModal
-          presentingDocument={presentingDocument}
-          onClose={() => setPreviewingFile(null)}
-        />
-      )}
+      <previewModal.Provider>
+        {previewingFile && (
+          <PreviewModal
+            presentingDocument={presentingDocument}
+            onClose={() => previewModal.toggle(false)}
+          />
+        )}
+      </previewModal.Provider>
 
       {textFiles.length > 0 && (
         <FileContainer id="onyx-file">
@@ -69,7 +75,10 @@ export default function FileDisplay({ files }: FileDisplayProps) {
             <Attachment
               key={file.id}
               fileName={file.name || file.id}
-              open={() => setPreviewingFile(file)}
+              open={() => {
+                setPreviewingFile(file);
+                previewModal.toggle(true);
+              }}
             />
           ))}
         </FileContainer>
@@ -91,7 +100,12 @@ export default function FileDisplay({ files }: FileDisplayProps) {
                 key={file.id}
                 fileDescriptor={file}
                 close={() => setClose(false)}
-                ContentComponent={CsvContent}
+                // All TABULAR files render via the parsed preview, which
+                // dispatches on the response content type: spreadsheet JSON
+                // (xlsx is a binary OOXML zip the browser can't decode as
+                // text) or raw CSV passthrough. Display names are never
+                // trusted — a renamed xlsx/csv still renders correctly.
+                ContentComponent={SpreadsheetContent}
               />
             ) : (
               <Attachment

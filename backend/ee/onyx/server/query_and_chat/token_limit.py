@@ -1,184 +1,156 @@
-from collections import defaultdict
-from collections.abc import Sequence
-from datetime import datetime
-from itertools import groupby
-from typing import Dict
-from typing import List
-from typing import Tuple
+"""EE spending limit strategy. Three checks run in parallel, and each must pass:
+
+- workspace pool (GLOBAL): every budget must have room.
+- group pools (USER_GROUP): the user passes if any of their groups with an
+  applicable pool has room; pools never block across groups.
+- per-user allowance: for each (period, unit), the largest USER_GROUP_MEMBER
+  budget among the user's groups, else the workspace default (USER). Only the
+  user's own usage counts against it.
+
+A check on one model reads only that model's limits and usage."""
+
+from datetime import datetime, timezone
 from uuid import UUID
 
-from fastapi import HTTPException
-from sqlalchemy import func
-from sqlalchemy import select
-from sqlalchemy.orm import Session
-
+from onyx.configs.constants import TokenRateLimitScope
 from onyx.db.api_key import is_api_key_email_address
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
-from onyx.db.models import ChatMessage
-from onyx.db.models import ChatSession
-from onyx.db.models import TokenRateLimit
-from onyx.db.models import TokenRateLimit__UserGroup
+from onyx.db.enums import AccountType
 from onyx.db.models import User
-from onyx.db.models import User__UserGroup
-from onyx.db.models import UserGroup
-from onyx.db.token_limit import fetch_all_user_token_rate_limits
-from onyx.server.query_and_chat.token_limit import _get_cutoff_time
-from onyx.server.query_and_chat.token_limit import _is_rate_limited
-from onyx.server.query_and_chat.token_limit import _user_is_rate_limited_by_global
+from onyx.db.token_limit import (
+    fetch_pool_usage_baselines,
+    fetch_user_group_enforced_token_rate_limits,
+)
+from onyx.db.user_usage import (
+    get_group_cost_cents_buckets_since,
+    get_group_token_buckets_since,
+    get_user_cost_cents_buckets_since,
+    get_user_token_buckets_since,
+)
+from onyx.server.query_and_chat.token_limit import (
+    BudgetUnit,
+    WindowUsage,
+    _user_is_rate_limited_by_global,
+    budget_windows,
+    exhausted_windows,
+    fetch_member_allowance,
+    latest_reset,
+    raise_rate_limited,
+    token_buckets,
+    usage_cutoff,
+)
 from onyx.utils.threadpool_concurrency import run_functions_tuples_in_parallel
 
 
-def _check_token_rate_limits(user: User) -> None:
-    # Anonymous users are only rate limited by global settings
-    if user.is_anonymous:
-        _user_is_rate_limited_by_global()
-
-    elif is_api_key_email_address(user.email):
-        # API keys are only rate limited by global settings
-        _user_is_rate_limited_by_global()
-
-    else:
-        run_functions_tuples_in_parallel(
-            [
-                (_user_is_rate_limited, (user.id,)),
-                (_user_is_rate_limited_by_group, (user.id,)),
-                (_user_is_rate_limited_by_global, ()),
-            ]
-        )
-
-
-"""
-User rate limits
-"""
-
-
-def _user_is_rate_limited(user_id: UUID) -> None:
-    with get_session_with_current_tenant() as db_session:
-        user_rate_limits = fetch_all_user_token_rate_limits(
-            db_session=db_session, enabled_only=True, ordered=False
-        )
-
-        if user_rate_limits:
-            user_cutoff_time = _get_cutoff_time(user_rate_limits)
-            user_usage = _fetch_user_usage(user_id, user_cutoff_time, db_session)
-
-            if _is_rate_limited(user_rate_limits, user_usage):
-                raise HTTPException(
-                    status_code=429,
-                    detail="Token budget exceeded for user. Try again later.",
-                )
-
-
-def _fetch_user_usage(
-    user_id: UUID, cutoff_time: datetime, db_session: Session
-) -> Sequence[tuple[datetime, int]]:
-    """
-    Fetch user usage within the cutoff time, grouped by minute
-    """
-    result = db_session.execute(
-        select(
-            func.date_trunc("minute", ChatMessage.time_sent),
-            func.sum(ChatMessage.token_count),
-        )
-        .join(ChatSession, ChatMessage.chat_session_id == ChatSession.id)
-        .where(ChatSession.user_id == user_id, ChatMessage.time_sent >= cutoff_time)
-        .group_by(func.date_trunc("minute", ChatMessage.time_sent))
-    ).all()
-
-    return [(row[0], row[1]) for row in result]
-
-
-"""
-User Group rate limits
-"""
-
-
-def _user_is_rate_limited_by_group(user_id: UUID) -> None:
-    with get_session_with_current_tenant() as db_session:
-        group_rate_limits = _fetch_all_user_group_rate_limits(user_id, db_session)
-
-        if group_rate_limits:
-            # Group cutoff time is the same for all groups.
-            # This could be optimized to only fetch the maximum cutoff time for
-            # a specific group, but seems unnecessary for now.
-            group_cutoff_time = _get_cutoff_time(
-                [e for sublist in group_rate_limits.values() for e in sublist]
-            )
-
-            user_group_ids = list(group_rate_limits.keys())
-            group_usage = _fetch_user_group_usage(
-                user_group_ids, group_cutoff_time, db_session
-            )
-
-            has_at_least_one_untriggered_limit = False
-            for user_group_id, rate_limits in group_rate_limits.items():
-                usage = group_usage.get(user_group_id, [])
-
-                if not _is_rate_limited(rate_limits, usage):
-                    has_at_least_one_untriggered_limit = True
-                    break
-
-            if not has_at_least_one_untriggered_limit:
-                raise HTTPException(
-                    status_code=429,
-                    detail="Token budget exceeded for user's groups. Try again later.",
-                )
-
-
-def _fetch_all_user_group_rate_limits(
-    user_id: UUID, db_session: Session
-) -> Dict[int, List[TokenRateLimit]]:
-    group_limits = (
-        select(TokenRateLimit, User__UserGroup.user_group_id)
-        .join(
-            TokenRateLimit__UserGroup,
-            TokenRateLimit.id == TokenRateLimit__UserGroup.rate_limit_id,
-        )
-        .join(
-            UserGroup,
-            UserGroup.id == TokenRateLimit__UserGroup.user_group_id,
-        )
-        .join(
-            User__UserGroup,
-            User__UserGroup.user_group_id == UserGroup.id,
-        )
-        .where(
-            User__UserGroup.user_id == user_id,
-            TokenRateLimit.enabled.is_(True),
-        )
+def is_shared_spend_principal(user: User) -> bool:
+    """Shared principals carry traffic for many callers, so only the workspace
+    pool applies to them."""
+    return (
+        user.is_anonymous
+        or user.account_type == AccountType.SERVICE_ACCOUNT
+        or is_api_key_email_address(user.email)
     )
 
-    raw_rate_limits = db_session.execute(group_limits).all()
 
-    group_rate_limits = defaultdict(list)
-    for rate_limit, user_group_id in raw_rate_limits:
-        group_rate_limits[user_group_id].append(rate_limit)
+def _check_spend_limits(user: User, model_configuration_id: int | None) -> None:
+    if is_shared_spend_principal(user):
+        _user_is_rate_limited_by_global(model_configuration_id)
+        return
 
-    return group_rate_limits
+    run_functions_tuples_in_parallel(
+        [
+            (_user_is_rate_limited, (user.id, model_configuration_id)),
+            (_user_is_rate_limited_by_group, (user.id, model_configuration_id)),
+            (_user_is_rate_limited_by_global, (model_configuration_id,)),
+        ]
+    )
 
 
-def _fetch_user_group_usage(
-    user_group_ids: list[int], cutoff_time: datetime, db_session: Session
-) -> dict[int, list[Tuple[datetime, int]]]:
-    """
-    Fetch user group usage within the cutoff time, grouped by minute
-    """
-    user_group_usage = db_session.execute(
-        select(
-            func.sum(ChatMessage.token_count),
-            func.date_trunc("minute", ChatMessage.time_sent),
-            UserGroup.id,
+"""
+Per-user allowance
+"""
+
+
+def _user_is_rate_limited(user_id: UUID, model_configuration_id: int | None) -> None:
+    with get_session_with_current_tenant() as db_session:
+        windows = fetch_member_allowance(db_session, user_id, model_configuration_id)
+        if not windows:
+            return
+
+        now = datetime.now(timezone.utc)
+        usage = WindowUsage()
+        if token_cutoff := usage_cutoff(now, windows, BudgetUnit.TOKENS):
+            usage.tokens = token_buckets(
+                get_user_token_buckets_since(
+                    db_session, str(user_id), token_cutoff, model_configuration_id
+                )
+            )
+        if cost_cutoff := usage_cutoff(now, windows, BudgetUnit.COST):
+            usage.cost_cents = get_user_cost_cents_buckets_since(
+                db_session, str(user_id), cost_cutoff, model_configuration_id
+            )
+
+    exhausted = exhausted_windows(windows, usage)
+    if reset := latest_reset(exhausted):
+        from_group = any(window.user_group_id is not None for window, _ in exhausted)
+        raise_rate_limited(
+            (
+                TokenRateLimitScope.USER_GROUP_MEMBER
+                if from_group
+                else TokenRateLimitScope.USER
+            ),
+            reset,
+            model_configuration_id,
         )
-        .join(ChatSession, ChatMessage.chat_session_id == ChatSession.id)
-        .join(User__UserGroup, User__UserGroup.user_id == ChatSession.user_id)
-        .join(UserGroup, UserGroup.id == User__UserGroup.user_group_id)
-        .filter(UserGroup.id.in_(user_group_ids), ChatMessage.time_sent >= cutoff_time)
-        .group_by(func.date_trunc("minute", ChatMessage.time_sent), UserGroup.id)
-    ).all()
 
-    return {
-        user_group_id: [(usage, time_sent) for time_sent, usage, _ in group_usage]
-        for user_group_id, group_usage in groupby(
-            user_group_usage, key=lambda row: row[2]
+
+"""
+Group pools
+"""
+
+
+def _user_is_rate_limited_by_group(
+    user_id: UUID, model_configuration_id: int | None
+) -> None:
+    with get_session_with_current_tenant() as db_session:
+        limits_by_group = fetch_user_group_enforced_token_rate_limits(
+            db_session, user_id, TokenRateLimitScope.USER_GROUP, model_configuration_id
         )
-    }
+        baselines = fetch_pool_usage_baselines(
+            db_session,
+            [limit for limits in limits_by_group.values() for limit in limits],
+        )
+        windows_by_group = {
+            group_id: windows
+            for group_id, limits in limits_by_group.items()
+            if (windows := budget_windows(limits, group_id, baselines))
+        }
+        if not windows_by_group:
+            return
+
+        all_windows = [w for windows in windows_by_group.values() for w in windows]
+        group_ids = list(windows_by_group)
+        now = datetime.now(timezone.utc)
+        usage_by_group = {group_id: WindowUsage() for group_id in group_ids}
+        if token_cutoff := usage_cutoff(now, all_windows, BudgetUnit.TOKENS):
+            for group_id, buckets in get_group_token_buckets_since(
+                db_session, group_ids, token_cutoff, model_configuration_id
+            ).items():
+                usage_by_group[group_id].tokens = token_buckets(buckets)
+        if cost_cutoff := usage_cutoff(now, all_windows, BudgetUnit.COST):
+            for group_id, cost_buckets in get_group_cost_cents_buckets_since(
+                db_session, group_ids, cost_cutoff, model_configuration_id
+            ).items():
+                usage_by_group[group_id].cost_cents = cost_buckets
+
+    group_resets: list[datetime] = []
+    for group_id, windows in windows_by_group.items():
+        reset = latest_reset(exhausted_windows(windows, usage_by_group[group_id]))
+        # A group with room unblocks the user entirely.
+        if reset is None:
+            return
+        group_resets.append(reset)
+
+    raise_rate_limited(
+        TokenRateLimitScope.USER_GROUP, min(group_resets), model_configuration_id
+    )

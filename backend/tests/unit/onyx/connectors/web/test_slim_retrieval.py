@@ -3,14 +3,26 @@
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import MagicMock
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 from onyx.connectors.models import SlimDocument
-from onyx.connectors.web.connector import WEB_CONNECTOR_VALID_SETTINGS
+from onyx.connectors.web.config import WEB_CONNECTOR_VALID_SETTINGS
 from onyx.connectors.web.connector import WebConnector
 
 BASE_URL = "http://example.com"
+
+
+@pytest.fixture(autouse=True)
+def _skip_web_connector_ssrf_check(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests crawl example.com and don't exercise SSRF. The default SSRF
+    level is VALIDATE_ALL, at which the web connector does a real DNS lookup per
+    fetch; neutralize the gate so the tests stay hermetic (no network)."""
+    monkeypatch.setattr(
+        "onyx.connectors.web.connector.protected_url_check", lambda _url: None
+    )
+
 
 SINGLE_PAGE_HTML = (
     "<html><body><p>Content that should not appear in slim output</p></body></html>"
@@ -43,13 +55,13 @@ def _make_playwright_context_mock(url_to_html: dict[str, str]) -> MagicMock:
             response.header_value.return_value = None  # no cf-ray
             return response
 
-        def _content() -> str:
+        def _content(_expression: str, _limit: int) -> str:
             return url_to_html.get(
                 visited[-1] if visited else "", "<html><body></body></html>"
             )
 
         page.goto.side_effect = _goto
-        page.content.side_effect = _content
+        page.evaluate.side_effect = _content
         return page
 
     context.new_page.side_effect = _new_page
@@ -72,22 +84,24 @@ def _make_page_mock(
     response.status = status
     response.header_value.side_effect = lambda h: cf_ray if h == "cf-ray" else None
     page.goto.return_value = response
-    page.content.return_value = html
+    page.evaluate.return_value = html
     return page
 
 
 @patch("onyx.connectors.web.connector.check_internet_connection")
-@patch("onyx.connectors.web.connector.requests.head")
+@patch("onyx.connectors.web.connector.ssrf_safe_get")
 @patch("onyx.connectors.web.connector.start_playwright")
 def test_slim_yields_slim_documents(
     mock_start_playwright: MagicMock,
-    mock_head: MagicMock,
+    mock_fetch: MagicMock,
     _mock_check: MagicMock,
 ) -> None:
     """retrieve_all_slim_docs yields SlimDocuments with the correct URL as id."""
     context = _make_playwright_context_mock({BASE_URL + "/": SINGLE_PAGE_HTML})
     mock_start_playwright.return_value = (_make_playwright_mock(), context)
-    mock_head.return_value.headers = {"content-type": "text/html"}
+    mock_fetch.return_value.__enter__.return_value.headers = {
+        "content-type": "text/html"
+    }
 
     connector = WebConnector(
         base_url=BASE_URL + "/",
@@ -102,17 +116,19 @@ def test_slim_yields_slim_documents(
 
 
 @patch("onyx.connectors.web.connector.check_internet_connection")
-@patch("onyx.connectors.web.connector.requests.head")
+@patch("onyx.connectors.web.connector.ssrf_safe_get")
 @patch("onyx.connectors.web.connector.start_playwright")
 def test_slim_skips_content_extraction(
     mock_start_playwright: MagicMock,
-    mock_head: MagicMock,
+    mock_fetch: MagicMock,
     _mock_check: MagicMock,
 ) -> None:
     """web_html_cleanup is never called in slim mode."""
     context = _make_playwright_context_mock({BASE_URL + "/": SINGLE_PAGE_HTML})
     mock_start_playwright.return_value = (_make_playwright_mock(), context)
-    mock_head.return_value.headers = {"content-type": "text/html"}
+    mock_fetch.return_value.__enter__.return_value.headers = {
+        "content-type": "text/html"
+    }
 
     connector = WebConnector(
         base_url=BASE_URL + "/",
@@ -125,11 +141,11 @@ def test_slim_skips_content_extraction(
 
 
 @patch("onyx.connectors.web.connector.check_internet_connection")
-@patch("onyx.connectors.web.connector.requests.head")
+@patch("onyx.connectors.web.connector.ssrf_safe_get")
 @patch("onyx.connectors.web.connector.start_playwright")
 def test_slim_discovers_links_recursively(
     mock_start_playwright: MagicMock,
-    mock_head: MagicMock,
+    mock_fetch: MagicMock,
     _mock_check: MagicMock,
 ) -> None:
     """In RECURSIVE mode, internal <a href> links are followed and all URLs yielded."""
@@ -140,7 +156,9 @@ def test_slim_discovers_links_recursively(
     }
     context = _make_playwright_context_mock(url_to_html)
     mock_start_playwright.return_value = (_make_playwright_mock(), context)
-    mock_head.return_value.headers = {"content-type": "text/html"}
+    mock_fetch.return_value.__enter__.return_value.headers = {
+        "content-type": "text/html"
+    }
 
     connector = WebConnector(
         base_url=BASE_URL + "/",
@@ -162,11 +180,11 @@ def test_slim_discovers_links_recursively(
 
 
 @patch("onyx.connectors.web.connector.check_internet_connection")
-@patch("onyx.connectors.web.connector.requests.head")
+@patch("onyx.connectors.web.connector.ssrf_safe_get")
 @patch("onyx.connectors.web.connector.start_playwright")
 def test_normal_200_skips_5s_wait(
     mock_start_playwright: MagicMock,
-    mock_head: MagicMock,
+    mock_fetch: MagicMock,
     _mock_check: MagicMock,
 ) -> None:
     """Normal 200 responses without bot-detection signals skip the 5s render wait."""
@@ -174,7 +192,9 @@ def test_normal_200_skips_5s_wait(
     context = MagicMock()
     context.new_page.return_value = page
     mock_start_playwright.return_value = (_make_playwright_mock(), context)
-    mock_head.return_value.headers = {"content-type": "text/html"}
+    mock_fetch.return_value.__enter__.return_value.headers = {
+        "content-type": "text/html"
+    }
 
     connector = WebConnector(
         base_url=BASE_URL + "/",
@@ -187,11 +207,11 @@ def test_normal_200_skips_5s_wait(
 
 
 @patch("onyx.connectors.web.connector.check_internet_connection")
-@patch("onyx.connectors.web.connector.requests.head")
+@patch("onyx.connectors.web.connector.ssrf_safe_get")
 @patch("onyx.connectors.web.connector.start_playwright")
 def test_cloudflare_applies_5s_wait(
     mock_start_playwright: MagicMock,
-    mock_head: MagicMock,
+    mock_fetch: MagicMock,
     _mock_check: MagicMock,
 ) -> None:
     """Pages with a cf-ray header trigger the 5s wait before networkidle."""
@@ -199,7 +219,9 @@ def test_cloudflare_applies_5s_wait(
     context = MagicMock()
     context.new_page.return_value = page
     mock_start_playwright.return_value = (_make_playwright_mock(), context)
-    mock_head.return_value.headers = {"content-type": "text/html"}
+    mock_fetch.return_value.__enter__.return_value.headers = {
+        "content-type": "text/html"
+    }
 
     connector = WebConnector(
         base_url=BASE_URL + "/",
@@ -213,11 +235,11 @@ def test_cloudflare_applies_5s_wait(
 
 @patch("onyx.connectors.web.connector.time")
 @patch("onyx.connectors.web.connector.check_internet_connection")
-@patch("onyx.connectors.web.connector.requests.head")
+@patch("onyx.connectors.web.connector.ssrf_safe_get")
 @patch("onyx.connectors.web.connector.start_playwright")
 def test_403_applies_5s_wait(
     mock_start_playwright: MagicMock,
-    mock_head: MagicMock,
+    mock_fetch: MagicMock,
     _mock_check: MagicMock,
     _mock_time: MagicMock,
 ) -> None:
@@ -226,7 +248,9 @@ def test_403_applies_5s_wait(
     context = MagicMock()
     context.new_page.return_value = page
     mock_start_playwright.return_value = (_make_playwright_mock(), context)
-    mock_head.return_value.headers = {"content-type": "text/html"}
+    mock_fetch.return_value.__enter__.return_value.headers = {
+        "content-type": "text/html"
+    }
 
     connector = WebConnector(
         base_url=BASE_URL + "/",

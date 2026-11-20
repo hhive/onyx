@@ -1,4 +1,5 @@
 from datetime import datetime
+from enum import Enum
 from typing import Literal
 
 from pydantic import BaseModel
@@ -90,14 +91,33 @@ class ProductGatingResponse(BaseModel):
     error: str | None
 
 
+class StripeCheckoutSessionResult(BaseModel):
+    # url is always set on success; sessionId is null for the past_due/unpaid
+    # payment-method-update portal response.
+    session_id: str | None = None
+    url: str | None = None
+    requires_payment_method_update: bool = False
+
+
 class SubscriptionSessionResponse(BaseModel):
-    sessionId: str
+    sessionId: str | None = None
+    url: str | None = None
+    requires_payment_method_update: bool = False
 
 
 class CreateSubscriptionSessionRequest(BaseModel):
     """Request to create a subscription checkout session."""
 
     billing_period: Literal["monthly", "annual"] = "monthly"
+
+
+class SignUpDomainState(str, Enum):
+    """The control plane's answer to a playground sign-up (`POST /sign-up-domain`)."""
+
+    NEW = "new"
+    EMAIL_USED = "email_used"
+    ACTIVE_TENANT = "active_tenant"
+    LIMIT_REACHED = "limit_reached"
 
 
 class TenantByDomainResponse(BaseModel):

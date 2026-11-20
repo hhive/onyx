@@ -4,270 +4,170 @@ This file provides guidance to AI agents when working with code in this reposito
 
 ## KEY NOTES
 
-- If you run into any missing python dependency errors, try running your command with `source .venv/bin/activate` \
-  to assume the python venv.
-- To make tests work, check the `.env` file at the root of the project to find an OpenAI key.
-- If using `playwright` to explore the frontend, you can usually log in with username `a@example.com` and password
-  `a`. The app can be accessed at `http://localhost:3000`.
+- Python deps live in a `uv`-managed virtualenv at `.venv` (repo root). If it doesn't exist yet, create it
+  with `uv sync --frozen`, then `source .venv/bin/activate`.
+- Test secrets (API keys etc.) are resolved by `backend/tests/utils/aws_secrets.py`, in order: process
+  env vars → the gitignored `.vscode/.env` (also used by the pytest commands in `backend/AGENTS.md`;
+  create it by copying `.vscode/env_template.txt`) → AWS Secrets Manager (requires `aws sso login`).
+  Tests declare what they need via `@pytest.mark.secrets(TestSecret.X)`. If a key you need still can't
+  be resolved, ask the user rather than skipping tests.
+- If using `playwright` to explore the frontend, log in with username `admin_user@example.com` and password
+  `TestPassword123!` (the admin user created by the playwright global setup — see
+  `web/tests/e2e/constants.ts`). If it doesn't exist yet, register it via the signup page; the first user
+  registered automatically becomes admin. The app can be accessed at `http://localhost:3000`.
 - You should assume that all Onyx services are running. To verify, you can check the `backend/log` directory to
   make sure we see logs coming out from the relevant service.
-- To connect to the Postgres database, use: `docker exec -it onyx-relational_db-1 psql -U postgres -c "<SQL>"`
+- To connect to the Postgres database, use:
+  `PGPASSWORD="${POSTGRES_PASSWORD:-password}" psql -h "${POSTGRES_HOST:-localhost}" -U postgres -c "<SQL>"`.
+  This works on a host checkout and inside the devcontainer. If no `psql` client is available, fall back to
+  `docker exec onyx-relational_db-1 psql -U postgres -c "<SQL>"` (no `-it` — agent shells have no TTY).
 - When making calls to the backend, always go through the frontend. E.g. make a call to `http://localhost:3000/api/persona` not `http://localhost:8080/api/persona`
-- Put ALL db operations under the `backend/onyx/db` / `backend/ee/onyx/db` directories. Don't run queries
-  outside of those directories.
+- If `.agents-local.md` exists at the repo root and its rules are not already in your context,
+  read and follow it. It carries developer-local agent guidance and is never committed.
+- Before you start work, check that your branch does not need a rebase on `origin/main`.
+  Rebase if the branch has merge conflicts with main.
+  Rebase if the branch is stale: more than 3 days since it diverged from or last synced with main.
+  Keeping a branch current prevents a much more involved conflict resolution later.
+  Claude Code and Codex run this check at session start and on later prompts.
+  The hook is `.agents/hooks/ensure_latest_main.py`. It fetches at most once an hour.
+  It is silent unless a rebase is needed.
+  Other agents: run `git fetch origin +refs/heads/main:refs/remotes/origin/main`.
+  Check for conflicts with `git merge-tree --write-tree HEAD origin/main`.
+  Exit status 1 means conflicts. Other non-zero codes are errors, not conflicts.
+  Check the age with `git show -s --format=%cr $(git merge-base HEAD origin/main)`.
+  To update, run `git rebase origin/main`. Use `git merge origin/main` for a shared branch.
+  On `main`, run `git pull --ff-only origin main`.
+  If a merge or rebase is already in progress, finish it or abort it first.
+  Never discard uncommitted changes to do this.
 
 ## Project Overview
 
 **Onyx** (formerly Danswer) is an open-source Gen-AI and Enterprise Search platform that connects to company documents, apps, and people. It features a modular architecture with both Community Edition (MIT licensed) and Enterprise Edition offerings.
 
-### Background Workers (Celery)
-
-Onyx uses Celery for asynchronous task processing with multiple specialized workers:
-
-#### Worker Types
-
-1. **Primary Worker** (`celery_app.py`)
-
-   - Coordinates core background tasks and system-wide operations
-   - Handles connector management, document sync, pruning, and periodic checks
-   - Runs with 4 threads concurrency
-   - Tasks: connector deletion, vespa sync, pruning, LLM model updates, user file sync
-
-2. **Docfetching Worker** (`docfetching`)
-
-   - Fetches documents from external data sources (connectors)
-   - Spawns docprocessing tasks for each document batch
-   - Implements watchdog monitoring for stuck connectors
-   - Configurable concurrency (default from env)
-
-3. **Docprocessing Worker** (`docprocessing`)
-
-   - Processes fetched documents through the indexing pipeline:
-     - Upserts documents to PostgreSQL
-     - Chunks documents and adds contextual information
-     - Embeds chunks via model server
-     - Writes chunks to Vespa vector database
-     - Updates document metadata
-   - Configurable concurrency (default from env)
-
-4. **Light Worker** (`light`)
-
-   - Handles lightweight, fast operations
-   - Tasks: vespa metadata sync, connector deletion, doc permissions upsert, checkpoint cleanup, index attempt cleanup
-   - Higher concurrency for quick tasks
-
-5. **Heavy Worker** (`heavy`)
-
-   - Handles resource-intensive operations
-   - Tasks: connector pruning, document permissions sync, external group sync, CSV generation
-   - Runs with 4 threads concurrency
-
-6. **Monitoring Worker** (`monitoring`)
-
-   - System health monitoring and metrics collection
-   - Monitors Celery queues, process memory, and system status
-   - Single thread (monitoring doesn't need parallelism)
-   - Cloud-specific monitoring tasks
-
-7. **User File Processing Worker** (`user_file_processing`)
-
-   - Processes user-uploaded files
-   - Handles user file indexing and project synchronization
-   - Configurable concurrency
-
-8. **Beat Worker** (`beat`)
-   - Celery's scheduler for periodic tasks
-   - Uses DynamicTenantScheduler for multi-tenant support
-   - Schedules tasks like:
-     - Indexing checks (every 15 seconds)
-     - Connector deletion checks (every 20 seconds)
-     - Vespa sync checks (every 20 seconds)
-     - Pruning checks (every 20 seconds)
-     - Monitoring tasks (every 5 minutes)
-     - Cleanup tasks (hourly)
-
-#### Key Features
-
-- **Thread-based Workers**: All workers use thread pools (not processes) for stability
-- **Tenant Awareness**: Multi-tenant support with per-tenant task isolation. There is a
-  middleware layer that automatically finds the appropriate tenant ID when sending tasks
-  via Celery Beat.
-- **Task Prioritization**: High, Medium, Low priority queues
-- **Monitoring**: Built-in heartbeat and liveness checking
-- **Failure Handling**: Automatic retry and failure recovery mechanisms
-- **Redis Coordination**: Inter-process communication via Redis
-- **PostgreSQL State**: Task state and metadata stored in PostgreSQL
-
-#### Important Notes
-
-**Defining Tasks**:
-
-- Always use `@shared_task` rather than `@celery_app`
-- Put tasks under `background/celery/tasks/` or `ee/background/celery/tasks`
-- Never enqueue a task without an expiration. Always supply `expires=` when
-  sending tasks, either from the beat schedule or directly from another task. It
-  should never be acceptable to submit code which enqueues tasks without an
-  expiration, as doing so can lead to unbounded task queue growth.
-
-**Defining APIs**:
-When creating new FastAPI APIs, do NOT use the `response_model` field. Instead, just type the
-function.
-
-**Testing Updates**:
-If you make any updates to a celery worker and you want to test these changes, you will need
-to ask me to restart the celery worker. There is no auto-restart on code-change mechanism.
-
-**Task Time Limits**:
-Since all tasks are executed in thread pools, the time limit features of Celery are silently
-disabled and won't work. Timeout logic must be implemented within the task itself.
-
-### Code Quality
-
-```bash
-# Install and run pre-commit hooks
-pre-commit install
-pre-commit run --all-files
-```
-
-NOTE: Always make sure everything is strictly typed (both in Python and Typescript).
-
-## Architecture Overview
-
 ### Technology Stack
 
-- **Backend**: Python 3.11, FastAPI, SQLAlchemy, Alembic, Celery
-- **Frontend**: Next.js 15+, React 18, TypeScript, Tailwind CSS
+- **Backend**: Python 3.13, FastAPI, SQLAlchemy, Alembic, Celery
+- **Frontend**: Next.js 16, React 19, TypeScript, Tailwind CSS
 - **Database**: PostgreSQL with Redis caching
-- **Search**: Vespa vector database
+- **Search**: OpenSearch-backed keyword and vector document index
 - **Auth**: OAuth2, SAML, multi-provider support
 - **AI/ML**: LangChain, LiteLLM, multiple embedding models
 
-### Directory Structure
+### Repository Layout & Sub-project Guides
 
-```
-backend/
-├── onyx/
-│   ├── auth/                    # Authentication & authorization
-│   ├── chat/                    # Chat functionality & LLM interactions
-│   ├── connectors/              # Data source connectors
-│   ├── db/                      # Database models & operations
-│   ├── document_index/          # Vespa integration
-│   ├── federated_connectors/    # External search connectors
-│   ├── llm/                     # LLM provider integrations
-│   └── server/                  # API endpoints & routers
-├── ee/                          # Enterprise Edition features
-├── alembic/                     # Database migrations
-└── tests/                       # Test suites
+Each sub-project has its own agents file with the standards for that area — read it before working
+there:
 
-web/
-├── src/app/                     # Next.js app router pages
-├── src/components/              # Reusable React components
-└── src/lib/                     # Utilities & business logic
-```
+- `backend/` — FastAPI app + Celery workers. `onyx/` is the Community Edition core, `ee/` mirrors its
+  layout for Enterprise features, `alembic/` holds migrations, `tests/` the test suites. Standards
+  (Celery, migrations, testing, error handling, LLM tracing): `backend/AGENTS.md`.
+- `web/` — Next.js frontend. Standards (also cover `desktop/`, the Tauri shell): `web/AGENTS.md`.
+- `mobile/` — React Native + Expo app. Standards: `mobile/AGENTS.md`. Mobile differs from web on
+  several points (no DOM, NativeWind, expo-router), so do **not** assume the web rules apply there.
+- `documentation/` — customer docs (Mintlify, docs.onyx.app). Standards: `documentation/AGENTS.md`. Production docs
+  follow the latest stable release, not `main`.
 
-## Frontend Standards
+Explore the tree with `ls` rather than relying on docs for the full package list.
 
-Frontend standards for the `web/` and `desktop/` projects live in `web/AGENTS.md`.
+### Docs
 
-## Database & Migrations
+When you change something a customer sees or configures (UI, admin settings, connectors, environment variables, the
+public API, deployment), check the matching page in `documentation/`. If the change makes the page wrong or leaves out
+something a customer needs, update it in the same PR. Write for the page's reader and task, at the level of detail of
+the whole page. Keep the behavior a reader can see, such as contracts, limits, sync, and failure handling.
+Recapture the screenshots that your change makes wrong. Follow "Decide what to include" and the other rules in
+`.agents/skills/docs-writing/SKILL.md`, and use the local app and admin login above. Skip docs for internal refactors,
+tests, CI, and multi-tenant cloud operations, which customers cannot use.
 
-### Running Migrations
+### Feature Map
 
-```bash
-# Standard migrations
-alembic upgrade head
+`.agents/feature-map/` maps the product: every surface, what it does, the code behind
+it, and how the parts connect. Use it before you change a product surface, when you
+review a diff or PR, and when you need to know what a feature does or what a change
+can break. The `feature-map` skill (`.agents/skills/feature-map/SKILL.md`) gives the
+procedure.
 
-# Multi-tenant (Enterprise)
-alembic -n schema_private upgrade head
-```
+- For new work, start at the Common tasks table in `.agents/feature-map/INDEX.md`.
+- Look up a code path in `.agents/feature-map/PATHS.md` to find its component.
+- The step-by-step review procedure is `.agents/feature-map/VERIFYING.md`.
+- Onyx overloads words such as Persona, Tool, turn, and SearchDoc. Read
+  `.agents/feature-map/GLOSSARY.md` before trusting a name.
 
-### Creating Migrations
+If your change makes a map document wrong, update it in the same pull request, as
+`.agents/feature-map/README.md` ("Keeping the map true") describes.
 
-```bash
-# Create migration
-alembic revision -m "description"
+### Skills
 
-# Multi-tenant migration
-alembic -n schema_private revision -m "description"
-```
+Shared agent skills live in `.agents/skills/`. `.claude/skills`, `.cursor/skills` and
+`.codex/skills` are symlinks to it, so add or edit skills only in `.agents/skills/`.
 
-Write the migration manually and place it in the file that alembic creates when running the above command.
+## Code Quality
 
-## Testing Strategy
-
-First, you must activate the virtual environment with `source .venv/bin/activate`.
-
-There are 4 main types of tests within Onyx:
-
-### Unit Tests
-
-These should not assume any Onyx/external services are available to be called.
-Interactions with the outside world should be mocked using `unittest.mock`. Generally, only
-write these for complex, isolated modules e.g. `citation_processing.py`.
-
-To run them:
+The hooks in `.pre-commit-config.yaml` run with [prek](https://github.com/j178/prek).
+`uv sync` installs the pinned version into `.venv`. If the git hooks came from `pre-commit`,
+run `prek install --force` once to replace them.
 
 ```bash
-pytest -xv backend/tests/unit
+# Install the git hooks and run every hook
+prek install
+prek run --all-files
+
+# Faster: run only on the files you touched
+prek run --files <path> [<path> ...]
 ```
 
-### External Dependency Unit Tests
+Claude Code and Codex also run prek on the files you changed in a turn when
+you end it (`.agents/hooks/pre_commit_on_stop.py`, wired as `UserPromptSubmit` and
+`Stop` hooks in `.claude/settings.json` and `.codex/hooks.json`). Files that were
+already dirty when the turn started are skipped unless you change them. Codex runs
+the hooks only after you trust the project `.codex/` layer. Committed changes come from
+local commit, amend, cherry-pick, revert, and conflict-resolution entries in the
+worktree HEAD reflog. For a merge commit, only files that differ from Git's automatic
+merge result are checked. For a rebase, the check includes every file in each commit
+resolved with `git rebase --continue`, and skips clean picks. The `--apply` rebase
+backend logs resolved conflicts as picks, so the hook skips them. Checkout, pull, clean
+merge, and clean rebase updates do not add files to the check.
+If a hook fails, fix the reported problems before you finish. When the repo has the feature map
+(`.agents/feature-map/stale_docs.py`), the same hook blocks the stop once with an
+editing brief: the sections and keys of the feature-map documents that cite code
+the turn changed, and changed files that `PATHS.md` does not cover. Ownership
+through `PATHS.md` alone does not block. Answer it
+with "Editing judgment" in `.agents/feature-map/README.md`. No update is a normal
+answer; edit only what the change made wrong or what a future agent needs.
 
-These tests assume that all external dependencies of Onyx are available and callable (e.g. Postgres, Redis,
-MinIO/S3, Vespa are running + OpenAI can be called + any request to the internet is fine + etc.).
+NOTE: Always make sure everything is strictly typed (both in Python and Typescript).
 
-However, the actual Onyx containers are not running and with these tests we call the function to test directly.
-We can also mock components/calls at will.
+NOTE: Keep code comments brief and focused on information that stays relevant long-term.
 
-The goal with these tests are to minimize mocking while giving some flexibility to mock things that are flakey,
-need strictly controlled behavior, or need to have their internal behavior validated (e.g. verify a function is called
-with certain args, something that would be impossible with proper integration tests).
+## Writing
 
-A great example of this type of test is `backend/tests/external_dependency_unit/connectors/confluence/test_confluence_group_sync.py`.
+These rules apply to all prose you write: docs, commit messages, PR descriptions, reports, and replies.
 
-To run them:
+Follow ASD-STE100 Simplified Technical English for technical text:
 
-```bash
-python -m dotenv -f .vscode/.env run -- pytest backend/tests/external_dependency_unit
-```
+- Use approved words only. Each word has one meaning.
+- Use one word for one idea. Do not use two words for the same thing.
+- Write short sentences. Use 20 words or less for instructions.
+- Use active voice. Write "Turn the switch", not "The switch must be turned".
+- Write short paragraphs. Keep one topic in each paragraph.
+- Keep code comments focused on information that is relevant long-term or for future readers.
 
-### Integration Tests
+## Testing
 
-Standard integration tests. Every test in `backend/tests/integration` runs against a real Onyx deployment. We cannot
-mock anything in these tests. Prefer writing integration tests (or External Dependency Unit Tests if mocking/internal
-verification is necessary) over any other type of test.
+There are 4 main types of tests: unit, external dependency unit, integration, and playwright e2e
+(`web/tests/e2e`). Commands and guidance for all four live in `backend/AGENTS.md`; shared fixtures
+and deeper detail in `backend/tests/README.md`. Prefer integration tests over the other types.
 
-Tests are parallelized at a directory level.
+- A regression test for a fix must fail without the fix. Revert the fix, see the test fail, then
+  restore the fix. Do this before you push.
+- Run each README command and Playwright spec that you add or change before you push. If you
+  cannot run one, say so in the PR description.
 
-When writing integration tests, make sure to check the root `conftest.py` for useful fixtures + the `backend/tests/integration/common_utils` directory for utilities. Prefer (if one exists), calling the appropriate Manager
-class in the utils over directly calling the APIs with a library like `requests`. Prefer using fixtures rather than
-calling the utilities directly (e.g. do NOT create admin users with
-`admin_user = UserManager.create(name="admin_user")`, instead use the `admin_user` fixture).
+## Flaky tests
 
-A great example of this type of test is `backend/tests/integration/tests/streaming_endpoints/test_chat_stream.py`.
-
-To run them:
-
-```bash
-python -m dotenv -f .vscode/.env run -- pytest backend/tests/integration
-```
-
-### Playwright (E2E) Tests
-
-These tests are an even more complete version of the Integration Tests mentioned above. Has all services of Onyx
-running, _including_ the Web Server.
-
-Use these tests for anything that requires significant frontend <-> backend coordination.
-
-Tests are located at `web/tests/e2e`. Tests are written in TypeScript.
-
-To run them:
-
-```bash
-npx playwright test <TEST_NAME>
-```
-
-For shared fixtures, best practices, and detailed guidance, see `backend/tests/README.md`.
+Do not add sleeps, skips, or retries to make a flaky test pass. Find and fix
+the root cause. If you delete the test, write down why and tell the user.
+After three failed fix rounds, stop and ask a human for help.
 
 ## Logs
 
@@ -277,36 +177,14 @@ will be tailing their logs to this file.
 
 ## Security Considerations
 
-- Never commit API keys or secrets to repository
-- Use encrypted credential storage for connector credentials
-- Follow RBAC patterns for new features
-- Implement proper input validation with Pydantic models
-- Use parameterized queries to prevent SQL injection
-
-## AI/LLM Integration
-
-- Multiple LLM providers supported via LiteLLM
-- Configurable models per feature (chat, search, embeddings)
-- Streaming support for real-time responses
-- Token management and rate limiting
-- Custom prompts and agent actions
-
-### Tracing — every LLM invocation must be tagged
-
-Every LLM, embedding, rerank, image-generation, voice (STT/TTS), and intent-classification call must open a generation span tagged with a value from the `LLMFlow` registry in `backend/onyx/tracing/flows.py`. Use one of:
-
-- `llm_generation_span(llm=..., flow=LLMFlow.X, input_messages=...)` for calls going through an `LLM` subclass.
-- `traced_llm_call(flow=LLMFlow.X, model=..., provider=..., input_messages=...)` for direct provider SDK / `litellm` / model_server HTTP calls that bypass the `LLM` abstraction.
-
-Rules:
-
-1. Add a new `LLMFlow` enum value before instrumenting a new operation. Don't pass raw strings.
-2. Flow tags name the **operation** (e.g. `IMAGE_EDIT`, `RERANK`) — not the provider. Provider lives in `model_config["model_provider"]`.
-3. The auto-wrap fallback in `onyx/llm/tracing_wrap.py` emits `LLMFlow.UNTAGGED_INVOKE` / `UNTAGGED_STREAM` for calls that reach `LLM.invoke` / `LLM.stream` without an explicit span. These sentinels are visible in dashboards and indicate missing instrumentation — fix the call site, don't rely on the fallback.
+- Never commit API keys or secrets to the repository
+- Use the encrypted credential storage for connector credentials
+- Follow existing RBAC patterns for new features
 
 ## Creating a Plan
 
-When creating a plan in the `plans` directory, make sure to include at least these elements:
+When creating a plan in the `plans` directory (gitignored — create it if it doesn't exist), make sure to
+include at least these elements:
 
 **Issues to Address**
 What the change is meant to do.
@@ -328,47 +206,31 @@ Keep it high level. You can reference certain files or functions though.
 
 Before writing your plan, make sure to do research. Explore the relevant sections in the codebase.
 
-## Error Handling
+## Reuse Existing Standards
 
-**Always raise `OnyxError` from `onyx.error_handling.exceptions` instead of `HTTPException`.
-Never hardcode status codes or use `starlette.status` / `fastapi.status` constants directly.**
+Before you add a helper, utility, pattern or convention, search the codebase for one that does
+the same job, and use it. For example, use the existing rate limiting, caching, URL validation,
+router and settings patterns. Do not invent a parallel mechanism. If the existing one does not
+do enough, extend it so other callers get the change too. A new pattern needs a reason that the
+existing ones cannot meet.
 
-A global FastAPI exception handler converts `OnyxError` into a JSON response with the standard
-`{"error_code": "...", "detail": "..."}` shape. This eliminates boilerplate and keeps error
-handling consistent across the entire backend.
+## Review Follow-up
 
-```python
-from onyx.error_handling.error_codes import OnyxErrorCode
-from onyx.error_handling.exceptions import OnyxError
+Use these rules when you fix findings from human or bot reviewers.
 
-# ✅ Good
-raise OnyxError(OnyxErrorCode.NOT_FOUND, "Session not found")
-
-# ✅ Good — no extra message needed
-raise OnyxError(OnyxErrorCode.UNAUTHENTICATED)
-
-# ✅ Good — upstream service with dynamic status code
-raise OnyxError(OnyxErrorCode.BAD_GATEWAY, detail, status_code_override=upstream_status)
-
-# ❌ Bad — using HTTPException directly
-raise HTTPException(status_code=404, detail="Session not found")
-
-# ❌ Bad — starlette constant
-raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
-```
-
-Available error codes are defined in `backend/onyx/error_handling/error_codes.py`. If a new error
-category is needed, add it there first — do not invent ad-hoc codes.
-
-**Upstream service errors:** When forwarding errors from an upstream service where the HTTP
-status code is dynamic (comes from the upstream response), use `status_code_override`:
-
-```python
-raise OnyxError(OnyxErrorCode.BAD_GATEWAY, detail, status_code_override=e.response.status_code)
-```
+- **Fix the class, not the instance.** Before you fix a finding, name its defect class in one line,
+  for example "limit counted in characters, not bytes". Search the PR for other instances. In a
+  stack, also search the later PRs. Fix all instances in one push, each in the stack PR that adds it.
+- **Review your fix diff.** Before you push, read `git diff <last reviewed commit>..HEAD` against
+  the comments. Fixes cause most late findings.
+- **Review locally first.** Before the first push, review the full diff with a local reviewer, for
+  example the `cli-review` skill. Handle its findings the same way.
+- **Push fixes together.** After a review round, push all fixes at one time. Request another full
+  bot round only if the round had P1 or P2 findings, or if a fix changed logic. For P3 and
+  doc-wording fixes, review the diff yourself and push without a new request.
 
 ## Best Practices
 
 In addition to the other content in this file, best practices for contributing
-to the codebase can be found in the "Engineering Best Practices" section of
-`CONTRIBUTING.md`. Understand its contents and follow them.
+to the codebase are in `contributing_guides/best_practices.md`. Understand its
+contents and follow them.

@@ -1,30 +1,41 @@
 import fnmatch
 import itertools
 from collections import deque
-from collections.abc import Iterable
-from collections.abc import Iterator
-from datetime import datetime
-from datetime import timezone
-from typing import Any
-from typing import TypeVar
+from collections.abc import Iterable, Iterator
+from datetime import datetime, timezone
+from typing import Any, TypeVar
+from urllib.parse import urlsplit
 
 import gitlab
 import pytz
+import requests
 from gitlab.v4.objects import Project
 
-from onyx.configs.app_configs import GITLAB_CONNECTOR_INCLUDE_CODE_FILES
-from onyx.configs.app_configs import INDEX_BATCH_SIZE
+from onyx.configs.app_configs import (
+    GITLAB_CONNECTOR_INCLUDE_CODE_FILES,
+    INDEX_BATCH_SIZE,
+)
 from onyx.configs.constants import DocumentSource
-from onyx.connectors.interfaces import GenerateDocumentsOutput
-from onyx.connectors.interfaces import LoadConnector
-from onyx.connectors.interfaces import PollConnector
-from onyx.connectors.interfaces import SecondsSinceUnixEpoch
-from onyx.connectors.models import BasicExpertInfo
-from onyx.connectors.models import ConnectorMissingCredentialError
-from onyx.connectors.models import Document
-from onyx.connectors.models import HierarchyNode
-from onyx.connectors.models import TextSection
+from onyx.connectors.cross_connector_utils.miscellaneous_utils import time_str_to_utc
+from onyx.connectors.exceptions import ConnectorValidationError
+from onyx.connectors.interfaces import (
+    GenerateDocumentsOutput,
+    LoadConnector,
+    PollConnector,
+    SecondsSinceUnixEpoch,
+)
+from onyx.connectors.models import (
+    BasicExpertInfo,
+    ConnectorMissingCredentialError,
+    Document,
+    HierarchyNode,
+    TextSection,
+)
+from onyx.server.security.models import connector_ssrf_enforced
+from onyx.server.security.store import get_security_settings
+from onyx.utils.datetime import datetime_to_utc
 from onyx.utils.logger import setup_logger
+from onyx.utils.url import SSRFException, validate_outbound_http_url
 
 T = TypeVar("T")
 
@@ -61,16 +72,30 @@ def get_author(author: Any) -> BasicExpertInfo:
     )
 
 
+def _gitlab_datetime_to_utc(value: Any) -> datetime | None:
+    """Normalize a GitLab timestamp to tz-aware UTC.
+
+    python-gitlab exposes REST attributes as raw JSON, so these arrive as
+    ISO-8601 strings; handle datetime values defensively too. Uses the shared
+    parser rather than a fixed format so whole-second timestamps (no fractional
+    part) don't raise.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return datetime_to_utc(value)
+    return time_str_to_utc(value)
+
+
 def _convert_merge_request_to_document(mr: Any) -> Document:
     doc = Document(
         id=mr.web_url,
         sections=[TextSection(link=mr.web_url, text=mr.description or "")],
         source=DocumentSource.GITLAB,
         semantic_identifier=mr.title,
-        # updated_at is UTC time but is timezone unaware, explicitly add UTC
-        # as there is logic in indexing to prevent wrong timestamped docs
-        # due to local time discrepancies with UTC
-        doc_updated_at=mr.updated_at.replace(tzinfo=timezone.utc),
+        doc_updated_at=_gitlab_datetime_to_utc(mr.updated_at),
+        # NOTE: doc_created_at population not yet verified against live data
+        doc_created_at=_gitlab_datetime_to_utc(mr.created_at),
         primary_owners=[get_author(mr.author)],
         metadata={"state": mr.state, "type": "MergeRequest"},
     )
@@ -83,12 +108,11 @@ def _convert_issue_to_document(issue: Any) -> Document:
         sections=[TextSection(link=issue.web_url, text=issue.description or "")],
         source=DocumentSource.GITLAB,
         semantic_identifier=issue.title,
-        # updated_at is UTC time but is timezone unaware, explicitly add UTC
-        # as there is logic in indexing to prevent wrong timestamped docs
-        # due to local time discrepancies with UTC
-        doc_updated_at=issue.updated_at.replace(tzinfo=timezone.utc),
+        doc_updated_at=_gitlab_datetime_to_utc(issue.updated_at),
+        # NOTE: doc_created_at population not yet verified against live data
+        doc_created_at=_gitlab_datetime_to_utc(issue.created_at),
         primary_owners=[get_author(issue.author)],
-        metadata={"state": issue.state, "type": issue.type if issue.type else "Issue"},
+        metadata={"state": issue.state, "type": issue.type or "Issue"},
     )
     return doc
 
@@ -120,7 +144,7 @@ def _convert_code_to_document(
         sections=[TextSection(link=file_url, text=file_content)],
         source=DocumentSource.GITLAB,
         semantic_identifier=file["name"],
-        doc_updated_at=datetime.now().replace(tzinfo=timezone.utc),
+        doc_updated_at=datetime.now(timezone.utc),
         primary_owners=[],  # Add owners if needed
         metadata={"type": "CodeFile"},
     )
@@ -130,6 +154,42 @@ def _convert_code_to_document(
 def _should_exclude(path: str) -> bool:
     """Check if a path matches any of the exclude patterns."""
     return any(fnmatch.fnmatch(path, pattern) for pattern in exclude_patterns)
+
+
+def _validate_credential_url(gitlab_url: str) -> None:
+    enforced: bool = connector_ssrf_enforced(
+        get_security_settings().ssrf_protection_level
+    )
+    try:
+        _ = urlsplit(gitlab_url).port
+        validate_outbound_http_url(
+            gitlab_url,
+            https_only=True,
+            allow_private_network=not enforced,
+            block_link_local_only=not enforced,
+        )
+    except (SSRFException, ValueError) as e:
+        raise ConnectorValidationError(f"Invalid GitLab URL '{gitlab_url}': {e}") from e
+
+
+class _GitlabSession(requests.Session):
+    def __init__(self, base_url: str) -> None:
+        super().__init__()
+        parsed = urlsplit(base_url)
+        self._host: str | None = parsed.hostname
+        self._port: int = parsed.port if parsed.port is not None else 443
+
+    def send(
+        self, request: requests.PreparedRequest, **kwargs: Any
+    ) -> requests.Response:
+        if request.url is None:
+            raise ConnectorValidationError("GitLab request has no destination")
+        _validate_credential_url(request.url)
+        parsed = urlsplit(request.url)
+        port = parsed.port if parsed.port is not None else 443
+        if parsed.hostname != self._host or port != self._port:
+            raise ConnectorValidationError("GitLab request changed credential origin")
+        return super().send(request, **kwargs)
 
 
 class GitlabConnector(LoadConnector, PollConnector):
@@ -153,8 +213,12 @@ class GitlabConnector(LoadConnector, PollConnector):
         self.gitlab_client: gitlab.Gitlab | None = None
 
     def load_credentials(self, credentials: dict[str, Any]) -> dict[str, Any] | None:
+        gitlab_url: str = credentials["gitlab_url"].strip()
+        _validate_credential_url(gitlab_url)
         self.gitlab_client = gitlab.Gitlab(
-            credentials["gitlab_url"], private_token=credentials["gitlab_access_token"]
+            gitlab_url,
+            private_token=credentials["gitlab_access_token"],
+            session=_GitlabSession(gitlab_url),
         )
         return None
 

@@ -11,7 +11,7 @@ test.describe.configure({ mode: "parallel" });
 const THEMES = ["light", "dark"] as const;
 
 for (const theme of THEMES) {
-  test.describe(`Welcome page — /app (${theme} mode)`, () => {
+  test.describe(`Welcome page: /app (${theme} mode)`, () => {
     test.beforeEach(async ({ page }) => {
       // Always log in before each test to ensure a valid session.
       await loginAs(page, "admin");
@@ -52,10 +52,7 @@ for (const theme of THEMES) {
     // ── Sidebar element screenshot ────────────────────────────────────
 
     test("sidebar element snapshot", async ({ page }) => {
-      // SidebarWrapper renders a div with `group/SidebarWrapper` Tailwind
-      // group class — this is the most stable identifier for the sidebar
-      // container element.
-      const sidebar = page.locator(".group\\/SidebarWrapper");
+      const sidebar = page.locator(".opal-sidebar-root__column");
       await sidebar.waitFor({ state: "visible", timeout: 10000 });
 
       await expectElementScreenshot(sidebar, {

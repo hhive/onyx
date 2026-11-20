@@ -1,13 +1,5 @@
 export const IS_DEV = process.env.NODE_ENV === "development";
 
-export enum AuthType {
-  BASIC = "basic",
-  GOOGLE_OAUTH = "google_oauth",
-  OIDC = "oidc",
-  SAML = "saml",
-  CLOUD = "cloud",
-}
-
 export const HOST_URL = process.env.WEB_DOMAIN || "http://localhost:3000";
 
 export const INTERNAL_URL = process.env.INTERNAL_URL || "http://localhost:8080";
@@ -18,19 +10,18 @@ export const APP_DISPLAY_NAME = "小逆talk";
 export const DOCS_BASE_URL = "https://docs.onyx.app";
 export const DOCS_ADMINS_PATH = `${DOCS_BASE_URL}/admins`;
 
+// The landing page's contact-sales form.
+export const CONTACT_SALES_URL = "https://www.onyx.app/contact-sales";
+
 export const MCP_INTERNAL_URL =
   process.env.MCP_INTERNAL_URL || "http://127.0.0.1:8090";
 
-// NOTE: this should ONLY be used on the server-side (including middleware).
-// The AUTH_TYPE environment variable is set in the backend and shared with Next.js
-export const SERVER_SIDE_ONLY__AUTH_TYPE = (process.env.AUTH_TYPE ||
-  AuthType.BASIC) as AuthType;
-
-export const NEXT_PUBLIC_DO_NOT_USE_TOGGLE_OFF_DANSWER_POWERED =
-  process.env.NEXT_PUBLIC_DO_NOT_USE_TOGGLE_OFF_DANSWER_POWERED?.toLowerCase() ===
-  "true";
-
-export const TENANT_ID_COOKIE_NAME = "onyx_tid";
+// Name of the FastAPI-Users auth cookie. Configurable via env (shared with the
+// backend's AUTH_COOKIE_NAME) so deployments sharing a hostname — e.g. parallel
+// local worktrees on different ports of localhost — keep separate auth cookies.
+// Server-side only: read in middleware, route handlers, and server components.
+export const SERVER_SIDE_ONLY__AUTH_COOKIE_NAME =
+  process.env.AUTH_COOKIE_NAME || "fastapiusersauth";
 
 export const SEARCH_TYPE_COOKIE_NAME = "search_type";
 export const AGENTIC_SEARCH_TYPE_COOKIE_NAME = "agentic_type";
@@ -38,21 +29,10 @@ export const AGENTIC_SEARCH_TYPE_COOKIE_NAME = "agentic_type";
 export const LOGOUT_DISABLED =
   process.env.NEXT_PUBLIC_DISABLE_LOGOUT?.toLowerCase() === "true";
 
-export const TOGGLED_CONNECTORS_COOKIE_NAME = "toggled_connectors";
-
 /* Enterprise-only settings */
 export const NEXT_PUBLIC_CUSTOM_REFRESH_URL =
   process.env.NEXT_PUBLIC_CUSTOM_REFRESH_URL;
 
-// NOTE: this should ONLY be used on the server-side. If used client side,
-// it will not be accurate (will always be false).
-// Mirrors backend logic: EE is enabled if EITHER the legacy flag OR license
-// enforcement is active. LICENSE_ENFORCEMENT_ENABLED defaults to true on the
-// backend, so we treat undefined as enabled here to match.
-export const SERVER_SIDE_ONLY__PAID_ENTERPRISE_FEATURES_ENABLED =
-  process.env.ENABLE_PAID_ENTERPRISE_EDITION_FEATURES?.toLowerCase() ===
-    "true" ||
-  process.env.LICENSE_ENFORCEMENT_ENABLED?.toLowerCase() !== "false";
 // NOTE: since this is a `NEXT_PUBLIC_` variable, it will be set at
 // build-time
 // TODO: consider moving this to an API call so that the api_server
@@ -127,17 +107,17 @@ export const ART_ASSISTANT_ID = -3;
 // The rest will be hidden behind an "All Recent Files" button.
 export const MAX_FILES_TO_SHOW = 3;
 
-// SIZES
-export const MOBILE_SIDEBAR_BREAKPOINT_PX = 724;
-export const DESKTOP_SMALL_BREAKPOINT_PX = 912;
-export const DESKTOP_MEDIUM_BREAKPOINT_PX = 1232;
+// SIZES — sidebar breakpoints are canonical in Opal; imported here for app consumers
+export {
+  SMALL_BREAKPOINT_PX,
+  MEDIUM_BREAKPOINT_PX,
+  LARGE_BREAKPOINT_PX,
+} from "@opal/constants";
 export const DEFAULT_AVATAR_SIZE_PX = 18;
 export const HORIZON_DISTANCE_PX = 800;
 export const DEFAULT_LOGO_SIZE_PX = 24;
 
 export const DEFAULT_CONTEXT_TOKENS = 120_000;
 export const MAX_CHUNKS_FED_TO_CHAT = 25;
-
-export const APP_SLOGAN = "Open Source AI Platform";
 
 export const DEFAULT_PAGE_SIZE = 10;

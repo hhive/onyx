@@ -3,25 +3,15 @@ from collections.abc import Generator
 from contextlib import nullcontext
 from io import BytesIO
 from typing import Any
-from unittest.mock import MagicMock
-from unittest.mock import Mock
-from unittest.mock import patch
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
-from sqlalchemy import create_engine
-from sqlalchemy import DateTime
-from sqlalchemy import Enum
-from sqlalchemy import String
-from sqlalchemy.orm import DeclarativeBase
-from sqlalchemy.orm import Mapped
-from sqlalchemy.orm import mapped_column
-from sqlalchemy.orm import Session
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy import DateTime, Enum, String, create_engine
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 from sqlalchemy.sql import func
 
 from onyx.configs.constants import FileOrigin
-from onyx.file_store.file_store import get_default_file_store
-from onyx.file_store.file_store import S3BackedFileStore
+from onyx.file_store.file_store import S3BackedFileStore, get_default_file_store
 from onyx.file_store.gcs_file_store import GCSBackedFileStore
 
 
@@ -592,7 +582,7 @@ class TestGCSFileStore:
                 return_value=nullcontext(mock_db_session),
             ),
             patch(
-                "onyx.file_store.gcs_file_store.get_filerecord_by_file_id_optional",
+                "onyx.file_store.gcs_file_store.get_filerecord_by_file_id_for_update",
                 return_value=mock_record,
             ),
             patch(
@@ -632,7 +622,7 @@ class TestGCSFileStore:
                 return_value=nullcontext(mock_db_session),
             ),
             patch(
-                "onyx.file_store.gcs_file_store.get_filerecord_by_file_id_optional",
+                "onyx.file_store.gcs_file_store.get_filerecord_by_file_id_for_update",
                 return_value=mock_record,
             ),
             patch(
@@ -659,7 +649,7 @@ class TestGCSFileStore:
                 return_value=nullcontext(mock_db_session),
             ),
             patch(
-                "onyx.file_store.gcs_file_store.get_filerecord_by_file_id_optional",
+                "onyx.file_store.gcs_file_store.get_filerecord_by_file_id_for_update",
                 return_value=None,
             ),
         ):
@@ -682,7 +672,7 @@ class TestGCSFileStore:
                 return_value=nullcontext(mock_db_session),
             ),
             patch(
-                "onyx.file_store.gcs_file_store.get_filerecord_by_file_id_optional",
+                "onyx.file_store.gcs_file_store.get_filerecord_by_file_id_for_update",
                 return_value=None,
             ),
         ):
@@ -697,7 +687,7 @@ class TestGCSFileStore:
             mock_db_session.rollback.assert_not_called()
 
     def test_gcs_change_file_id_mock(self) -> None:
-        """Test GCS change_file_id copies blob, upserts new record, and deletes old"""
+        """change_file_id repoints the record at the same blob — no copy/delete."""
         mock_record = Mock(
             bucket_name="test-bucket",
             object_key="onyx-files/public/old-id",
@@ -706,14 +696,7 @@ class TestGCSFileStore:
             file_type="text/plain",
             file_metadata=None,
         )
-        mock_source_blob = Mock()
-        mock_source_bucket = Mock()
-        mock_source_bucket.blob.return_value = mock_source_blob
-        mock_dest_bucket = Mock()
-
         mock_client = Mock()
-        # First call returns source bucket, second returns destination bucket
-        mock_client.bucket.side_effect = [mock_source_bucket, mock_dest_bucket]
 
         mock_db_session = MagicMock()
 
@@ -723,12 +706,12 @@ class TestGCSFileStore:
                 return_value=nullcontext(mock_db_session),
             ),
             patch(
-                "onyx.file_store.gcs_file_store.get_filerecord_by_file_id",
+                "onyx.db.file_record.get_filerecord_by_file_id_for_update",
                 return_value=mock_record,
             ),
-            patch("onyx.file_store.gcs_file_store.upsert_filerecord") as mock_upsert,
+            patch("onyx.db.file_record.upsert_filerecord") as mock_upsert,
             patch(
-                "onyx.file_store.gcs_file_store.delete_filerecord_by_file_id"
+                "onyx.db.file_record.delete_filerecord_by_file_id"
             ) as mock_delete_record,
             patch(
                 "onyx.file_store.gcs_file_store.get_current_tenant_id",
@@ -738,28 +721,25 @@ class TestGCSFileStore:
             file_store = GCSBackedFileStore(bucket_name="test-bucket")
             file_store._gcs_client = mock_client
 
-            file_store.change_file_id(
+            assert file_store.change_file_id(
                 old_file_id="old-id",
                 new_file_id="new-id",
                 db_session=mock_db_session,
             )
 
-            new_key = "onyx-files/public/new-id"
-            mock_source_bucket.copy_blob.assert_called_once_with(
-                mock_source_blob, mock_dest_bucket, new_key
-            )
+            # New record reuses the old bucket/object — the blob never moves.
             mock_upsert.assert_called_once()
             assert mock_upsert.call_args.kwargs["file_id"] == "new-id"
             assert mock_upsert.call_args.kwargs["bucket_name"] == "test-bucket"
-            assert mock_upsert.call_args.kwargs["object_key"] == new_key
+            assert (
+                mock_upsert.call_args.kwargs["object_key"] == "onyx-files/public/old-id"
+            )
             mock_delete_record.assert_called_once_with(
                 file_id="old-id", db_session=mock_db_session
             )
             mock_db_session.commit.assert_called_once()
-            mock_source_blob.delete.assert_called_once()
-            # Source blob deletion must happen after the DB commit
-            commit_call_order = mock_db_session.commit.call_args_list
-            assert commit_call_order, "expected db_session.commit to have been called"
+            # The GCS client is never touched at all — no copy, no delete.
+            mock_client.bucket.assert_not_called()
 
     def test_gcs_get_file_size_mock(self) -> None:
         """Test GCS get_file_size returns the blob size"""

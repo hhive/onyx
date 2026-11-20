@@ -1,12 +1,13 @@
 "use client";
 
 import { Formik, Form } from "formik";
+import { useTranslations } from "next-intl";
 import * as Yup from "yup";
 import { Button } from "@opal/components";
-import { useProjectsContext } from "@/providers/ProjectsContext";
-import { useModal } from "@/refresh-components/contexts/ModalContext";
+import { useProjectsContext } from "@/lib/projects/providers";
+import { useModal } from "@opal/components";
 import { SvgAddLines } from "@opal/icons";
-import Modal from "@/refresh-components/Modal";
+import { Modal } from "@opal/components";
 import InputTextAreaField from "@/refresh-components/form/InputTextAreaField";
 
 const validationSchema = Yup.object({
@@ -14,6 +15,7 @@ const validationSchema = Yup.object({
 });
 
 export default function AddInstructionModal() {
+  const t = useTranslations("skills.modals");
   const modal = useModal();
   const { currentProjectDetails, upsertInstructions } = useProjectsContext();
 
@@ -22,8 +24,8 @@ export default function AddInstructionModal() {
       <Modal.Content width="sm">
         <Modal.Header
           icon={SvgAddLines}
-          title="设置项目指令"
-          description="指定此项目中聊天会话的行为方式或语气。"
+          title={t("addInstruction.header.title")}
+          description={t("addInstruction.header.description")}
           onClose={() => modal.toggle(false)}
         />
         <Formik
@@ -47,7 +49,9 @@ export default function AddInstructionModal() {
               <Modal.Body>
                 <InputTextAreaField
                   name="instructions"
-                  placeholder="我的目标是... 请在回复中注意..."
+                  placeholder={t(
+                    "addInstruction.instructionsField.placeholder"
+                  )}
                 />
               </Modal.Body>
               <Modal.Footer>
@@ -56,13 +60,13 @@ export default function AddInstructionModal() {
                   type="button"
                   onClick={() => modal.toggle(false)}
                 >
-                  取消
+                  {t("addInstruction.cancelButton.label")}
                 </Button>
                 <Button
                   type="submit"
                   disabled={isSubmitting || !dirty || !isValid}
                 >
-                  保存指令
+                  {t("addInstruction.saveButton.label")}
                 </Button>
               </Modal.Footer>
             </Form>

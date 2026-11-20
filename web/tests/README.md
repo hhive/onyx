@@ -21,23 +21,29 @@ Comprehensive guide for writing integration tests in the Onyx web application us
 
 ```bash
 # Run all tests
-npm test
+bun run test
 
 # Run specific test file
-npm test -- EmailPasswordForm.test
+bun run test -- EmailPasswordForm.test
 
 # Run tests matching pattern
-npm test -- --testPathPattern="auth"
+bun run test -- --testPathPattern="auth"
 
 # Run without coverage
-npm test -- --no-coverage
+bun run test -- --no-coverage
 
 # Run in watch mode
-npm test -- --watch
+bun run test -- --watch
 
 # Run with verbose output
-npm test -- --verbose
+bun run test -- --verbose
 ```
+
+## Test timing
+
+oxlint rejects real-time waits (`setTimeout` or a frame inside a `Promise`), per-test
+timeouts and retries, and skips without a reason. Wait with `waitFor` or drive Jest fake
+timers. To disable a test, put `// Skip: <reason> <issue URL>` directly above it.
 
 ## Core Concepts
 
@@ -780,9 +786,9 @@ render(<Component />)
 
 See comprehensive test examples:
 
-- `src/app/auth/login/EmailPasswordForm.test.tsx` - Login/signup workflows, validation
-- `src/app/chat/input-prompts/InputPrompts.test.tsx` - CRUD operations, conditional rendering
-- `src/app/admin/configuration/llm/CustomLLMProviderUpdateForm.test.tsx` - Complex forms, multi-step workflows
+- `src/components/admin/connectors/AccessTypeForm.test.tsx` - Form defaults that depend on permissions
+- `src/views/SkillsPage.test.tsx` - Optimistic updates, conditional rendering
+- `src/sections/modals/skills/CreateSkillModal.test.tsx` - Modal workflows, pending and error states
 
 ## Built-in Mocks
 

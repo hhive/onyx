@@ -1,28 +1,9 @@
-import { FileDescriptor, Message } from "../interfaces";
+import { FileDescriptor, Message } from "@/app/app/types";
 
 export const SYSTEM_MESSAGE_ID = -3;
 export const SYSTEM_NODE_ID = -3;
 
 export type MessageTreeState = Map<number, Message>; // key is nodeId
-
-export function createInitialMessageTreeState(
-  initialMessages?: Map<number, Message> | Message[]
-): MessageTreeState {
-  if (!initialMessages) {
-    return new Map();
-  }
-  if (initialMessages instanceof Map) {
-    return new Map(initialMessages); // Shallow copy
-  }
-  return new Map(initialMessages.map((msg) => [msg.nodeId, msg]));
-}
-
-export function getMessage(
-  messages: MessageTreeState,
-  nodeId: number
-): Message | undefined {
-  return messages.get(nodeId);
-}
 
 export function getMessageByMessageId(
   messages: MessageTreeState,
@@ -163,58 +144,86 @@ export function upsertMessages(
   return newMessages;
 }
 
-export function removeMessage(
-  currentMessages: MessageTreeState,
-  nodeIdToRemove: number
+/** Preserve incognito content while reconnecting saved rows to the visible tree. */
+export function restoreIncognitoMessages(
+  saved: MessageTreeState,
+  local: MessageTreeState,
+  responseId?: number
 ): MessageTreeState {
-  if (!currentMessages.has(nodeIdToRemove)) {
-    return currentMessages; // Return original if message doesn't exist
+  const nodeIds = new Map<number, number>();
+  for (const message of local.values()) {
+    if (message.messageId !== undefined)
+      nodeIds.set(message.messageId, message.nodeId);
+  }
+  const localRoot = Array.from(local.values()).find(
+    (message) => message.type === "system"
+  );
+  const savedRoot = Array.from(saved.values()).find(
+    (message) => message.type === "system"
+  );
+  if (localRoot && savedRoot) nodeIds.set(savedRoot.nodeId, localRoot.nodeId);
+
+  const active = responseId === undefined ? undefined : saved.get(responseId);
+  const savedQuestion =
+    active?.parentNodeId != null ? saved.get(active.parentNodeId) : undefined;
+  const localChain = getLatestMessageChain(local);
+  const localQuestion = localChain.findLast(
+    (message) => message.type === "user"
+  );
+  // A reservation may reach the server before the reader attaches its IDs locally.
+  // Match only the active turn on the same parent branch.
+  if (
+    savedQuestion?.type === "user" &&
+    localQuestion &&
+    localQuestion.messageId === undefined &&
+    (savedQuestion.parentNodeId === null
+      ? localQuestion.parentNodeId === null
+      : nodeIds.get(savedQuestion.parentNodeId) === localQuestion.parentNodeId)
+  ) {
+    nodeIds.set(savedQuestion.nodeId, localQuestion.nodeId);
+  }
+  const localAnswer = localChain.at(-1);
+  if (
+    active?.type === "assistant" &&
+    localAnswer?.type === "assistant" &&
+    localAnswer.messageId === undefined &&
+    active.parentNodeId !== null &&
+    nodeIds.get(active.parentNodeId) === localAnswer.parentNodeId
+  ) {
+    nodeIds.set(active.nodeId, localAnswer.nodeId);
   }
 
-  const newMessages = new Map(currentMessages);
-  const messageToRemove = newMessages.get(nodeIdToRemove)!;
-
-  // Collect all descendant IDs to remove
-  const idsToRemove = new Set<number>();
-  const queue: number[] = [nodeIdToRemove];
-
-  while (queue.length > 0) {
-    const currentId = queue.shift()!;
-    if (!newMessages.has(currentId) || idsToRemove.has(currentId)) continue;
-    idsToRemove.add(currentId);
-
-    const currentMsg = newMessages.get(currentId);
-    if (currentMsg?.childrenNodeIds) {
-      currentMsg.childrenNodeIds.forEach((childId) => queue.push(childId));
-    }
-  }
-
-  // Remove all descendants
-  idsToRemove.forEach((id) => newMessages.delete(id));
-
-  // Update the parent
-  if (messageToRemove.parentNodeId !== null) {
-    const parent = newMessages.get(messageToRemove.parentNodeId);
-    if (parent) {
-      const updatedChildren = (parent.childrenNodeIds || []).filter(
-        (id) => id !== nodeIdToRemove
+  const messages = new Map(local);
+  const missing: Message[] = [];
+  for (const message of saved.values()) {
+    const nodeId = nodeIds.get(message.nodeId);
+    const retained = nodeId === undefined ? undefined : local.get(nodeId);
+    if (retained) {
+      messages.set(
+        retained.nodeId,
+        retained.messageId === message.messageId
+          ? retained
+          : { ...retained, messageId: message.messageId }
       );
-      const updatedParent = {
-        ...parent,
-        childrenNodeIds: updatedChildren,
-        // If the removed message was the latest, find the new latest (last in the updated children list)
-        latestChildNodeId:
-          parent.latestChildNodeId === nodeIdToRemove
-            ? updatedChildren.length > 0
-              ? updatedChildren[updatedChildren.length - 1]
-              : null
-            : parent.latestChildNodeId,
-      };
-      newMessages.set(parent.nodeId, updatedParent);
+      continue;
     }
+    missing.push({
+      ...message,
+      parentNodeId:
+        message.parentNodeId === null
+          ? null
+          : (nodeIds.get(message.parentNodeId) ?? message.parentNodeId),
+      childrenNodeIds: message.childrenNodeIds?.map(
+        (id) => nodeIds.get(id) ?? id
+      ),
+      latestChildNodeId:
+        message.latestChildNodeId == null
+          ? message.latestChildNodeId
+          : (nodeIds.get(message.latestChildNodeId) ??
+            message.latestChildNodeId),
+    });
   }
-
-  return newMessages;
+  return upsertMessages(messages, missing);
 }
 
 export function setMessageAsLatest(
@@ -246,6 +255,19 @@ export function setMessageAsLatest(
   newMessages.set(parent.nodeId, updatedParent);
 
   return newMessages;
+}
+
+/**
+ * The responses of the latest turn: the tip of the latest chain and, for a
+ * multi-model turn, its siblings.
+ */
+export function getLatestTurn(tree: MessageTreeState): Message[] {
+  const latest = getLatestMessageChain(tree).at(-1);
+  if (!latest) return [];
+  if (latest.parentNodeId === null) return [latest];
+  return (tree.get(latest.parentNodeId)?.childrenNodeIds ?? [latest.nodeId])
+    .map((nodeId) => tree.get(nodeId))
+    .filter((node): node is Message => node !== undefined);
 }
 
 export function getLatestMessageChain(messages: MessageTreeState): Message[] {
@@ -303,109 +325,6 @@ export function getLatestMessageChain(messages: MessageTreeState): Message[] {
   }
 
   return chain;
-}
-
-export function getHumanAndAIMessageFromMessageNumber(
-  messages: MessageTreeState,
-  messageNumber: number
-): { humanMessage: Message | null; aiMessage: Message | null } {
-  const latestChain = getLatestMessageChain(messages);
-  const messageIndex = latestChain.findIndex(
-    (msg) => msg.messageId === messageNumber
-  );
-
-  if (messageIndex === -1) {
-    // Maybe the message exists but isn't in the latest chain? Search the whole map.
-    const message = getMessageByMessageId(messages, messageNumber);
-    if (!message) return { humanMessage: null, aiMessage: null };
-
-    if (message.type === "user") {
-      // Find its latest child that is an agent
-      const potentialAiMessage =
-        message.latestChildNodeId !== null &&
-        message.latestChildNodeId !== undefined
-          ? messages.get(message.latestChildNodeId)
-          : undefined;
-      const aiMessage =
-        potentialAiMessage?.type === "assistant" ? potentialAiMessage : null;
-      return { humanMessage: message, aiMessage };
-    } else if (message.type === "assistant" || message.type === "error") {
-      const humanMessage =
-        message.parentNodeId !== null
-          ? messages.get(message.parentNodeId)
-          : null;
-      return {
-        humanMessage: humanMessage?.type === "user" ? humanMessage : null,
-        aiMessage: message,
-      };
-    }
-    return { humanMessage: null, aiMessage: null };
-  }
-
-  // Message is in the latest chain
-  const message = latestChain[messageIndex];
-  if (!message) {
-    console.error(`Message ${messageNumber} not found in the latest chain.`);
-    return { humanMessage: null, aiMessage: null };
-  }
-
-  if (message.type === "user") {
-    const potentialAiMessage = latestChain[messageIndex + 1];
-    const aiMessage =
-      potentialAiMessage?.type === "assistant" &&
-      potentialAiMessage.parentNodeId === message.nodeId
-        ? potentialAiMessage
-        : null;
-    return { humanMessage: message, aiMessage };
-  } else if (message.type === "assistant" || message.type === "error") {
-    const potentialHumanMessage = latestChain[messageIndex - 1];
-    const humanMessage =
-      potentialHumanMessage?.type === "user" &&
-      message.parentNodeId === potentialHumanMessage.nodeId
-        ? potentialHumanMessage
-        : null;
-    return { humanMessage, aiMessage: message };
-  }
-
-  return { humanMessage: null, aiMessage: null };
-}
-
-export function getLastSuccessfulMessageId(
-  messages: MessageTreeState,
-  chain?: Message[]
-): number | null {
-  const messageChain = chain || getLatestMessageChain(messages);
-  for (let i = messageChain.length - 1; i >= 0; i--) {
-    const message = messageChain[i];
-    if (!message) {
-      console.error(`Message ${i} not found in the message chain.`);
-      continue;
-    }
-
-    // don't include failed / not-completed messages
-    if (message.type !== "error" && message.messageId !== undefined) {
-      return message.messageId ?? null;
-    }
-  }
-
-  // If the chain starts with an error or is empty, check for system message
-  const systemMessage = messages.get(SYSTEM_NODE_ID);
-  if (systemMessage) {
-    // Check if the system message itself is considered "successful" (it usually is)
-    // Or if it has a successful child
-    const childNodeId = systemMessage.latestChildNodeId;
-    if (childNodeId !== null && childNodeId !== undefined) {
-      const firstRealMessage = messages.get(childNodeId);
-      if (firstRealMessage && firstRealMessage.type !== "error") {
-        return firstRealMessage.messageId ?? null;
-      }
-    }
-    // If no successful child, return the system message ID itself as the root?
-    // This matches the class behavior implicitly returning the root ID if nothing else works.
-    return systemMessage.messageId ?? null;
-  }
-
-  return null; // No successful message found
 }
 
 interface BuildEmptyMessageParams {

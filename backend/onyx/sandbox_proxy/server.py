@@ -3,32 +3,70 @@
 import asyncio
 import os
 import signal
+import socket
 import sys
 import threading
 import uuid
 from collections.abc import Callable
-from http.server import BaseHTTPRequestHandler
-from http.server import HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from mitmproxy.options import Options
 from mitmproxy.tools.dump import DumpMaster
 
+from onyx.cache.factory import get_cache_backend, get_shared_cache_backend
 from onyx.cache.interface import CacheBackend
-from onyx.db.engine.sql_engine import get_session_with_tenant
 from onyx.db.engine.sql_engine import SqlEngine
-from onyx.sandbox_proxy.action_matcher import SlackPostMessageMatcher
 from onyx.sandbox_proxy.addons.gate import GateAddon
-from onyx.sandbox_proxy.ca import CABootstrap
-from onyx.sandbox_proxy.ca import MaterializedCA
-from onyx.sandbox_proxy.ca_k8s import K8sSecretCAStore
-from onyx.sandbox_proxy.identity import IdentityResolver
-from onyx.sandbox_proxy.identity import SandboxIPLookup
-from onyx.sandbox_proxy.identity_k8s import K8sInformerLookup
-from onyx.sandbox_proxy.snapshot_egress import SnapshotEgressPolicy
-from onyx.server.features.build.configs import SANDBOX_NAMESPACE
-from onyx.server.features.build.configs import SANDBOX_PROXY_HEALTHZ_PORT
-from onyx.server.features.build.configs import SANDBOX_PROXY_LISTEN_PORT
+from onyx.sandbox_proxy.certificate_authority.bootstrap import (
+    CABootstrap,
+    MaterializedCA,
+    build_ca_store,
+)
+from onyx.sandbox_proxy.credential_injection import (
+    CredentialInjectionDispatcher,
+    CredentialResolver,
+)
+from onyx.sandbox_proxy.destination_policy import (
+    UpstreamEventLoop,
+    parse_destination_policy,
+)
+from onyx.sandbox_proxy.models import DestinationPolicyConfig
+from onyx.sandbox_proxy.relay_tls import RelayTLSConfig, RelayTLSListener, loopback_for
+from onyx.sandbox_proxy.request_evaluator import IntegrationRequestEvaluator
+from onyx.sandbox_proxy.resolvers.integration import IntegrationResolver
+from onyx.sandbox_proxy.resolvers.onyx_pat import OnyxPatResolver
+from onyx.sandbox_proxy.sandbox_identity.resolution import (
+    IdentityResolver,
+    SandboxIPLookup,
+    build_ip_lookup,
+)
+from onyx.sandbox_proxy.sandbox_identity.signed import SignedIdentityVerifier
+from onyx.sandbox_proxy.sandbox_identity.signed_lookups import (
+    CachedNodeSigningKeyLookup,
+    CacheReplayGuard,
+    CacheSandboxPlacementLookup,
+)
+from onyx.sandbox_proxy.usable_integrations import UsableIntegrations
+from onyx.server.features.build.configs import (
+    ONYX_SERVER_URL,
+    SANDBOX_NAMESPACE,
+    SANDBOX_PROXY_ALLOW_GLOBAL_CLIENTS,
+    SANDBOX_PROXY_HEALTHZ_PORT,
+    SANDBOX_PROXY_INTERNAL_CIDRS,
+    SANDBOX_PROXY_LISTEN_HOST,
+    SANDBOX_PROXY_LISTEN_PORT,
+    SANDBOX_PROXY_RELAY_TLS_ALLOWED_SANS,
+    SANDBOX_PROXY_RELAY_TLS_CERT_PATH,
+    SANDBOX_PROXY_RELAY_TLS_CLIENT_CA_PATH,
+    SANDBOX_PROXY_RELAY_TLS_KEY_PATH,
+    SANDBOX_PROXY_RELAY_TLS_PORT,
+    SANDBOX_PROXY_SSL_VERIFY_UPSTREAM_TRUSTED_CA,
+    SANDBOX_RUNTIME,
+    SandboxRuntime,
+)
+from onyx.utils.encryption import validate_encryption_configuration
 from onyx.utils.logger import setup_logger
+from onyx.utils.variable_functionality import set_is_ee_if_available
 
 _DB_POOL_SIZE = 4
 _DB_MAX_OVERFLOW = 4
@@ -37,12 +75,16 @@ _DB_APP_NAME = "sandbox_proxy"
 # Cap on the SIGTERM drain; only fires if `GateAddon.drain_inflight` hangs.
 _DRAIN_TIMEOUT_S = 10.0
 
-# Startup sync deadline; past it the proxy exits rather than serve traffic
-# with unbacked identity.
+# Startup sync deadline; past it the proxy exits rather than serve traffic with
+# unbacked identity.
 _LOOKUP_INITIAL_SYNC_TIMEOUT_S = 60.0
 
-# Must be the parent of ca._DEFAULT_CA_PEM_PATH.
-_MITM_CONFDIR = "/var/run/sandbox-proxy/mitmproxy-confdir"
+# Default suits prod (root in /var/run/ tmpfs, K8s-standard); env-tunable so
+# local-dev runs without root can point at /tmp.
+_MITM_CONFDIR = os.environ.get(
+    "SANDBOX_PROXY_MITM_CONFDIR",
+    "/var/run/sandbox-proxy/mitmproxy-confdir",
+)
 
 logger = setup_logger()
 
@@ -93,10 +135,22 @@ def _build_healthz_handler(
     return _HealthzHandler
 
 
+class _IPv6HTTPServer(HTTPServer):
+    address_family = socket.AF_INET6
+
+    def server_bind(self) -> None:
+        # Match mitmproxy: an explicit IPv6 host serves IPv6 clients only.
+        self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        super().server_bind()
+
+
 def _start_healthz_server(readiness: _Readiness, lookup: SandboxIPLookup) -> HTTPServer:
     handler = _build_healthz_handler(readiness, lookup)
-    server = HTTPServer(
-        ("0.0.0.0", SANDBOX_PROXY_HEALTHZ_PORT),  # noqa: S104 — container scope
+    server_class: type[HTTPServer] = (
+        _IPv6HTTPServer if ":" in SANDBOX_PROXY_LISTEN_HOST else HTTPServer
+    )
+    server = server_class(
+        (SANDBOX_PROXY_LISTEN_HOST, SANDBOX_PROXY_HEALTHZ_PORT),
         handler,
     )
     thread = threading.Thread(
@@ -105,32 +159,30 @@ def _start_healthz_server(readiness: _Readiness, lookup: SandboxIPLookup) -> HTT
         daemon=True,
     )
     thread.start()
-    logger.info("healthz listening on 0.0.0.0:%d", SANDBOX_PROXY_HEALTHZ_PORT)
+    logger.info(
+        "healthz listening on [%s]:%d",
+        SANDBOX_PROXY_LISTEN_HOST,
+        SANDBOX_PROXY_HEALTHZ_PORT,
+    )
     return server
 
 
 def _bootstrap_ca() -> MaterializedCA:
-    return CABootstrap(store=K8sSecretCAStore()).ensure_ca()
+    # Pass pem_path explicitly so it tracks _MITM_CONFDIR. ca.py's default
+    # points at /var/run/...; we cannot let the two drift, since mitmproxy
+    # auto-loads $confdir/mitmproxy-ca.pem and would otherwise never see what
+    # CABootstrap wrote.
+    return CABootstrap(
+        store=build_ca_store(),
+        pem_path=f"{_MITM_CONFDIR}/mitmproxy-ca.pem",
+    ).ensure_ca()
 
 
-def _build_lookup() -> K8sInformerLookup:
-    lookup = K8sInformerLookup()
-    lookup.start()
-    synced = lookup.wait_for_initial_sync(
-        timeout_seconds=_LOOKUP_INITIAL_SYNC_TIMEOUT_S
-    )
-    if not synced:
-        raise RuntimeError(
-            "Sandbox IP lookup did not complete initial sync within "
-            f"{_LOOKUP_INITIAL_SYNC_TIMEOUT_S:.1f}s; refusing to "
-            "serve traffic with unbacked identity"
-        )
-    return lookup
-
-
-def _build_cache_factory() -> "Callable[[str], CacheBackend]":
-    """tenant_id → CacheBackend; must match the API side's namespace to share keys."""
-    from onyx.cache.factory import get_cache_backend
+def _build_cache_factory() -> Callable[[str], CacheBackend]:
+    """
+    tenant_id -> CacheBackend; Must match the API side's namespace to share
+    keys.
+    """
 
     def _factory(tenant_id: str) -> CacheBackend:
         return get_cache_backend(tenant_id=tenant_id)
@@ -138,18 +190,48 @@ def _build_cache_factory() -> "Callable[[str], CacheBackend]":
     return _factory
 
 
-def _build_mitm_options() -> Options:
-    return Options(
-        listen_host="0.0.0.0",  # noqa: S104 — container scope; pod network only
-        listen_port=SANDBOX_PROXY_LISTEN_PORT,
-        confdir=_MITM_CONFDIR,
-        mode=["regular"],
-        ssl_insecure=False,
+def _build_mitm_master() -> DumpMaster:
+    master: DumpMaster = DumpMaster(
+        options=Options(
+            listen_host=SANDBOX_PROXY_LISTEN_HOST,
+            listen_port=SANDBOX_PROXY_LISTEN_PORT,
+            confdir=_MITM_CONFDIR,
+            mode=["regular"],
+            ssl_insecure=False,
+            # Every forwarded request must pass the HTTP policy and credential hooks.
+            rawtcp=False,
+            ssl_verify_upstream_trusted_ca=SANDBOX_PROXY_SSL_VERIFY_UPSTREAM_TRUSTED_CA,
+        ),
+        with_termlog=False,
+        with_dumper=False,
     )
+    # DumpMaster registers block_global; gate still requires pod identity.
+    master.options.update(block_global=not SANDBOX_PROXY_ALLOW_GLOBAL_CLIENTS)
+    return master
 
 
 async def _run_master(master: DumpMaster) -> None:
     await master.run()
+
+
+def build_resolvers(
+    integration_resolver: IntegrationResolver | None = None,
+) -> list[CredentialResolver]:
+    """Builds the registered credential resolvers, in first-claim-wins order.
+
+    Host-claim sets are designed to be disjoint (integration requests are
+    attributed by the evaluator; the Onyx PAT resolver claims the Onyx API
+    host). Order is a safety net against accidental overlap, not a
+    designed-in priority.
+    """
+    return [
+        OnyxPatResolver(),
+        (
+            integration_resolver
+            if integration_resolver is not None
+            else IntegrationResolver()
+        ),
+    ]
 
 
 def _install_signal_handlers(
@@ -164,17 +246,17 @@ def _install_signal_handlers(
             await asyncio.wait_for(gate.drain_inflight(), timeout=_DRAIN_TIMEOUT_S)
         except asyncio.TimeoutError:
             logger.warning(
-                "gate drain exceeded %.1fs; exiting anyway",
+                "Gate drain exceeded %.1fs; Exiting anyway.",
                 _DRAIN_TIMEOUT_S,
             )
         except Exception:
-            logger.exception("gate drain raised; exiting anyway")
+            logger.exception("Gate drain raised; Exiting anyway.")
         master.shutdown()
 
     def _on_signal() -> None:
         if readiness.shutting_down:
             return
-        logger.info("SIGTERM received; flipping readiness and draining")
+        logger.info("SIGTERM received; Flipping readiness and draining.")
         readiness.shutting_down = True
         lookup.stop()
         loop.create_task(_drain_and_shutdown())
@@ -183,9 +265,68 @@ def _install_signal_handlers(
         loop.add_signal_handler(sig, _on_signal)
 
 
+def _build_destination_policy() -> DestinationPolicyConfig:
+    cidrs: list[str] = (
+        SANDBOX_PROXY_INTERNAL_CIDRS.split(",") if SANDBOX_PROXY_INTERNAL_CIDRS else []
+    )
+    if (
+        SANDBOX_PROXY_ALLOW_GLOBAL_CLIENTS or ":" in SANDBOX_PROXY_LISTEN_HOST
+    ) and not cidrs:
+        raise ValueError(
+            "SANDBOX_PROXY_INTERNAL_CIDRS is required for IPv6 sandbox networking"
+        )
+    return parse_destination_policy(ONYX_SERVER_URL, cidrs)
+
+
+def _relay_tls_config() -> RelayTLSConfig | None:
+    if not SANDBOX_PROXY_RELAY_TLS_PORT:
+        return None
+    if SANDBOX_RUNTIME is not SandboxRuntime.FIRECRACKER:
+        raise ValueError(
+            "SANDBOX_PROXY_RELAY_TLS_PORT needs SANDBOX_RUNTIME=firecracker"
+        )
+    paths = (
+        SANDBOX_PROXY_RELAY_TLS_CERT_PATH,
+        SANDBOX_PROXY_RELAY_TLS_KEY_PATH,
+        SANDBOX_PROXY_RELAY_TLS_CLIENT_CA_PATH,
+    )
+    if not all(paths):
+        raise ValueError(
+            "SANDBOX_PROXY_RELAY_TLS_PORT needs SANDBOX_PROXY_RELAY_TLS_CERT_PATH, "
+            "SANDBOX_PROXY_RELAY_TLS_KEY_PATH and SANDBOX_PROXY_RELAY_TLS_CLIENT_CA_PATH"
+        )
+    return RelayTLSConfig(
+        port=SANDBOX_PROXY_RELAY_TLS_PORT,
+        cert_path=SANDBOX_PROXY_RELAY_TLS_CERT_PATH,
+        key_path=SANDBOX_PROXY_RELAY_TLS_KEY_PATH,
+        client_ca_path=SANDBOX_PROXY_RELAY_TLS_CLIENT_CA_PATH,
+        allowed_sans=frozenset(SANDBOX_PROXY_RELAY_TLS_ALLOWED_SANS),
+    )
+
+
+def build_relay_tls_listener() -> RelayTLSListener | None:
+    """Raises if the setup is partial or a file does not load: the proxy
+    then exits instead of leaving the relays without their port."""
+    config = _relay_tls_config()
+    if config is None:
+        return None
+    return RelayTLSListener(
+        config,
+        listen_host=SANDBOX_PROXY_LISTEN_HOST,
+        upstream_host=loopback_for(SANDBOX_PROXY_LISTEN_HOST),
+        upstream_port=SANDBOX_PROXY_LISTEN_PORT,
+    )
+
+
 def main() -> int:
+    destination_policy = _build_destination_policy()
+    relay_tls = build_relay_tls_listener()
+    set_is_ee_if_available()
+    validate_encryption_configuration()
+
     logger.info(
-        "starting sandbox proxy listen=%d healthz=%d namespace=%s",
+        "Starting sandbox proxy host=%s listen=%d healthz=%d namespace=%s",
+        SANDBOX_PROXY_LISTEN_HOST,
         SANDBOX_PROXY_LISTEN_PORT,
         SANDBOX_PROXY_HEALTHZ_PORT,
         SANDBOX_NAMESPACE,
@@ -196,42 +337,67 @@ def main() -> int:
     SqlEngine.set_app_name(_DB_APP_NAME)
     SqlEngine.init_engine(pool_size=_DB_POOL_SIZE, max_overflow=_DB_MAX_OVERFLOW)
 
-    materialized_ca = _bootstrap_ca()
-    readiness.ca_ready = True
-    logger.info("CA bootstrapped at %s", materialized_ca.pem_path)
-
-    lookup = _build_lookup()
+    # Bind healthz before the blocking CA bootstrap and informer sync below, so
+    # the probe endpoint answers from t=0 — reporting 503 (not connection-refused)
+    # until startup finishes. Otherwise a slow startup k8s call leaves the port
+    # unbound and the liveness probe SIGKILLs the pod mid-boot. ca_ready and
+    # is_synced() are false pre-startup, so /healthz stays not-ready until
+    # genuinely ready.
+    lookup = build_ip_lookup()
     healthz_server: HTTPServer | None = None
     try:
-        readiness.lookup_ready = True
-        logger.info("informer initial sync complete")
-
         healthz_server = _start_healthz_server(readiness, lookup)
+
+        materialized_ca = _bootstrap_ca()
+        readiness.ca_ready = True
+        logger.info("CA bootstrapped at %s", materialized_ca.pem_path)
+
+        lookup.start()
+        if not lookup.wait_for_initial_sync(
+            timeout_seconds=_LOOKUP_INITIAL_SYNC_TIMEOUT_S
+        ):
+            raise RuntimeError(
+                "Sandbox IP lookup did not complete initial sync within "
+                f"{_LOOKUP_INITIAL_SYNC_TIMEOUT_S:.1f}s; refusing to serve traffic "
+                "with unbacked identity."
+            )
+        readiness.lookup_ready = True
+        logger.info("Informer initial sync complete.")
 
         identity = IdentityResolver(ip_lookup=lookup)
         proxy_instance_id = os.environ.get("HOSTNAME") or str(uuid.uuid4())
-        snapshot_policy = SnapshotEgressPolicy.from_env()
-        if snapshot_policy is not None:
-            logger.info(
-                "snapshot egress streaming enabled bucket=%s endpoint_host=%s",
-                snapshot_policy.bucket,
-                snapshot_policy.endpoint_host,
+        usable = UsableIntegrations()
+        integration_resolver = IntegrationResolver(usable)
+        resolvers = build_resolvers(integration_resolver)
+        logger.info(
+            "Credential resolvers registered: %s",
+            [type(r).__name__ for r in resolvers],
+        )
+        cache_factory = _build_cache_factory()
+        # Only the Firecracker runtime has a relay that signs VM identity.
+        signed_identity = (
+            SignedIdentityVerifier(
+                signing_keys=CachedNodeSigningKeyLookup(get_shared_cache_backend),
+                placement=CacheSandboxPlacementLookup(cache_factory),
+                replay_guard=CacheReplayGuard(cache_factory),
             )
+            if SANDBOX_RUNTIME is SandboxRuntime.FIRECRACKER
+            else None
+        )
         gate = GateAddon(
+            integration_resolver=integration_resolver,
+            destination_policy=destination_policy,
             identity=identity,
-            action_matcher=SlackPostMessageMatcher(),
-            db_session_factory=lambda tenant_id: get_session_with_tenant(
-                tenant_id=tenant_id
-            ),
-            cache_factory=_build_cache_factory(),
+            signed_identity=signed_identity,
+            request_evaluator=IntegrationRequestEvaluator(usable),
+            cache_factory=cache_factory,
             proxy_instance_id=proxy_instance_id,
-            snapshot_policy=snapshot_policy,
+            credential_dispatcher=CredentialInjectionDispatcher(resolvers),
         )
 
         # DumpMaster binds to the running event loop in its constructor.
         async def _async_main() -> None:
-            options = _build_mitm_options()
-            master = DumpMaster(options=options, with_termlog=True, with_dumper=False)
+            master: DumpMaster = _build_mitm_master()
             master.addons.add(gate)
             _install_signal_handlers(
                 asyncio.get_running_loop(),
@@ -240,16 +406,22 @@ def main() -> int:
                 lookup,
                 gate,
             )
-            await _run_master(master)
+            if relay_tls is not None:
+                await relay_tls.start()
+            try:
+                await _run_master(master)
+            finally:
+                if relay_tls is not None:
+                    await relay_tls.close()
 
-        asyncio.run(_async_main())
+        asyncio.run(_async_main(), loop_factory=UpstreamEventLoop)
     finally:
         lookup.stop()
         if healthz_server is not None:
             healthz_server.shutdown()
             healthz_server.server_close()
 
-    logger.info("sandbox proxy exiting cleanly")
+    logger.info("Sandbox proxy exiting cleanly.")
     return 0
 
 

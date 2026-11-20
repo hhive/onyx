@@ -79,18 +79,13 @@ function Confirm-Action {
 }
 
 function Prompt-VersionTag {
+    # Craft uses the regular backend image (ENABLE_CRAFT is a runtime flag), so
+    # the tag is prompted for normally even with --include-craft.
     Print-Info "Which tag would you like to deploy?"
-    if ($script:IncludeCraftMode) {
-        Write-Host "  - Press Enter for craft-latest (recommended for Craft)"
-        Write-Host "  - Type a specific tag (e.g., craft-v1.0.0)"
-        $version = Prompt-OrDefault "Enter tag [default: craft-latest]" "craft-latest"
-    } else {
-        Write-Host "  - Press Enter for edge (recommended)"
-        Write-Host "  - Type a specific tag (e.g., v0.1.0)"
-        $version = Prompt-OrDefault "Enter tag [default: edge]" "edge"
-    }
-    if     ($script:IncludeCraftMode -and $version -eq "craft-latest") { Print-Info "Selected: craft-latest (Craft enabled)" }
-    elseif ($version -eq "edge") { Print-Info "Selected: edge (latest nightly)" }
+    Write-Host "  - Press Enter for edge (recommended)"
+    Write-Host "  - Type a specific tag (e.g., v0.1.0)"
+    $version = Prompt-OrDefault "Enter tag [default: edge]" "edge"
+    if ($version -eq "edge") { Print-Info "Selected: edge (latest nightly)" }
     else   { Print-Info "Selected: $version" }
     return $version
 }
@@ -99,7 +94,7 @@ function Prompt-DeploymentMode {
     param([string]$LiteOverlayPath)
     if ($script:LiteMode) { Print-Info "Deployment mode: Lite (set via -Lite flag)"; return }
     Print-Info "Which deployment mode would you like?"
-    Write-Host "  1) Lite      - Minimal deployment (no Vespa, Redis, or model servers)"
+    Write-Host "  1) Lite      - Minimal deployment (no OpenSearch, Redis, or model servers)"
     Write-Host "                  LLM chat, tools, file uploads, and Projects still work"
     Write-Host "  2) Standard  - Full deployment with search, connectors, and RAG"
     $modeChoice = Prompt-OrDefault "Choose a mode (1 or 2) [default: 1]" "1"
@@ -110,14 +105,6 @@ function Prompt-DeploymentMode {
         Print-Info "Selected: Lite mode"
         if (-not (Ensure-OnyxFile $LiteOverlayPath "$($script:GitHubRawUrl)/$($script:LiteComposeFile)" $script:LiteComposeFile)) { exit 1 }
     }
-}
-
-function Assert-NotCraftLite {
-    param([string]$Tag)
-    if (-not ($script:LiteMode -and $Tag -match '^craft-')) { return }
-    Print-OnyxError "Cannot use a craft image tag ($Tag) with Lite mode."
-    Print-Info "Craft requires services (Vespa, Redis, background workers) that lite mode disables."
-    exit 1
 }
 
 function Refresh-PathFromRegistry {
@@ -327,7 +314,7 @@ function Show-OnyxHelp {
     $help += "`nUsage: .\install.ps1 [OPTIONS]`n"
     $help += "`nOptions:"
     $help += "`n  -IncludeCraft  Enable Onyx Craft (AI-powered web app building)"
-    $help += "`n  -Lite          Deploy Onyx Lite (no Vespa, Redis, or model servers)"
+    $help += "`n  -Lite          Deploy Onyx Lite (no OpenSearch, Redis, or model servers)"
     $help += "`n  -Local         Use existing config files instead of downloading from GitHub"
     $help += "`n  -Shutdown      Stop (pause) Onyx containers"
     $help += "`n  -DeleteData    Remove all Onyx data (containers, volumes, and files)"
@@ -939,6 +926,14 @@ function Main {
     if (-not (Ensure-OnyxFile $envTemplateDest "$($script:GitHubRawUrl)/env.template" "env.template")) { exit 1 }
     if (-not (Ensure-OnyxFile (Join-Path $script:InstallRoot "data\nginx\app.conf.template") "$($script:NginxBaseUrl)/app.conf.template" "nginx/app.conf.template")) { exit 1 }
     if (-not (Ensure-OnyxFile (Join-Path $script:InstallRoot "data\nginx\run-nginx.sh") "$($script:NginxBaseUrl)/run-nginx.sh" "nginx/run-nginx.sh")) { exit 1 }
+    foreach ($nginxInclude in @("mcp.conf.inc.template", "mcp_upstream.conf.inc.template", "webhook.conf.inc")) {
+        $nginxIncludePath = Join-Path $script:InstallRoot "data\nginx\$nginxInclude"
+        if ($Local -and -not (Test-Path $nginxIncludePath)) {
+            Print-Warning "nginx/$nginxInclude is missing. nginx starts without its routes."
+            continue
+        }
+        if (-not (Ensure-OnyxFile $nginxIncludePath "$($script:NginxBaseUrl)/$nginxInclude" "nginx/$nginxInclude")) { exit 1 }
+    }
     if (-not (Ensure-OnyxFile (Join-Path $script:InstallRoot "README.md") "$($script:GitHubRawUrl)/README.md" "README.md")) { exit 1 }
 
     $gitkeep = Join-Path $script:InstallRoot "data\nginx\local\.gitkeep"
@@ -970,18 +965,23 @@ function Main {
         $reply = Prompt-OrDefault "Choose an option [default: restart]" ""
 
         Prompt-DeploymentMode -LiteOverlayPath $liteOverlayPath
+        if ($script:LiteMode -and $script:IncludeCraftMode) {
+            Print-OnyxError "-IncludeCraft cannot be used with Lite mode."
+            exit 1
+        }
 
         if ($reply -eq "update") {
             $version = Prompt-VersionTag
-            Assert-NotCraftLite $version
             Set-EnvFileValue -Path $envFile -Key "IMAGE_TAG" -Value $version
             Print-Success "Updated IMAGE_TAG to $version"
-            if ($version -match '^craft-') {
-                Set-EnvFileValue -Path $envFile -Key "ENABLE_CRAFT" -Value "true" -Uncomment
-            }
         } else {
-            Assert-NotCraftLite (Get-EnvFileValue -Path $envFile -Key "IMAGE_TAG")
             Print-Info "Keeping existing configuration"
+        }
+        # Honor -IncludeCraft on existing installs regardless of update/restart;
+        # ENABLE_CRAFT is a runtime flag, so enabling it doesn't require a new tag.
+        if ($script:IncludeCraftMode) {
+            Set-EnvFileValue -Path $envFile -Key "ENABLE_CRAFT" -Value "true" -Uncomment
+            Print-Success "Onyx Craft enabled (ENABLE_CRAFT=true)"
         }
         if ($script:LiteMode) {
             $profiles = Get-EnvFileValue -Path $envFile -Key "COMPOSE_PROFILES"
@@ -999,24 +999,21 @@ function Main {
         if ($script:LiteMode) { $script:ExpectedDockerRamGB = 4; $script:ExpectedDiskGB = 16 }
 
         $version = Prompt-VersionTag
-        Assert-NotCraftLite $version
 
         Copy-Item -Path $envTemplateDest -Destination $envFile -Force
         Set-EnvFileValue -Path $envFile -Key "IMAGE_TAG" -Value $version
         Print-Success "IMAGE_TAG set to $version"
         if ($script:LiteMode) { Set-EnvFileValue -Path $envFile -Key "COMPOSE_PROFILES" -Value "" }
-        Set-EnvFileValue -Path $envFile -Key "AUTH_TYPE" -Value "basic"
-        Print-Success "Basic authentication enabled"
         Set-EnvFileValue -Path $envFile -Key "USER_AUTH_SECRET" -Value "`"$(New-SecureSecret)`""
         Print-Success "Generated secure USER_AUTH_SECRET"
-        if ($script:IncludeCraftMode -or $version -match '^craft-') {
+        if ($script:IncludeCraftMode) {
             Set-EnvFileValue -Path $envFile -Key "ENABLE_CRAFT" -Value "true" -Uncomment
             Print-Success "Onyx Craft enabled"
         } else {
             Print-Info "Onyx Craft disabled (use -IncludeCraft to enable)"
         }
         Print-Success ".env file created"
-        Print-Info "You can customize .env later for OAuth/SAML, AI models, domain settings, and Craft."
+        Print-Info "You can customize .env later for AI models, domain settings, and Craft."
     }
 
     # Clean up stale lite overlay if standard mode was selected
@@ -1034,7 +1031,7 @@ function Main {
     Print-Success "Using port $availablePort for nginx"
 
     $currentImageTag = Get-EnvFileValue -Path $envFile -Key "IMAGE_TAG"
-    $useLatest = ($currentImageTag -eq "edge" -or $currentImageTag -eq "latest" -or $currentImageTag -match '^craft-')
+    $useLatest = ($currentImageTag -eq "edge" -or $currentImageTag -eq "latest")
     if ($useLatest) { Print-Info "Using '$currentImageTag' tag - will force pull and recreate containers" }
 
     # For pinned version tags, re-download config files from that tag so the
@@ -1046,6 +1043,9 @@ function Main {
             Download-OnyxFile "$pinnedBase/docker_compose/docker-compose.yml" $composeDest
             try { Download-OnyxFile "$pinnedBase/data/nginx/app.conf.template" (Join-Path $script:InstallRoot "data\nginx\app.conf.template") } catch {}
             try { Download-OnyxFile "$pinnedBase/data/nginx/run-nginx.sh" (Join-Path $script:InstallRoot "data\nginx\run-nginx.sh") } catch {}
+            foreach ($nginxInclude in @("mcp.conf.inc.template", "mcp_upstream.conf.inc.template", "webhook.conf.inc")) {
+                try { Download-OnyxFile "$pinnedBase/data/nginx/$nginxInclude" (Join-Path $script:InstallRoot "data\nginx\$nginxInclude") } catch {}
+            }
             if ($script:LiteMode) {
                 try { Download-OnyxFile "$pinnedBase/docker_compose/$($script:LiteComposeFile)" $liteOverlayPath } catch {}
             }
@@ -1121,7 +1121,7 @@ function Main {
     Print-Info "The first user created will automatically have admin privileges"
 
     if ($script:LiteMode) {
-        Print-Info "Running in Lite mode - Vespa, Redis, model servers, and background workers are NOT started."
+        Print-Info "Running in Lite mode - OpenSearch, Redis, model servers, and background workers are NOT started."
         Print-Info "Connectors and RAG search are disabled. LLM chat, tools, Projects still work."
     }
 

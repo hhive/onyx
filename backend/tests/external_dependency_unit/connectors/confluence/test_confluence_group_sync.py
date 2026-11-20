@@ -2,14 +2,12 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from ee.onyx.db.external_perm import ExternalUserGroup
 from ee.onyx.external_permissions.confluence.group_sync import confluence_group_sync
 from onyx.configs.constants import DocumentSource
 from onyx.connectors.models import InputType
-from onyx.db.enums import AccessType
-from onyx.db.enums import ConnectorCredentialPairStatus
-from onyx.db.models import Connector
-from onyx.db.models import ConnectorCredentialPair
-from onyx.db.models import Credential
+from onyx.db.enums import AccessType, ConnectorCredentialPairStatus
+from onyx.db.models import Connector, ConnectorCredentialPair, Credential
 from shared_configs.contextvars import get_current_tenant_id
 from tests.daily.connectors.confluence.models import ExternalUserGroupSet
 
@@ -155,8 +153,11 @@ def test_confluence_group_sync(
     )
 
     expected_groups = {group.id: group for group in _EXPECTED_CONFLUENCE_GROUPS}
-    actual_groups = {
-        group.id: ExternalUserGroupSet.from_model(external_user_group=group)
-        for group in group_sync_iter
-    }
+    actual_groups: dict[str, ExternalUserGroupSet] = {}
+    for group in group_sync_iter:
+        # The test site reads clean, so no user may be skipped.
+        assert isinstance(group, ExternalUserGroup)
+        actual_groups[group.id] = ExternalUserGroupSet.from_model(
+            external_user_group=group
+        )
     assert expected_groups == actual_groups

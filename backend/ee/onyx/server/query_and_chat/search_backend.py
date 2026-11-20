@@ -9,34 +9,40 @@ multi-stage retrieval used by chat mode), see
 onyx/server/features/search/api.py (POST /api/search).
 """
 
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 
-from fastapi import APIRouter
-from fastapi import Depends
-from fastapi import HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from ee.onyx.db.search import fetch_search_queries_for_user
-from ee.onyx.search.process_search_query import gather_search_stream
-from ee.onyx.search.process_search_query import stream_search_query
+from ee.onyx.search.process_search_query import (
+    gather_search_stream,
+    stream_search_query,
+)
 from ee.onyx.secondary_llm_flows.search_flow_classification import (
     classify_is_search_flow,
 )
-from ee.onyx.server.query_and_chat.models import SearchFlowClassificationRequest
-from ee.onyx.server.query_and_chat.models import SearchFlowClassificationResponse
-from ee.onyx.server.query_and_chat.models import SearchFullResponse
-from ee.onyx.server.query_and_chat.models import SearchHistoryResponse
-from ee.onyx.server.query_and_chat.models import SearchQueryResponse
-from ee.onyx.server.query_and_chat.models import SendSearchQueryRequest
+from ee.onyx.server.query_and_chat.models import (
+    SearchFlowClassificationRequest,
+    SearchFlowClassificationResponse,
+    SearchFullResponse,
+    SearchHistoryResponse,
+    SearchQueryResponse,
+    SendSearchQueryRequest,
+)
 from ee.onyx.server.query_and_chat.streaming_models import SearchErrorPacket
 from onyx.auth.permissions import require_permission
 from onyx.configs.app_configs import ONYX_SEARCH_UI_USES_OPENSEARCH_KEYWORD_SEARCH
-from onyx.db.engine.sql_engine import get_session
-from onyx.db.engine.sql_engine import get_session_with_current_tenant
+from onyx.configs.constants import PUBLIC_API_TAGS
+from onyx.db.engine.sql_engine import get_session, get_session_with_current_tenant
 from onyx.db.enums import Permission
 from onyx.db.models import User
-from onyx.llm.factory import get_default_llm
+from onyx.error_handling.error_codes import OnyxErrorCode
+from onyx.error_handling.exceptions import OnyxError
+from onyx.llm.factory import get_default_llm, get_search_selection_llm
+from onyx.llm.interfaces import LLM
+from onyx.server.query_and_chat.token_limit import check_token_rate_limits
 from onyx.server.usage_limits import check_llm_cost_limit_for_provider
 from onyx.server.utils import get_json_line
 from onyx.server.utils_vector_db import require_vector_db
@@ -48,12 +54,19 @@ logger = setup_logger()
 router = APIRouter(prefix="/search")
 
 
-@router.post("/search-flow-classification")
+@router.post("/search-flow-classification", tags=PUBLIC_API_TAGS)
 def search_flow_classification(
     request: SearchFlowClassificationRequest,
-    _: User = Depends(require_permission(Permission.BASIC_ACCESS)),
+    _: User = Depends(require_permission(Permission.READ_SEARCH)),
     db_session: Session = Depends(get_session),
 ) -> SearchFlowClassificationResponse:
+    """
+    Classify whether a query should be answered by search or by chat.
+
+    Queries longer than 200 characters are classified as a chat flow without an
+    LLM call. A failed classification falls back to ``is_search_flow: false``
+    rather than raising.
+    """
     query = request.user_query
     # This is a heuristic that if the user is typing a lot of text, it's unlikely they're looking for some specific document
     # Most likely something needs to be done with the text included so we'll just classify it as a chat flow
@@ -86,12 +99,33 @@ def search_flow_classification(
 # compatible across versions.
 @router.post(
     "/send-search-message",
-    response_model=None,
+    response_model=SearchFullResponse,  # no-response-model: allow the handler also returns a Response, so the annotation is a union
     dependencies=[Depends(require_vector_db)],
+    tags=PUBLIC_API_TAGS,
+    responses={
+        200: {
+            "description": (
+                "If `stream=true`, returns `text/event-stream`.\n"
+                "If `stream=false` (the default), returns `application/json` "
+                "(SearchFullResponse)."
+            ),
+            "content": {
+                "text/event-stream": {
+                    "schema": {"type": "string"},
+                    "examples": {
+                        "stream": {
+                            "summary": "Stream of NDJSON search packets",
+                            "value": "string",
+                        }
+                    },
+                },
+            },
+        }
+    },
 )
 def handle_send_search_message(
     request: SendSearchQueryRequest,
-    user: User = Depends(require_permission(Permission.BASIC_ACCESS)),
+    user: User = Depends(require_permission(Permission.READ_SEARCH)),
     db_session: Session = Depends(get_session),
 ) -> StreamingResponse | SearchFullResponse:
     """
@@ -108,10 +142,44 @@ def handle_send_search_message(
     if request.hybrid_alpha is None and ONYX_SEARCH_UI_USES_OPENSEARCH_KEYWORD_SEARCH:
         request.hybrid_alpha = 0.0
 
+    # Query expansion and LLM doc selection spend tokens, so the chat budgets apply.
+    primary_llm: LLM | None = None
+    selection_llm_factory: Callable[[], LLM] | None = None
+    run_selection = (request.num_docs_fed_to_llm_selection or 0) >= 1
+    if request.run_query_expansion or run_selection:
+        check_token_rate_limits(user)
+        primary_llm = get_default_llm()
+    if request.run_query_expansion and primary_llm is not None:
+        check_llm_cost_limit_for_provider(
+            db_session=db_session,
+            tenant_id=get_current_tenant_id(),
+            llm_provider_api_key=primary_llm.config.api_key,
+        )
+    if run_selection and primary_llm is not None:
+        selection_fallback = primary_llm
+
+        def resolve_selection_llm() -> LLM:
+            selection_llm = get_search_selection_llm(fallback=selection_fallback)
+            if selection_llm is selection_fallback and not request.run_query_expansion:
+                check_llm_cost_limit_for_provider(
+                    db_session=db_session,
+                    tenant_id=get_current_tenant_id(),
+                    llm_provider_api_key=selection_llm.config.api_key,
+                )
+            return selection_llm
+
+        selection_llm_factory = resolve_selection_llm
+
     # Non-streaming path
     if not request.stream:
         try:
-            packets = stream_search_query(request, user, db_session)
+            packets = stream_search_query(
+                request,
+                user,
+                db_session,
+                primary_llm=primary_llm,
+                selection_llm_factory=selection_llm_factory,
+            )
             return gather_search_stream(packets)
         except NotImplementedError as e:
             return SearchFullResponse(
@@ -124,10 +192,18 @@ def handle_send_search_message(
     def stream_generator() -> Generator[str, None, None]:
         try:
             with get_session_with_current_tenant() as streaming_db_session:
-                for packet in stream_search_query(request, user, streaming_db_session):
+                for packet in stream_search_query(
+                    request,
+                    user,
+                    streaming_db_session,
+                    primary_llm=primary_llm,
+                    selection_llm_factory=selection_llm_factory,
+                ):
                     yield get_json_line(packet.model_dump())
         except NotImplementedError as e:
             yield get_json_line(SearchErrorPacket(error=str(e)).model_dump())
+        except OnyxError as e:
+            yield get_json_line(SearchErrorPacket(error=e.detail).model_dump())
         except HTTPException:
             raise
         except Exception as e:
@@ -137,11 +213,11 @@ def handle_send_search_message(
     return StreamingResponse(stream_generator(), media_type="text/event-stream")
 
 
-@router.get("/search-history")
+@router.get("/search-history", tags=PUBLIC_API_TAGS)
 def get_search_history(
     limit: int = 100,
     filter_days: int | None = None,
-    user: User = Depends(require_permission(Permission.BASIC_ACCESS)),
+    user: User = Depends(require_permission(Permission.READ_SEARCH)),
     db_session: Session = Depends(get_session),
 ) -> SearchHistoryResponse:
     """
@@ -156,22 +232,13 @@ def get_search_history(
     """
     # Validate limit
     if limit <= 0:
-        raise HTTPException(
-            status_code=400,
-            detail="limit must be greater than 0",
-        )
+        raise OnyxError(OnyxErrorCode.BAD_REQUEST, "limit must be greater than 0")
     if limit > 1000:
-        raise HTTPException(
-            status_code=400,
-            detail="limit must be at most 1000",
-        )
+        raise OnyxError(OnyxErrorCode.BAD_REQUEST, "limit must be at most 1000")
 
     # Validate filter_days
     if filter_days is not None and filter_days <= 0:
-        raise HTTPException(
-            status_code=400,
-            detail="filter_days must be greater than 0",
-        )
+        raise OnyxError(OnyxErrorCode.BAD_REQUEST, "filter_days must be greater than 0")
 
     search_queries = fetch_search_queries_for_user(
         db_session=db_session,

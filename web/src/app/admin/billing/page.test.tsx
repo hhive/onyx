@@ -17,8 +17,16 @@ const mockRouter = {
   replace: jest.fn() as jest.Mock,
   refresh: jest.fn() as jest.Mock,
 };
+const MOCK_QUERY_KEYS = ["session_id", "portal_return", "retry_upgrade"];
 const mockSearchParams = {
   get: jest.fn() as jest.Mock,
+  toString: (): string =>
+    new URLSearchParams(
+      MOCK_QUERY_KEYS.flatMap((key): [string, string][] => {
+        const value: unknown = mockSearchParams.get(key);
+        return typeof value === "string" ? [[key, value]] : [];
+      })
+    ).toString(),
 };
 const mockClaimLicense = jest.fn() as jest.Mock;
 const mockRefreshBilling = jest.fn() as jest.Mock;
@@ -27,24 +35,25 @@ const mockRefreshLicense = jest.fn() as jest.Mock;
 // ---- Mocks ----
 
 jest.mock("next/navigation", () => ({
+  ...jest.requireActual<typeof import("@tests/setup/mocks/nextNavigation")>(
+    "@tests/setup/mocks/nextNavigation"
+  ).nextNavigationMock,
   useRouter: () => mockRouter,
+  usePathname: () => "/admin/billing",
   useSearchParams: () => mockSearchParams,
 }));
 
-jest.mock("@/layouts/settings-layouts", () => ({
-  Root: ({ children }: { children: React.ReactNode }) => (
-    <div data-testid="settings-root">{children}</div>
-  ),
-  Header: () => <div data-testid="settings-header" />,
-  Body: ({ children }: { children: React.ReactNode }) => (
-    <div data-testid="settings-body">{children}</div>
-  ),
-}));
-
-jest.mock("@/layouts/general-layouts", () => ({
-  Section: ({ children }: { children: React.ReactNode }) => (
-    <div>{children}</div>
-  ),
+jest.mock("@opal/layouts", () => ({
+  ...jest.requireActual("@opal/layouts"),
+  SettingsLayouts: {
+    Root: ({ children }: { children: React.ReactNode }) => (
+      <div data-testid="settings-root">{children}</div>
+    ),
+    Header: () => <div data-testid="settings-header" />,
+    Body: ({ children }: { children: React.ReactNode }) => (
+      <div data-testid="settings-body">{children}</div>
+    ),
+  },
 }));
 
 jest.mock("@opal/icons", () => ({
@@ -67,6 +76,10 @@ jest.mock("./BillingDetailsView", () => ({
 jest.mock("./LicenseActivationCard", () => ({
   __esModule: true,
   default: () => <div data-testid="license-activation-card" />,
+}));
+jest.mock("./DowngradeToCommunityLink", () => ({
+  __esModule: true,
+  default: () => null,
 }));
 
 jest.mock("@opal/components", () => {
@@ -130,7 +143,7 @@ function setupHooks() {
 
 // ---- Tests ----
 
-describe("BillingPage — handleBillingReturn retry logic", () => {
+describe("BillingPage: handleBillingReturn retry logic", () => {
   beforeEach(() => {
     jest.clearAllMocks();
     jest.useFakeTimers();
@@ -139,6 +152,8 @@ describe("BillingPage — handleBillingReturn retry logic", () => {
     mockSearchParams.get.mockReturnValue(null);
     // Clear any activating state from prior tests
     sessionStorage.clear();
+    // `go()` skips a navigation to the URL it is already on.
+    window.history.replaceState(null, "", "/");
   });
 
   afterEach(() => {

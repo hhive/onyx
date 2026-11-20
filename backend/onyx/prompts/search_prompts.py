@@ -42,6 +42,10 @@ For modifications, you can:
 
 3. Fill in relevant information about the user. For example:
 "What document did I write last week?" -> "What document did John Doe write last week?" (assuming the user is John Doe)
+
+4. Remove source type scoping details — scoping is applied automatically, so naming a specific app or tool to search in only adds noise. For example:
+"Search Google Drive for the SLA doc" -> "SLA doc"
+"the refund policy in Zendesk" -> "refund policy"
 {additional_context}
 =========================
 CRITICAL: ONLY provide the standalone query and nothing else.
@@ -69,6 +73,7 @@ Each query should have as few keywords as necessary to represent the user's sear
 Guidelines:
 - Do not provide more than 3 queries.
 - Do not replace or expand niche, proprietary, or obscure terms
+- Do not include source type scoping details (e.g. naming an app or tool like Zendesk, Google Drive, Slack) as keywords — scoping is applied automatically.
 - Focus on the last user message, in most cases the history and any extra context should be ignored.
 {additional_context}
 =========================
@@ -118,7 +123,8 @@ Select the most relevant document sections for the user's query (maximum {max_se
 later to expand the section and read more from the document so include the section.
 
 # Output Format
-Return ONLY section_ids as a comma-separated list, ordered by relevance:
+Return ONLY the section_ids as a bracketed, comma-separated list of integers, ordered by relevance. \
+Do not include any other text.
 [most_relevant_section_id, second_most_relevant_section_id, ...]
 
 Section IDs:
@@ -194,3 +200,39 @@ CRITICAL: ONLY output the NUMBER of the situation most applicable to the query a
 
 Situation Number:
 """.strip()
+
+
+# Decision-model rerank and expansion (secondary_llm_flows/decision_rerank_expansion.py)
+DECISION_RERANK_QUESTION = (
+    "Compared with the other sections, is section [{index}] one of the sections "
+    "that best help answer the query?"
+)
+
+DECISION_EXPANSION_QUESTION = (
+    "How much of the document should the reader see to answer the query? If only "
+    "a small piece is useful, or the document is on topic and useful together with "
+    "other documents, do not choose not relevant."
+)
+
+# (label, description) for each expansion level, from least to most context.
+DECISION_EXPANSION_LEVELS = [
+    (
+        "not relevant",
+        "Neither the main section nor the sections around it help answer the "
+        "query, or they are about a different subject than the query.",
+    ),
+    (
+        "main section only",
+        "The main section helps; the sections above and below add nothing relevant.",
+    ),
+    (
+        "include adjacent sections",
+        "The sections above or below add relevant information, and unseen parts of "
+        "the document are unlikely to add more.",
+    ),
+    (
+        "include full document",
+        "Unseen parts of the document are likely to hold more information relevant "
+        "to the query.",
+    ),
+]

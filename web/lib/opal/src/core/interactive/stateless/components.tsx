@@ -5,38 +5,35 @@ import { Slot } from "@radix-ui/react-slot";
 import { cn } from "@opal/utils";
 import { guardPortalClick } from "@opal/core/interactive/utils";
 import type { ButtonType, WithoutStyles } from "@opal/types";
+import type {
+  InteractiveContract,
+  InteractiveVariant,
+  InteractiveProminence,
+} from "@onyx-ai/shared/contracts";
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
-type InteractiveStatelessVariant = "default" | "action" | "danger";
-type InteractiveStatelessProminence =
-  | "primary"
-  | "secondary"
-  | "tertiary"
-  | "internal";
+// `variant`/`prominence`/`disabled` come from the shared InteractiveContract. Opal
+// re-exports the unions under its `InteractiveStateless*` names so web code imports
+// the Interactive family from `@opal/core`, not `@onyx-ai/shared`. `interaction`
+// stays web-local — `hover` has no meaning on touch.
+type InteractiveStatelessVariant = InteractiveVariant;
+type InteractiveStatelessProminence = InteractiveProminence;
 type InteractiveStatelessInteraction = "rest" | "hover" | "active";
 
 /**
  * Props for {@link InteractiveStateless}.
+ *
+ * `variant`, `prominence`, and `disabled` come from the shared
+ * {@link InteractiveContract}; the rest are web-specific wiring.
  */
-interface InteractiveStatelessProps extends WithoutStyles<
-  React.HTMLAttributes<HTMLElement>
-> {
+interface InteractiveStatelessProps
+  extends
+    InteractiveContract,
+    WithoutStyles<React.HTMLAttributes<HTMLElement>> {
   ref?: React.Ref<HTMLElement>;
-
-  /**
-   * Visual variant controlling the color palette.
-   * @default "default"
-   */
-  variant?: InteractiveStatelessVariant;
-
-  /**
-   * Prominence level controlling background intensity.
-   * @default "primary"
-   */
-  prominence?: InteractiveStatelessProminence;
 
   /**
    * JS-controllable interaction state override.
@@ -50,6 +47,14 @@ interface InteractiveStatelessProps extends WithoutStyles<
   interaction?: InteractiveStatelessInteraction;
 
   /**
+   * Keeps the resting colours but drops the hover, focus and pressed states,
+   * for a surface that is not clickable right now (e.g. an open card that a
+   * click only folds while closed). Children stay fully interactive, unlike
+   * the HTML `inert` attribute.
+   */
+  passive?: boolean;
+
+  /**
    * Tailwind group class (e.g. `"group/Card"`) for `group-hover:*` utilities.
    */
   group?: string;
@@ -61,6 +66,8 @@ interface InteractiveStatelessProps extends WithoutStyles<
    */
   type?: ButtonType;
 
+  form?: string;
+
   /**
    * URL to navigate to when clicked. Passed through Slot to the child.
    */
@@ -70,11 +77,6 @@ interface InteractiveStatelessProps extends WithoutStyles<
    * Link target (e.g. `"_blank"`). Only used when `href` is provided.
    */
   target?: string;
-
-  /**
-   * Applies variant-specific disabled colors and suppresses clicks.
-   */
-  disabled?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -101,6 +103,7 @@ function InteractiveStateless({
   href,
   target,
   disabled,
+  passive,
   ...props
 }: InteractiveStatelessProps) {
   const isDisabled = !!disabled;
@@ -109,13 +112,15 @@ function InteractiveStateless({
   // so Radix Slot-injected handlers don't bypass this guard.
   const classes = cn(
     "interactive",
-    !props.onClick && !href && !type && "cursor-default! select-auto!",
+    (passive || (!props.onClick && !href && !type)) &&
+      "cursor-default! select-auto!",
     group
   );
 
   const dataAttrs = {
     "data-interactive-variant": variant,
     "data-interactive-prominence": prominence,
+    "data-passive": passive ? "true" : undefined,
     "data-interaction": interaction !== "rest" ? interaction : undefined,
     "data-disabled": isDisabled ? "true" : undefined,
     "aria-disabled": isDisabled || undefined,

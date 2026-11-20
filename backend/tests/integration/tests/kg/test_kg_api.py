@@ -1,5 +1,5 @@
 import json
-from datetime import datetime
+from datetime import UTC, datetime
 from http import HTTPStatus
 
 import pytest
@@ -8,15 +8,16 @@ from onyx.configs.constants import DocumentSource
 from onyx.connectors.models import InputType
 from onyx.db.connector import create_connector
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
-from onyx.db.kg_config import get_kg_config_settings
-from onyx.db.kg_config import set_kg_config_settings
+from onyx.db.kg_config import get_kg_config_settings, set_kg_config_settings
 from onyx.db.models import Connector
 from onyx.server.documents.models import ConnectorBase
-from onyx.server.kg.models import DisableKGConfigRequest
-from onyx.server.kg.models import EnableKGConfigRequest
-from onyx.server.kg.models import EntityType
+from onyx.server.kg.models import (
+    DisableKGConfigRequest,
+    EnableKGConfigRequest,
+    EntityType,
+    SourceAndEntityTypeView,
+)
 from onyx.server.kg.models import KGConfig as KGConfigAPIModel
-from onyx.server.kg.models import SourceAndEntityTypeView
 from tests.integration.common_utils.constants import API_SERVER_URL
 from tests.integration.common_utils.http_client import client
 from tests.integration.common_utils.managers.user import UserManager
@@ -89,7 +90,7 @@ def test_kg_enable_and_disable(connectors: None) -> None:  # noqa: ARG001
         vendor="Test",
         vendor_domains=["test.app", "tester.ai"],
         ignore_domains=[],
-        coverage_start=datetime(1970, 1, 1, 0, 0),
+        coverage_start=datetime(1970, 1, 1, tzinfo=UTC),
     )
 
     # Disable KG
@@ -118,7 +119,7 @@ def test_kg_enable_and_disable(connectors: None) -> None:  # noqa: ARG001
         vendor="Test",
         vendor_domains=["test.app", "tester.ai"],
         ignore_domains=[],
-        coverage_start=datetime(1970, 1, 1, 0, 0),
+        coverage_start=datetime(1970, 1, 1, tzinfo=UTC),
     )
 
 

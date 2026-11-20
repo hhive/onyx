@@ -3,9 +3,12 @@ from typing import cast
 
 from onyx.cache.interface import CacheBackend
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
-from onyx.db.models import KVStore
-from onyx.key_value_store.interface import KeyValueStore
-from onyx.key_value_store.interface import KvKeyNotFoundError
+from onyx.db.kv_store import (
+    add_kv_store_row__no_commit,
+    delete_kv_store_row__no_commit,
+    fetch_kv_store_row,
+)
+from onyx.key_value_store.interface import KeyValueStore, KvKeyNotFoundError
 from onyx.utils.logger import setup_logger
 from onyx.utils.special_types import JSON_ro
 
@@ -27,8 +30,8 @@ class PgRedisKVStore(KeyValueStore):
             self._cache = get_cache_backend()
         return self._cache
 
-    def store(self, key: str, val: JSON_ro, encrypt: bool = False) -> None:
-        # Not encrypted in Cache backend (typically Redis), but encrypted in Postgres
+    def store(self, key: str, val: JSON_ro) -> None:
+        # Not encrypted in Cache backend (typically Redis)
         try:
             self._get_cache().set(
                 REDIS_KEY_PREFIX + key, json.dumps(val), ex=KV_REDIS_KEY_EXPIRATION
@@ -39,17 +42,15 @@ class PgRedisKVStore(KeyValueStore):
                 "Failed to set value in Cache backend for key '%s': %s", key, str(e)
             )
 
-        encrypted_val = val if encrypt else None
-        plain_val = val if not encrypt else None
         with get_session_with_current_tenant() as db_session:
-            obj = db_session.query(KVStore).filter_by(key=key).first()
+            obj = fetch_kv_store_row(db_session, key)
             if obj:
-                obj.value = plain_val
-                obj.encrypted_value = encrypted_val  # ty: ignore[invalid-assignment]
+                obj.value = val
+                # Clear any ciphertext written by the pre-flag-removal code path.
+                obj.encrypted_value = None
             else:
-                obj = KVStore(key=key, value=plain_val, encrypted_value=encrypted_val)
-                db_session.query(KVStore).filter_by(key=key).delete()  # just in case
-                db_session.add(obj)
+                delete_kv_store_row__no_commit(db_session, key)  # just in case
+                add_kv_store_row__no_commit(db_session, key, val)
             db_session.commit()
 
     def load(self, key: str, refresh_cache: bool = False) -> JSON_ro:
@@ -64,7 +65,7 @@ class PgRedisKVStore(KeyValueStore):
                 )
 
         with get_session_with_current_tenant() as db_session:
-            obj = db_session.query(KVStore).filter_by(key=key).first()
+            obj = fetch_kv_store_row(db_session, key)
             if not obj:
                 raise KvKeyNotFoundError
 
@@ -98,7 +99,7 @@ class PgRedisKVStore(KeyValueStore):
             )
 
         with get_session_with_current_tenant() as db_session:
-            result = db_session.query(KVStore).filter_by(key=key).delete()
+            result = delete_kv_store_row__no_commit(db_session, key)
             if result == 0:
                 raise KvKeyNotFoundError
             db_session.commit()

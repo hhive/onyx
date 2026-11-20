@@ -1,20 +1,25 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import { useTranslations } from "next-intl";
 import ReactMarkdown, { Components } from "react-markdown";
 import type { PluggableList } from "unified";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import rehypeHighlight from "rehype-highlight";
+import { useHighlightLanguages } from "@/hooks/useHighlightLanguages";
 import rehypeKatex from "rehype-katex";
 import "katex/dist/katex.min.css";
 
 import { useTypewriter } from "@/hooks/useTypewriter";
-import Text from "@/refresh-components/texts/Text";
+import { Text } from "@opal/components";
 import {
   ChatPacket,
   PacketType,
   StopReason,
 } from "../../../services/streamingModels";
-import { MessageRenderer, FullChatState } from "../interfaces";
+import {
+  MessageRenderer,
+  FullChatState,
+} from "@/app/app/message/messageComponents/types";
 import { isFinalAnswerComplete } from "../../../services/packetUtils";
 import { processContent, ScrollableTable } from "../markdownUtils";
 import { BlinkingBar } from "../../BlinkingBar";
@@ -24,10 +29,15 @@ import {
   MemoizedParagraph,
 } from "@/app/app/message/MemoizedTextComponents";
 import { extractCodeText } from "@/app/app/message/codeUtils";
+import {
+  createCitationResolver,
+  tableToCopyContent,
+} from "@/app/app/message/tableCopyUtils";
 import { CodeBlock } from "@/app/app/message/CodeBlock";
 import { InMessageImage } from "@/app/app/components/files/images/InMessageImage";
 import { extractChatImageFileId } from "@/app/app/components/files/images/utils";
 import { transformLinkUri } from "@/lib/utils";
+import { rehypeDirection } from "@/lib/rehypeDirection";
 import { cn } from "@opal/utils";
 import { useSmoothStreaming } from "@/hooks/useSmoothStreaming";
 import { useChatSessionStore } from "@/app/app/stores/useChatSessionStore";
@@ -81,9 +91,8 @@ const STREAMING_REMARK_PLUGINS: PluggableList = [
   remarkGfm,
   [remarkMath, { singleDollarTextMath: true }],
 ];
-const STREAMING_REHYPE_PLUGINS: PluggableList = [rehypeKatex];
+const STREAMING_REHYPE_PLUGINS: PluggableList = [rehypeKatex, rehypeDirection];
 const FULL_REMARK_PLUGINS: PluggableList = STREAMING_REMARK_PLUGINS;
-const FULL_REHYPE_PLUGINS: PluggableList = [rehypeHighlight, rehypeKatex];
 
 export const MessageTextRenderer: MessageRenderer<
   ChatPacket,
@@ -96,14 +105,13 @@ export const MessageTextRenderer: MessageRenderer<
   onComplete,
   renderType,
   animate,
+  restoredTextLength = 0,
   stopPacketSeen,
   stopReason,
   children,
 }) => {
+  const t = useTranslations("chat.messages");
   const { enabled: smoothStreamingEnabled } = useSmoothStreaming();
-  const setLatestMessageRenderComplete = useChatSessionStore(
-    (state) => state.setLatestMessageRenderComplete
-  );
   const setIsStreamDraining = useChatSessionStore(
     (state) => state.setIsStreamDraining
   );
@@ -267,7 +275,8 @@ export const MessageTextRenderer: MessageRenderer<
   const { displayed: displayedContent, isDraining } = useTypewriter(
     content,
     isStreamingAnimationEnabled,
-    isStreamFinished
+    isStreamFinished,
+    restoredTextLength
   );
 
   // One-way signal: stream done AND typewriter caught up. Do NOT derive
@@ -276,37 +285,35 @@ export const MessageTextRenderer: MessageRenderer<
   const streamFullyDisplayed =
     isStreamFinished && displayedContent.length >= content.length;
 
+  // Syntax-highlighting grammars load dynamically, and only once the stream is
+  // fully displayed — keeps the ~170 KB corpus off the critical path. Until
+  // they resolve we fall back to the streaming (katex-only) plugin set.
+  const highlightLanguages = useHighlightLanguages(streamFullyDisplayed);
+  const fullRehypePlugins = useMemo<PluggableList>(
+    () =>
+      highlightLanguages
+        ? [
+            [rehypeHighlight, { languages: highlightLanguages }],
+            rehypeKatex,
+            rehypeDirection,
+          ]
+        : STREAMING_REHYPE_PLUGINS,
+    [highlightLanguages]
+  );
+
   // Capture `animate` at mount. `animate = !stopPacketSeen`, which only
   // ever goes true→false during a renderer's lifetime, so its mount-time
   // value distinguishes "actively-streaming renderer" (animate=true) from
-  // "historical mount" (animate=false). Used to gate the queue-release
-  // write below.
+  // "historical mount" (animate=false) for scroll draining below.
   const wasEverAnimatingRef = useRef(animate);
 
-  // Bind sessionId at mount so a navigation while the typewriter is still
-  // draining doesn't write the completion flag to the newly-active session.
+  // Keep scroll-draining updates on the session that mounted this renderer.
   const sessionIdAtMountRef = useRef(
     useChatSessionStore.getState().currentSessionId
   );
-
-  // Fire onComplete exactly once per mount. `onComplete` is an inline
-  // arrow in AgentMessage so its identity changes on every parent render;
-  // without this guard, each new identity would re-fire the effect once
-  // `streamFullyDisplayed` is true.
-  const onCompleteFiredRef = useRef(false);
   useEffect(() => {
-    if (streamFullyDisplayed && !onCompleteFiredRef.current) {
-      onCompleteFiredRef.current = true;
-      onComplete();
-      // Only the renderer that was actively streaming (mounted with
-      // animate=true) flips the chat-session gate back to "rendered".
-      // Historical mounts leave the flag alone so they don't release the
-      // queue while a newer stream is still in flight.
-      if (wasEverAnimatingRef.current && sessionIdAtMountRef.current) {
-        setLatestMessageRenderComplete(sessionIdAtMountRef.current, true);
-      }
-    }
-  }, [streamFullyDisplayed, onComplete, setLatestMessageRenderComplete]);
+    if (streamFullyDisplayed) onComplete();
+  }, [streamFullyDisplayed, onComplete]);
 
   // Mirror the typewriter's drain state into the chat-session store so
   // ChatScrollContainer can pause auto-scroll while the drain runs. Only
@@ -327,8 +334,10 @@ export const MessageTextRenderer: MessageRenderer<
   // never change — otherwise every typewriter tick would invalidate
   // React reconciliation on the markdown subtree.
   const stateRef = useRef(state);
+  // oxlint-disable-next-line react-doctor/no-ref-current-in-render -- render-phase mirror keeps markdownComponents identities stable (see block comment above)
   stateRef.current = state;
   const processedContentRef = useRef(processedContent);
+  // oxlint-disable-next-line react-doctor/no-ref-current-in-render -- render-phase mirror keeps markdownComponents identities stable (see block comment above)
   processedContentRef.current = processedContent;
 
   const markdownComponents = useMemo<Components>(
@@ -359,10 +368,8 @@ export const MessageTextRenderer: MessageRenderer<
           </MemoizedAnchor>
         );
       },
-      p: ({ children }) => (
-        <MemoizedParagraph className="font-main-content-body">
-          {children}
-        </MemoizedParagraph>
+      p: ({ children, dir }) => (
+        <MemoizedParagraph dir={dir}>{children}</MemoizedParagraph>
       ),
       pre: ({ children }) => <>{children}</>,
       b: ({ className, children }) => (
@@ -383,8 +390,23 @@ export const MessageTextRenderer: MessageRenderer<
           {children}
         </li>
       ),
-      table: ({ className, children, ...rest }) => (
-        <ScrollableTable className={className} {...rest}>
+      table: ({ node, className, children, ...rest }) => (
+        <ScrollableTable
+          className={className}
+          getCopyContent={
+            node
+              ? () =>
+                  tableToCopyContent(
+                    node,
+                    createCitationResolver(
+                      stateRef.current?.docs,
+                      stateRef.current?.citations
+                    )
+                  )
+              : undefined
+          }
+          {...rest}
+        >
           {children}
         </ScrollableTable>
       ),
@@ -436,9 +458,11 @@ export const MessageTextRenderer: MessageRenderer<
       status: null,
       content:
         shouldShowThinkingPlaceholder || shouldShowSpeechWarmupIndicator ? (
-          <Text as="span" secondaryBody text04 className="italic">
-            Thinking
-          </Text>
+          <span className="italic">
+            <Text font="secondary-body" color="text-04">
+              {t("text.thinkingPlaceholder.text")}
+            </Text>
+          </span>
         ) : displayedContent.length > 0 ? (
           <div
             dir="auto"
@@ -454,7 +478,7 @@ export const MessageTextRenderer: MessageRenderer<
               }
               rehypePlugins={
                 streamFullyDisplayed
-                  ? FULL_REHYPE_PLUGINS
+                  ? fullRehypePlugins
                   : STREAMING_REHYPE_PLUGINS
               }
               urlTransform={transformLinkUri}

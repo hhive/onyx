@@ -1,62 +1,146 @@
 from __future__ import annotations
 
-from fastapi import APIRouter
-from fastapi import Depends
-from fastapi import HTTPException
-from fastapi import Response
-from sqlalchemy.dialects.postgresql import insert
+from fastapi import APIRouter, Depends, HTTPException, Response
 from sqlalchemy.orm import Session
 
 from onyx.auth.permissions import require_permission
 from onyx.db.engine.sql_engine import get_session
 from onyx.db.enums import Permission
-from onyx.db.models import InternetContentProvider
-from onyx.db.models import InternetSearchProvider
 from onyx.db.models import User
-from onyx.db.web_search import deactivate_web_content_provider
-from onyx.db.web_search import deactivate_web_search_provider
-from onyx.db.web_search import delete_web_content_provider
-from onyx.db.web_search import delete_web_search_provider
-from onyx.db.web_search import fetch_web_content_provider_by_name
-from onyx.db.web_search import fetch_web_content_provider_by_type
-from onyx.db.web_search import fetch_web_content_providers
-from onyx.db.web_search import fetch_web_search_provider_by_name
-from onyx.db.web_search import fetch_web_search_provider_by_type
-from onyx.db.web_search import fetch_web_search_providers
-from onyx.db.web_search import set_active_web_content_provider
-from onyx.db.web_search import set_active_web_search_provider
-from onyx.db.web_search import upsert_web_content_provider
-from onyx.db.web_search import upsert_web_search_provider
-from onyx.server.manage.web_search.models import WebContentProviderTestRequest
-from onyx.server.manage.web_search.models import WebContentProviderUpsertRequest
-from onyx.server.manage.web_search.models import WebContentProviderView
-from onyx.server.manage.web_search.models import WebSearchProviderTestRequest
-from onyx.server.manage.web_search.models import WebSearchProviderUpsertRequest
-from onyx.server.manage.web_search.models import WebSearchProviderView
+from onyx.db.web_search import (
+    deactivate_web_content_provider,
+    deactivate_web_search_provider,
+    delete_web_content_provider,
+    delete_web_search_provider,
+    fetch_web_content_provider_by_id,
+    fetch_web_content_provider_by_name,
+    fetch_web_content_provider_by_type,
+    fetch_web_content_providers,
+    fetch_web_search_provider_by_id,
+    fetch_web_search_provider_by_name,
+    fetch_web_search_provider_by_type,
+    fetch_web_search_providers,
+    set_active_web_content_provider,
+    set_active_web_search_provider,
+    set_web_content_provider_base_url,
+    set_web_search_provider_base_url,
+    upsert_web_content_provider,
+    upsert_web_content_provider_api_key__no_commit,
+    upsert_web_search_provider,
+    upsert_web_search_provider_api_key__no_commit,
+)
+from onyx.error_handling.error_codes import OnyxErrorCode
+from onyx.error_handling.exceptions import OnyxError
+from onyx.server.manage.web_search.models import (
+    WebContentProviderTestRequest,
+    WebContentProviderUpsertRequest,
+    WebContentProviderView,
+    WebSearchProviderTestRequest,
+    WebSearchProviderUpsertRequest,
+    WebSearchProviderView,
+)
+from onyx.tools.tool_implementations.open_url.firecrawl import FIRECRAWL_SCRAPE_URL
 from onyx.tools.tool_implementations.open_url.utils import (
     filter_web_contents_with_no_title_or_content,
+)
+from onyx.tools.tool_implementations.web_search.clients.firecrawl_client import (
+    FIRECRAWL_SEARCH_URL,
 )
 from onyx.tools.tool_implementations.web_search.models import WebContentProviderConfig
 from onyx.tools.tool_implementations.web_search.providers import (
     build_content_provider_from_config,
-)
-from onyx.tools.tool_implementations.web_search.providers import (
     build_search_provider_from_config,
-)
-from onyx.tools.tool_implementations.web_search.providers import (
     provider_requires_api_key,
 )
 from onyx.utils.logger import setup_logger
 from shared_configs.configs import MULTI_TENANT
-from shared_configs.enums import WebContentProviderType
-from shared_configs.enums import WebSearchProviderType
+from shared_configs.enums import WebContentProviderType, WebSearchProviderType
 
 logger = setup_logger()
 
 admin_router = APIRouter(prefix="/admin/web-search")
 
+# Providers whose API key is shared between the search and content sides: a key
+# entered on one side seeds the other (see the upsert endpoints below). Each
+# entry is (provider_type_on_this_side, display_name, provider_type_other_side).
+_SEARCH_TO_CONTENT_SYNC: list[
+    tuple[WebSearchProviderType, str, WebContentProviderType]
+] = [
+    (WebSearchProviderType.EXA, "Exa", WebContentProviderType.EXA),
+    (WebSearchProviderType.TAVILY, "Tavily", WebContentProviderType.TAVILY),
+    (WebSearchProviderType.FIRECRAWL, "Firecrawl", WebContentProviderType.FIRECRAWL),
+]
+_CONTENT_TO_SEARCH_SYNC: list[
+    tuple[WebContentProviderType, str, WebSearchProviderType]
+] = [
+    (WebContentProviderType.EXA, "Exa", WebSearchProviderType.EXA),
+    (WebContentProviderType.TAVILY, "Tavily", WebSearchProviderType.TAVILY),
+    (WebContentProviderType.FIRECRAWL, "Firecrawl", WebSearchProviderType.FIRECRAWL),
+]
 
-@admin_router.get("/search-providers", response_model=list[WebSearchProviderView])
+_FIRECRAWL_SCRAPE_PATH = "/v2/scrape"
+_FIRECRAWL_SEARCH_PATH = "/v2/search"
+
+
+def _sibling_firecrawl_url(
+    base_url: str | None, *, from_path: str, to_path: str
+) -> str | None:
+    """Derive the other Firecrawl endpoint on the same origin.
+
+    Both Firecrawl endpoints require a full URL, so a synced row needs one too.
+    Returns None when the source URL does not end in the expected path; the
+    synced row then stays disconnected until the admin enters a URL.
+    """
+    if not base_url or not base_url.endswith(from_path):
+        return None
+    return base_url[: -len(from_path)] + to_path
+
+
+def _synced_content_config(
+    content_type: WebContentProviderType, search_config: dict[str, str] | None
+) -> WebContentProviderConfig | None:
+    if content_type != WebContentProviderType.FIRECRAWL:
+        return None
+    search_url = (search_config or {}).get("base_url") or FIRECRAWL_SEARCH_URL
+    scrape_url = _sibling_firecrawl_url(
+        search_url, from_path=_FIRECRAWL_SEARCH_PATH, to_path=_FIRECRAWL_SCRAPE_PATH
+    )
+    return WebContentProviderConfig(base_url=scrape_url) if scrape_url else None
+
+
+def _synced_search_config(
+    search_type: WebSearchProviderType, content_config: WebContentProviderConfig | None
+) -> dict[str, str] | None:
+    if search_type != WebSearchProviderType.FIRECRAWL:
+        return None
+    scrape_url = (content_config.base_url if content_config else None) or (
+        FIRECRAWL_SCRAPE_URL
+    )
+    search_url = _sibling_firecrawl_url(
+        scrape_url, from_path=_FIRECRAWL_SCRAPE_PATH, to_path=_FIRECRAWL_SEARCH_PATH
+    )
+    return {"base_url": search_url} if search_url else None
+
+
+def _require_stored_key_target_unchanged(
+    *,
+    stored_type: str,
+    stored_base_url: str | None,
+    request_type: str,
+    request_base_url: str | None,
+) -> None:
+    """On cloud, a stored key may only be reused against the endpoint it was saved for."""
+    if not MULTI_TENANT:
+        return
+    if stored_type != request_type or stored_base_url != request_base_url:
+        raise OnyxError(
+            OnyxErrorCode.INVALID_INPUT,
+            "Provider type and base URL cannot differ from the stored provider "
+            "when using the stored API key",
+        )
+
+
+@admin_router.get("/search-providers")
 def list_search_providers(
     _: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
     db_session: Session = Depends(get_session),
@@ -79,7 +163,7 @@ def list_search_providers(
     ]
 
 
-@admin_router.post("/search-providers", response_model=WebSearchProviderView)
+@admin_router.post("/search-providers")
 def upsert_search_provider_endpoint(
     request: WebSearchProviderUpsertRequest,
     _: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
@@ -91,10 +175,20 @@ def upsert_search_provider_endpoint(
         and request.id is not None
         and existing_by_name.id != request.id
     ):
-        raise HTTPException(
-            status_code=400,
-            detail=f"A search provider named '{request.name}' already exists.",
+        raise OnyxError(
+            OnyxErrorCode.BAD_REQUEST,
+            f"A search provider named '{request.name}' already exists.",
         )
+
+    if request.id is not None and not request.api_key_changed:
+        existing = fetch_web_search_provider_by_id(request.id, db_session)
+        if existing is not None and existing.api_key:
+            _require_stored_key_target_unchanged(
+                stored_type=existing.provider_type,
+                stored_base_url=(existing.config or {}).get("base_url"),
+                request_type=request.provider_type.value,
+                request_base_url=(request.config or {}).get("base_url"),
+            )
 
     provider = upsert_web_search_provider(
         provider_id=request.id,
@@ -107,27 +201,31 @@ def upsert_search_provider_endpoint(
         db_session=db_session,
     )
 
-    # Sync Exa key of search engine to content provider
-    if (
-        request.provider_type == WebSearchProviderType.EXA
-        and request.api_key_changed
-        and request.api_key
-    ):
-        stmt = (
-            insert(InternetContentProvider)
-            .values(
-                name="Exa",
-                provider_type=WebContentProviderType.EXA.value,
-                api_key=request.api_key,
-                is_active=False,
-            )
-            .on_conflict_do_update(
-                index_elements=["name"],
-                set_={"api_key": request.api_key},
-            )
-        )
-        db_session.execute(stmt)
-        db_session.flush()
+    # Sync API key from search provider to content provider (Exa / Tavily / Firecrawl)
+    if request.api_key_changed and request.api_key:
+        for search_type, name, content_type in _SEARCH_TO_CONTENT_SYNC:
+            if request.provider_type == search_type:
+                synced_config = _synced_content_config(content_type, request.config)
+                if (
+                    content_type == WebContentProviderType.FIRECRAWL
+                    and not synced_config
+                ):
+                    # No matching endpoint; keep the sibling's key and URL paired.
+                    break
+                upsert_web_content_provider_api_key__no_commit(
+                    name=name,
+                    provider_type=content_type.value,
+                    api_key=request.api_key,
+                    config=synced_config,
+                    db_session=db_session,
+                )
+                if synced_config is not None and synced_config.base_url:
+                    set_web_content_provider_base_url(
+                        name=name,
+                        base_url=synced_config.base_url,
+                        db_session=db_session,
+                    )
+                break
 
     db_session.commit()
     return WebSearchProviderView(
@@ -202,16 +300,22 @@ def test_search_provider(
             request.provider_type, db_session
         )
         if existing_provider is None or not existing_provider.api_key:
-            raise HTTPException(
-                status_code=400,
-                detail="No stored API key found for this provider type.",
+            raise OnyxError(
+                OnyxErrorCode.BAD_REQUEST,
+                "No stored API key found for this provider type.",
             )
+        _require_stored_key_target_unchanged(
+            stored_type=existing_provider.provider_type,
+            stored_base_url=(existing_provider.config or {}).get("base_url"),
+            request_type=request.provider_type.value,
+            request_base_url=(request.config or {}).get("base_url"),
+        )
         api_key = existing_provider.api_key.get_value(apply_mask=False)
 
     if requires_key and not api_key:
-        raise HTTPException(
-            status_code=400,
-            detail="API key is required. Either provide api_key or set use_stored_key to true.",
+        raise OnyxError(
+            OnyxErrorCode.BAD_REQUEST,
+            "API key is required. Either provide api_key or set use_stored_key to true.",
         )
 
     try:
@@ -221,23 +325,23 @@ def test_search_provider(
             config=request.config or {},
         )
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise OnyxError(OnyxErrorCode.BAD_REQUEST, str(exc)) from exc
 
     if provider is None:
-        raise HTTPException(
-            status_code=400, detail="Unable to build provider configuration."
+        raise OnyxError(
+            OnyxErrorCode.BAD_REQUEST, "Unable to build provider configuration."
         )
 
     # Run the API client's test_connection method to ensure the connection is valid.
     try:
         return provider.test_connection()
-    except HTTPException:
+    except (HTTPException, OnyxError):
         raise
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
+        raise OnyxError(OnyxErrorCode.BAD_REQUEST, str(e)) from e
 
 
-@admin_router.get("/content-providers", response_model=list[WebContentProviderView])
+@admin_router.get("/content-providers")
 def list_content_providers(
     _: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
     db_session: Session = Depends(get_session),
@@ -260,7 +364,7 @@ def list_content_providers(
     ]
 
 
-@admin_router.post("/content-providers", response_model=WebContentProviderView)
+@admin_router.post("/content-providers")
 def upsert_content_provider_endpoint(
     request: WebContentProviderUpsertRequest,
     _: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
@@ -272,10 +376,20 @@ def upsert_content_provider_endpoint(
         and request.id is not None
         and existing_by_name.id != request.id
     ):
-        raise HTTPException(
-            status_code=400,
-            detail=f"A content provider named '{request.name}' already exists.",
+        raise OnyxError(
+            OnyxErrorCode.BAD_REQUEST,
+            f"A content provider named '{request.name}' already exists.",
         )
+
+    if request.id is not None and not request.api_key_changed:
+        existing = fetch_web_content_provider_by_id(request.id, db_session)
+        if existing is not None and existing.api_key:
+            _require_stored_key_target_unchanged(
+                stored_type=existing.provider_type,
+                stored_base_url=existing.config.base_url if existing.config else None,
+                request_type=request.provider_type.value,
+                request_base_url=request.config.base_url if request.config else None,
+            )
 
     provider = upsert_web_content_provider(
         provider_id=request.id,
@@ -288,27 +402,28 @@ def upsert_content_provider_endpoint(
         db_session=db_session,
     )
 
-    # Sync Exa key of content provider to search provider
-    if (
-        request.provider_type == WebContentProviderType.EXA
-        and request.api_key_changed
-        and request.api_key
-    ):
-        stmt = (
-            insert(InternetSearchProvider)
-            .values(
-                name="Exa",
-                provider_type=WebSearchProviderType.EXA.value,
-                api_key=request.api_key,
-                is_active=False,
-            )
-            .on_conflict_do_update(
-                index_elements=["name"],
-                set_={"api_key": request.api_key},
-            )
-        )
-        db_session.execute(stmt)
-        db_session.flush()
+    # Sync API key from content provider to search provider (Exa / Tavily / Firecrawl)
+    if request.api_key_changed and request.api_key:
+        for content_type, name, search_type in _CONTENT_TO_SEARCH_SYNC:
+            if request.provider_type == content_type:
+                synced_config = _synced_search_config(search_type, request.config)
+                if search_type == WebSearchProviderType.FIRECRAWL and not synced_config:
+                    # No matching endpoint; keep the sibling's key and URL paired.
+                    break
+                upsert_web_search_provider_api_key__no_commit(
+                    name=name,
+                    provider_type=search_type.value,
+                    api_key=request.api_key,
+                    config=synced_config,
+                    db_session=db_session,
+                )
+                if synced_config is not None and synced_config.get("base_url"):
+                    set_web_search_provider_base_url(
+                        name=name,
+                        base_url=synced_config["base_url"],
+                        db_session=db_session,
+                    )
+                break
 
     db_session.commit()
     return WebContentProviderView(
@@ -396,27 +511,24 @@ def test_content_provider(
             request.provider_type, db_session
         )
         if existing_provider is None or not existing_provider.api_key:
-            raise HTTPException(
-                status_code=400,
-                detail="No stored API key found for this provider type.",
+            raise OnyxError(
+                OnyxErrorCode.BAD_REQUEST,
+                "No stored API key found for this provider type.",
             )
-        if MULTI_TENANT:
-            stored_base_url = (
+        _require_stored_key_target_unchanged(
+            stored_type=existing_provider.provider_type,
+            stored_base_url=(
                 existing_provider.config.base_url if existing_provider.config else None
-            )
-            request_base_url = request.config.base_url
-            if request_base_url != stored_base_url:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Base URL cannot differ from stored provider when using stored API key",
-                )
-
+            ),
+            request_type=request.provider_type.value,
+            request_base_url=request.config.base_url,
+        )
         api_key = existing_provider.api_key.get_value(apply_mask=False)
 
     if not api_key:
-        raise HTTPException(
-            status_code=400,
-            detail="API key is required. Either provide api_key or set use_stored_key to true.",
+        raise OnyxError(
+            OnyxErrorCode.BAD_REQUEST,
+            "API key is required. Either provide api_key or set use_stored_key to true.",
         )
 
     try:
@@ -426,11 +538,11 @@ def test_content_provider(
             config=request.config,
         )
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise OnyxError(OnyxErrorCode.BAD_REQUEST, str(exc)) from exc
 
     if provider is None:
-        raise HTTPException(
-            status_code=400, detail="Unable to build provider configuration."
+        raise OnyxError(
+            OnyxErrorCode.BAD_REQUEST, "Unable to build provider configuration."
         )
 
     # Actually test the API key by making a real content fetch call
@@ -442,11 +554,11 @@ def test_content_provider(
         if not test_results or not any(
             result.scrape_successful for result in test_results
         ):
-            raise HTTPException(
-                status_code=400,
-                detail="API key validation failed: content fetch returned no results.",
+            raise OnyxError(
+                OnyxErrorCode.BAD_REQUEST,
+                "API key validation failed: content fetch returned no results.",
             )
-    except HTTPException:
+    except (HTTPException, OnyxError):
         raise
     except Exception as e:
         error_msg = str(e)
@@ -455,13 +567,11 @@ def test_content_provider(
             or "key" in error_msg.lower()
             or "auth" in error_msg.lower()
         ):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid API key: {error_msg}",
+            raise OnyxError(
+                OnyxErrorCode.BAD_REQUEST, f"Invalid API key: {error_msg}"
             ) from e
-        raise HTTPException(
-            status_code=400,
-            detail=f"API key validation failed: {error_msg}",
+        raise OnyxError(
+            OnyxErrorCode.BAD_REQUEST, f"API key validation failed: {error_msg}"
         ) from e
 
     logger.info(

@@ -1,94 +1,88 @@
 import os
 from enum import Enum
-from pathlib import Path
+
+# In-sandbox paths shared by every backend implementation. Kept in sync with
+# the SESSIONS_ROOT constants the individual managers define (those exist
+# separately because the K8s manager emits exec scripts and the Docker
+# manager mounts via the named volume — both happen to land at the same
+# in-container path). The daemon's sandbox_daemon/snapshot.py also has its
+# own copy because it can't import from this package at runtime.
+BUN_CACHE_DIR = "/workspace/sessions/.bun-cache"
+BUN_IMAGE_CACHE_DIR = "/home/sandbox/.bun/install/cache"
 
 
 class SandboxBackend(str, Enum):
-    """Backend mode for sandbox operations.
-
-    KUBERNETES: Production + dev (kind) - full snapshots and cleanup.
-    DOCKER: Self-hosted docker-compose - api_server drives the Docker Engine.
-    """
-
     KUBERNETES = "kubernetes"
     DOCKER = "docker"
 
 
-def _parse_sandbox_backend(raw: str) -> SandboxBackend:
-    """Parse SANDBOX_BACKEND with a friendly error on the retired ``local`` value.
-
-    The local backend was removed in favour of the kubernetes (kind) dev flow
-    documented in ``docs/dev/local-kubernetes.md``. We raise a deliberate
-    startup error rather than the bare ``ValueError`` from the enum
-    constructor so the operator gets pointed at the migration path.
-    """
-    if raw.lower() == "local":
-        raise RuntimeError(
-            "SANDBOX_BACKEND=local is no longer supported. The local sandbox "
-            "backend has been removed; use the kind-based Kubernetes dev flow. "
-            "See docs/dev/local-kubernetes.md (run `make craft-up`) and unset "
-            "SANDBOX_BACKEND in your environment (it now defaults to "
-            "'kubernetes')."
-        )
+SANDBOX_BACKEND = SandboxBackend.KUBERNETES
+_env_sandbox_backend = os.environ.get("SANDBOX_BACKEND", "").strip()
+if _env_sandbox_backend:
     try:
-        return SandboxBackend(raw)
-    except ValueError as e:
-        raise RuntimeError(
-            f"SANDBOX_BACKEND={raw!r} is not a valid value. Allowed values: "
-            f"{[b.value for b in SandboxBackend]!r}. See "
-            "docs/dev/local-kubernetes.md for the recommended dev setup."
-        ) from e
+        SANDBOX_BACKEND = SandboxBackend(_env_sandbox_backend.lower())
+    except ValueError:
+        raise ValueError(
+            f"Invalid SANDBOX_BACKEND={_env_sandbox_backend!r}. Valid values: "
+            f"{', '.join(b.value for b in SandboxBackend)}. Unset it to use the "
+            f"default, or align it with this release if you recently changed "
+            f"image versions."
+        )
 
 
-# Sandbox backend mode (controls snapshot and cleanup behavior)
-# "kubernetes" = full snapshots and cleanup (production Helm/cloud + dev kind)
-# "docker" = full snapshots and cleanup (self-hosted docker-compose)
-SANDBOX_BACKEND = _parse_sandbox_backend(
-    os.environ.get("SANDBOX_BACKEND", "kubernetes")
-)
+class SandboxRuntime(str, Enum):
+    """How sandboxes run on a Kubernetes backend. Mirrors Terraform `craft_sandbox_runtime`."""
 
-# Base directory path for persistent document storage (local filesystem)
-# Example: /var/onyx/file-system or /app/file-system
-PERSISTENT_DOCUMENT_STORAGE_PATH = os.environ.get(
-    "PERSISTENT_DOCUMENT_STORAGE_PATH", "/app/file-system"
-)
+    POD = "pod"
+    # Opt-in. Adds relay-signed VM identity in the egress proxy and host-node
+    # key registration; pod sandboxes keep working beside it.
+    FIRECRACKER = "firecracker"
 
-_THIS_FILE = Path(__file__)
 
-SKILLS_TEMPLATE_PATH = str(
-    _THIS_FILE.parent / "sandbox" / "kubernetes" / "docker" / "skills"
-)
+SANDBOX_RUNTIME = SandboxRuntime.POD
+_env_sandbox_runtime = os.environ.get("SANDBOX_RUNTIME", "").strip()
+if _env_sandbox_runtime:
+    try:
+        SANDBOX_RUNTIME = SandboxRuntime(_env_sandbox_runtime.lower())
+    except ValueError:
+        raise ValueError(
+            f"Invalid SANDBOX_RUNTIME={_env_sandbox_runtime!r}. Valid values: "
+            f"{', '.join(r.value for r in SandboxRuntime)}."
+        )
+if (
+    SANDBOX_RUNTIME is SandboxRuntime.FIRECRACKER
+    and SANDBOX_BACKEND is not SandboxBackend.KUBERNETES
+):
+    raise ValueError("SANDBOX_RUNTIME=firecracker requires SANDBOX_BACKEND=kubernetes.")
 
-# Sandbox agent configuration
-SANDBOX_AGENT_COMMAND = os.environ.get("SANDBOX_AGENT_COMMAND", "opencode").split()
-
-# OpenCode disabled tools (comma-separated list)
-# Available tools: bash, edit, write, read, grep, glob, list, lsp, patch,
-#                  skill, todowrite, todoread, webfetch, question
-# Example: "question,webfetch" to disable user questions and web fetching
 _disabled_tools_str = os.environ.get("OPENCODE_DISABLED_TOOLS", "question")
 OPENCODE_DISABLED_TOOLS: list[str] = [
     t.strip() for t in _disabled_tools_str.split(",") if t.strip()
 ]
 
-# Sandbox lifecycle configuration
+
 SANDBOX_IDLE_TIMEOUT_SECONDS = int(
     os.environ.get("SANDBOX_IDLE_TIMEOUT_SECONDS", "3600")
 )
-SANDBOX_MAX_CONCURRENT_PER_ORG = int(
-    os.environ.get("SANDBOX_MAX_CONCURRENT_PER_ORG", "10")
+SANDBOX_APPROVAL_WAIT_TIMEOUT_SECONDS = int(
+    os.environ.get("SANDBOX_APPROVAL_WAIT_TIMEOUT_SECONDS", "180")
 )
-
-# Sandbox snapshot storage
-SANDBOX_SNAPSHOTS_BUCKET = os.environ.get(
-    "SANDBOX_SNAPSHOTS_BUCKET", "sandbox-snapshots"
+# Margin a client-side wait must add over the approval window so a decision
+# landing at the wire never races the client's own timeout. Shared by the
+# AGENTS.md guidance and the inactivity-backstop default below.
+SANDBOX_APPROVAL_WAIT_MARGIN_SECONDS = 20
+SANDBOX_IDLE_CLEANUP_INTERVAL_SECONDS = int(
+    os.environ.get("SANDBOX_IDLE_CLEANUP_INTERVAL_SECONDS", "60")
 )
+# Cleanup leaves runtime resources younger than this alone.
+SANDBOX_RESOURCE_GRACE_SECONDS = int(
+    os.environ.get("SANDBOX_RESOURCE_GRACE_SECONDS", str(15 * 60))
+)
+SANDBOX_HEARTBEAT_REFRESH_INTERVAL_SECONDS = 60
 
-# Next.js preview server port range
 SANDBOX_NEXTJS_PORT_START = int(os.environ.get("SANDBOX_NEXTJS_PORT_START", "3010"))
 SANDBOX_NEXTJS_PORT_END = int(os.environ.get("SANDBOX_NEXTJS_PORT_END", "3100"))
 
-# File upload configuration
 MAX_UPLOAD_FILE_SIZE_MB = int(os.environ.get("BUILD_MAX_UPLOAD_FILE_SIZE_MB", "50"))
 MAX_UPLOAD_FILE_SIZE_BYTES = MAX_UPLOAD_FILE_SIZE_MB * 1024 * 1024
 MAX_UPLOAD_FILES_PER_SESSION = int(
@@ -98,73 +92,101 @@ MAX_TOTAL_UPLOAD_SIZE_MB = int(os.environ.get("BUILD_MAX_TOTAL_UPLOAD_SIZE_MB", 
 MAX_TOTAL_UPLOAD_SIZE_BYTES = MAX_TOTAL_UPLOAD_SIZE_MB * 1024 * 1024
 ATTACHMENTS_DIRECTORY = "attachments"
 
-# ============================================================================
-# Kubernetes Sandbox Configuration
-# Only used when SANDBOX_BACKEND = "kubernetes"
-# ============================================================================
+# ==============================================================================
+# Kubernetes sandbox (SANDBOX_BACKEND=kubernetes)
+# ==============================================================================
 
-# Namespace where sandbox pods are created
 SANDBOX_NAMESPACE = os.environ.get("SANDBOX_NAMESPACE", "onyx-sandboxes")
 
-# Container image for sandbox pods
-# Should include Next.js template, opencode CLI, and agent skills
-SANDBOX_CONTAINER_IMAGE = os.environ.get(
-    "SANDBOX_CONTAINER_IMAGE", "onyxdotapp/sandbox:v0.1.44"
+SANDBOX_CONTAINER_IMAGE = (
+    os.environ.get("SANDBOX_CONTAINER_IMAGE", "").strip() or "onyxdotapp/sandbox:latest"
 )
 
-# S3 bucket for sandbox file storage (snapshots, knowledge files, uploads)
-# Path structure: s3://{bucket}/{tenant_id}/snapshots/{session_id}/{snapshot_id}.tar.gz
-#                 s3://{bucket}/{tenant_id}/knowledge/{user_id}/
-#                 s3://{bucket}/{tenant_id}/uploads/{session_id}/
-SANDBOX_S3_BUCKET = os.environ.get("SANDBOX_S3_BUCKET", "onyx-sandbox-files")
+# Set to "Always" only in internal environments that deliberately pin a mutable
+# tag. Non-dev deployments should use app-aligned immutable tags.
+SANDBOX_IMAGE_PULL_POLICY = os.environ.get("SANDBOX_IMAGE_PULL_POLICY", "IfNotPresent")
 
-# Service account for sandbox pods (needs IRSA for S3 snapshot access)
-SANDBOX_SERVICE_ACCOUNT_NAME = os.environ.get(
-    "SANDBOX_SERVICE_ACCOUNT_NAME", "sandbox-file-sync"
-)
+SANDBOX_SERVICE_ACCOUNT_NAME = os.environ.get("SANDBOX_SERVICE_ACCOUNT_NAME", "sandbox")
 
 ENABLE_CRAFT = os.environ.get("ENABLE_CRAFT", "false").lower() == "true"
 
-# Dev/debug-only: when true, exposes a frontend button + SSE endpoint that
-# tails the user's sandbox pod's opencode-serve container logs. Never
-# enable in prod — the logs include LLM I/O and tool invocations that may
-# contain sensitive data. Disabled by default; the SSE endpoint 404s when
-# this is false so the surface is gone (not just hidden).
+# Gates the built-in `browser` skill. Defaults on to match the sandbox image's
+# build-time ENABLE_BROWSER ARG (also on); a browserless sandbox build must set
+# this false too, else the skill is advertised without its runtime.
+ENABLE_BROWSER = os.environ.get("ENABLE_BROWSER", "true").lower() == "true"
+
+SANDBOX_PUSH_PRIVATE_KEY = os.environ.get("ONYX_SANDBOX_PUSH_PRIVATE_KEY", "")
+
+
+ONYX_GATEWAY_PROVIDER_ID = "onyx"
+
+# Dev/debug-only: exposes an SSE endpoint that tails the sandbox pod's
+# opencode-serve container logs. Never enable in prod — the logs include LLM I/O
+# and tool invocations that may contain sensitive data. When false, the endpoint
+# 404s so the surface is gone, not just hidden.
 ENABLE_OPENCODE_DEBUGGING = (
     os.environ.get("ENABLE_OPENCODE_DEBUGGING", "false").lower() == "true"
 )
 
-# Internal URL the sandbox uses to reach the Onyx API server.
-# Must be set when SANDBOX_BACKEND=kubernetes (no default — varies per deployment).
-SANDBOX_API_SERVER_URL = os.environ.get("SANDBOX_API_SERVER_URL", "")
+# Complete Onyx API base URL reachable from the sandbox, including any path
+# prefix. Must be set when SANDBOX_BACKEND=kubernetes.
+ONYX_SERVER_URL = os.environ.get("ONYX_SERVER_URL", "")
 
-# Per-pod resource requests/limits. Defaults match production sizing for
-# real bun/npm/python workloads. CI overrides these in kind clusters where
-# the runner only has 4 vCPU and we provision 4+ sandbox pods concurrently;
-# k8s scheduler honors requests, so the production defaults would prevent
-# all-but-one pod from being scheduled at the same time.
-SANDBOX_POD_CPU_REQUEST = os.environ.get("SANDBOX_POD_CPU_REQUEST", "1000m")
-SANDBOX_POD_MEMORY_REQUEST = os.environ.get("SANDBOX_POD_MEMORY_REQUEST", "2Gi")
-SANDBOX_POD_CPU_LIMIT = os.environ.get("SANDBOX_POD_CPU_LIMIT", "2000m")
-SANDBOX_POD_MEMORY_LIMIT = os.environ.get("SANDBOX_POD_MEMORY_LIMIT", "10Gi")
+# ==============================================================================
+# Sandbox egress proxy
+# ==============================================================================
 
-# ============================================================================
-# Sandbox Egress Proxy Configuration
-# Consumed by both the api-server (building sandbox pod specs) and the
-# proxy itself (on boot).
-# ============================================================================
-
-# Empty SANDBOX_PROXY_HOST disables proxy wiring for tests/dev (the
-# initContainer is skipped and HTTPS_PROXY isn't set on the sandbox).
+# Required when SANDBOX_BACKEND=kubernetes.
 SANDBOX_PROXY_HOST = os.environ.get("SANDBOX_PROXY_HOST", "")
 SANDBOX_PROXY_PORT = int(os.environ.get("SANDBOX_PROXY_PORT", "8080"))
 
+SANDBOX_PROXY_LISTEN_HOST = os.environ.get(
+    "SANDBOX_PROXY_LISTEN_HOST",
+    "0.0.0.0",  # noqa: S104 — pod network listener
+)
+SANDBOX_PROXY_ALLOW_GLOBAL_CLIENTS = (
+    os.environ.get("SANDBOX_PROXY_ALLOW_GLOBAL_CLIENTS", "false").lower() == "true"
+)
+SANDBOX_PROXY_INTERNAL_CIDRS: str = os.environ.get("SANDBOX_PROXY_INTERNAL_CIDRS", "")
+
 SANDBOX_PROXY_LISTEN_PORT = int(os.environ.get("SANDBOX_PROXY_LISTEN_PORT", "8080"))
+# Env-tunable on Helm only; compose's healthcheck.test hardcodes 8081 (can't
+# read container env), so a compose change here desyncs the probe.
 SANDBOX_PROXY_HEALTHZ_PORT = int(os.environ.get("SANDBOX_PROXY_HEALTHZ_PORT", "8081"))
 
-# Namespace the proxy runs in. The CA Secret lives here; the CA
-# ConfigMap is projected into SANDBOX_NAMESPACE so sandboxes can mount
-# it (K8s does not allow cross-namespace ConfigMap mounts).
+# Firecracker only: an mTLS listener for the host agent relays. It needs a
+# client cert from SANDBOX_PROXY_RELAY_TLS_CLIENT_CA_PATH (with one of the
+# comma-separated SANs, if set) and hands each connection to the proxy port.
+# 0 = off.
+SANDBOX_PROXY_RELAY_TLS_PORT = int(os.environ.get("SANDBOX_PROXY_RELAY_TLS_PORT", "0"))
+SANDBOX_PROXY_RELAY_TLS_CERT_PATH = os.environ.get(
+    "SANDBOX_PROXY_RELAY_TLS_CERT_PATH", ""
+)
+SANDBOX_PROXY_RELAY_TLS_KEY_PATH = os.environ.get(
+    "SANDBOX_PROXY_RELAY_TLS_KEY_PATH", ""
+)
+SANDBOX_PROXY_RELAY_TLS_CLIENT_CA_PATH = os.environ.get(
+    "SANDBOX_PROXY_RELAY_TLS_CLIENT_CA_PATH", ""
+)
+SANDBOX_PROXY_RELAY_TLS_ALLOWED_SANS: list[str] = [
+    s.strip()
+    for s in os.environ.get("SANDBOX_PROXY_RELAY_TLS_ALLOWED_SANS", "").split(",")
+    if s.strip()
+]
+
+# Optional additive CA bundle used by mitmproxy when it verifies HTTPS origins.
+# The Helm chart writes it into the proxy's writable confdir because the proxy
+# container intentionally runs non-root with a read-only root filesystem.
+# Other deployments can share the SSL_CERT_FILE bundle used by HTTPX OAuth calls.
+SANDBOX_PROXY_SSL_VERIFY_UPSTREAM_TRUSTED_CA = (
+    os.environ.get("SANDBOX_PROXY_SSL_VERIFY_UPSTREAM_TRUSTED_CA", "").strip()
+    or os.environ.get("SSL_CERT_FILE", "").strip()
+    or None
+)
+
+# The CA Secret lives here; the CA ConfigMap is projected into SANDBOX_NAMESPACE
+# so sandboxes can mount it (K8s does not allow cross-namespace ConfigMap
+# mounts).
 SANDBOX_PROXY_NAMESPACE = os.environ.get("SANDBOX_PROXY_NAMESPACE", "onyx")
 
 SANDBOX_PROXY_CA_SECRET = os.environ.get("SANDBOX_PROXY_CA_SECRET", "sandbox-proxy-ca")
@@ -172,135 +194,140 @@ SANDBOX_PROXY_CA_CONFIGMAP = os.environ.get(
     "SANDBOX_PROXY_CA_CONFIGMAP", "sandbox-proxy-ca-bundle"
 )
 
-# ============================================================================
-# Docker Sandbox Configuration
-# Only used when SANDBOX_BACKEND = "docker" (self-hosted docker-compose)
-# ============================================================================
+# Proxy-side bind path for the CA volume. Hardcoded because the compose
+# `volumes:` mount target is the source of truth; an env override would silently
+# desync.
+SANDBOX_PROXY_CA_VOLUME_PATH = "/var/lib/sandbox-proxy/ca"
 
-# Docker socket path on the api_server host. Mounted into the api_server
-# container; api_server uses this to drive sandbox container lifecycle.
+# Docker named-volume for the proxy CA. Hardcoded for the same reason as above.
+SANDBOX_PROXY_CA_VOLUME_NAME = "sandbox_proxy_ca"
+
+# Non-empty sentinel for every proxy-injected credential (ONYX_PAT + each
+# opencode apiKey); the proxy overwrites the real value on the wire. Sandboxes
+# never see the raw values.
+SANDBOX_PROXY_INJECTED_PLACEHOLDER = "replaced_by_egress_proxy"
+
+# Header carrying the originating BuildSession id on opencode's in-process MCP
+# client requests. opencode-serve is one process for many sessions and uses the
+# untagged base proxy env, so the shell-env proxy tag can't ride MCP egress;
+# instead the per-session opencode.json stamps this header on each MCP server.
+# The egress proxy reads it to attribute the tool call to a session for approval,
+# then strips it so it never reaches the MCP origin.
+MCP_SESSION_TAG_HEADER = "X-Onyx-Mcp-Session"
+
+# Shared cluster credential the Firecracker host agent presents to register its
+# node signing key. Unset = registration is locked.
+SANDBOX_NODE_REGISTRATION_SECRET = (
+    os.environ.get("SANDBOX_NODE_REGISTRATION_SECRET", "").strip() or None
+)
+# How long a node's previous signing key keeps verifying after rotation.
+SANDBOX_NODE_SIGNING_KEY_ROTATION_OVERLAP_SECONDS = 300
+
+
+# ==============================================================================
+# Docker sandbox (SANDBOX_BACKEND=docker, self-hosted docker-compose)
+# ==============================================================================
+
+# Mounted into the api_server container; api_server uses this to drive sandbox
+# container lifecycle.
 SANDBOX_DOCKER_SOCKET = os.environ.get("SANDBOX_DOCKER_SOCKET", "/var/run/docker.sock")
 
-# Bridge network for sandbox containers. Sandbox containers join only this
-# network and never compose's default network, isolating them from
-# api_server, postgres, redis, etc.
+# Sandbox containers join only this network and never compose's default network,
+# isolating them from api_server, postgres, redis, etc.
 SANDBOX_DOCKER_NETWORK = os.environ.get("SANDBOX_DOCKER_NETWORK", "onyx_craft_sandbox")
 
-# Prefix for the per-sandbox named volumes that hold ``/workspace/sessions``.
 SANDBOX_DOCKER_VOLUME_PREFIX = os.environ.get(
     "SANDBOX_DOCKER_VOLUME_PREFIX", "onyx-craft-sandbox-"
 )
 
-# Container resource limits. Memory accepts docker-style suffixes (``2g``).
-# Defaults match the Kubernetes sandbox pod's *requests* (1 CPU / 2Gi),
-# not its limits (2 CPU / 10Gi). Single-VM docker-compose deployments rarely
-# have the headroom to over-commit each sandbox to 10Gi.
+# Defaults match the Kubernetes sandbox pod's *requests* (1 CPU / 2Gi), not its
+# limits (2 CPU / 10Gi). Single-VM docker-compose deployments rarely have the
+# headroom to over-commit each sandbox to 10Gi.
 SANDBOX_DOCKER_MEMORY_LIMIT = os.environ.get("SANDBOX_DOCKER_MEMORY_LIMIT", "2g")
 SANDBOX_DOCKER_CPU_LIMIT = float(os.environ.get("SANDBOX_DOCKER_CPU_LIMIT", "1.0"))
 
-# ============================================================================
-# SSE Streaming Configuration
-# ============================================================================
+# ==============================================================================
+# SSE / opencode-serve
+# ==============================================================================
 
-# SSE keepalive interval in seconds - send keepalive comment if no events
 SSE_KEEPALIVE_INTERVAL = float(os.environ.get("SSE_KEEPALIVE_INTERVAL", "15.0"))
 
-# ============================================================================
-# ACP (Agent Communication Protocol) Configuration
-# ============================================================================
-
-# Timeout for ACP message processing in seconds
-# This is the maximum time to wait for a complete response from the agent
-ACP_MESSAGE_TIMEOUT = float(os.environ.get("ACP_MESSAGE_TIMEOUT", "900.0"))
-
-
-class AgentTransport(str, Enum):
-    """Wire protocol used to drive the in-sandbox agent.
-
-    ACP: subprocess-per-message `opencode acp` over JSON-RPC (stdin/stdout).
-         The historical default. Deprecated — opencode 1.15.7 non-deterministically
-         drops the per-turn terminator; see docs/craft/opencode-serve-migration.md.
-    SERVE: long-lived `opencode serve` HTTP server inside the sandbox pod.
-         Streaming via /event SSE, prompts via POST /session/.../prompt_async.
-         Target post-Phase 5.
-    """
-
-    ACP = "acp"
-    SERVE = "serve"
-
-
-# Transport for driving the in-sandbox agent. Default ACP until serve has soaked.
-# The OpencodeServeClient path is gated on this; setting "serve" routes
-# SandboxManager.send_message through HTTP instead of the per-message exec'd
-# `opencode acp` subprocess. See docs/craft/opencode-serve-migration.md.
-AGENT_TRANSPORT = AgentTransport(
-    os.environ.get("AGENT_TRANSPORT", AgentTransport.ACP.value)
+# Maximum time opencode-serve may go without emitting a turn event. Coarse
+# liveness backstop only: it must stay above every in-tool wait so it never
+# pre-empts a healthy long-running tool — opencode's bash tool defaults to
+# 180s, and a proxy-parked approval inside a tool call holds the stream
+# silent for the full approval window, hence the derivation. It exists to
+# catch stalls opencode does not bound itself (LLM-stream hangs, non-bash/MCP
+# tool hangs). The turn budget is the hard ceiling.
+OPENCODE_PROMPT_INACTIVITY_TIMEOUT_SECONDS = float(
+    os.environ.get(
+        "OPENCODE_PROMPT_INACTIVITY_TIMEOUT_SECONDS",
+        str(
+            SANDBOX_APPROVAL_WAIT_TIMEOUT_SECONDS + SANDBOX_APPROVAL_WAIT_MARGIN_SECONDS
+        ),
+    )
 )
 
-# Port `opencode serve` listens on inside the sandbox container.
+# Per-turn deadline stamp for the turn-budget plugin; name is an internal
+# contract with turn-budget.ts.
+TURN_BUDGET_FILE_NAME = ".onyx-turn-budget.json"
+
+# Prompt-slot lock lease; renewed on every sandbox event/keepalive, so a dead
+# holder strands the slot for at most this long.
+PROMPT_SLOT_LEASE_SECONDS = float(os.environ.get("PROMPT_SLOT_LEASE_SECONDS", "120.0"))
+
 # Match against the EXPOSE directive in the sandbox Dockerfile.
 OPENCODE_SERVE_PORT = int(os.environ.get("OPENCODE_SERVE_PORT", "4096"))
 
-# Name of the env var inside the sandbox container that holds the
-# per-pod HTTP Basic Auth password for opencode serve. The sandbox manager
-# is responsible for generating + provisioning the per-pod K8s Secret
-# (see docs/craft/opencode-serve-migration.md §Pod / image changes) and
-# mounting it under this name in the sandbox container's env.
-OPENCODE_SERVER_PASSWORD_ENV = os.environ.get(
-    "OPENCODE_SERVER_PASSWORD_ENV", "OPENCODE_SERVER_PASSWORD"
-)
+# Env var inside the sandbox container that holds the per-pod HTTP Basic
+# password for opencode serve. Internal contract — api_server writes this name
+# and opencode-serve reads it, so both ends must agree.
+OPENCODE_SERVER_PASSWORD = "OPENCODE_SERVER_PASSWORD"
 
-# Username for HTTP Basic Auth against opencode serve. Opencode's serve
-# implementation hard-codes the username to "opencode" when only
-# OPENCODE_SERVER_PASSWORD is set; using any other value yields a 401
-# (verified empirically against opencode 1.15.7, see test report).
+# Opencode's serve implementation hard-codes the username to "opencode" when
+# only OPENCODE_SERVER_PASSWORD is set; any other value yields a 401 (verified
+# against opencode 1.15.7).
 OPENCODE_SERVER_USERNAME = "opencode"
 
-# Per-request HTTP timeouts when talking to opencode serve, in seconds.
 OPENCODE_SERVE_CONNECT_TIMEOUT = float(
     os.environ.get("OPENCODE_SERVE_CONNECT_TIMEOUT", "5.0")
 )
+# Ordinary requests default to 30 seconds. Session initialization gets 90 seconds
+# because session lookup and creation can initialize a cold directory.
+# Stop uses a short request while it holds the interactive admission lock.
+OPENCODE_SERVE_ABORT_TIMEOUT = 2.0
+
 OPENCODE_SERVE_REQUEST_TIMEOUT = float(
     os.environ.get("OPENCODE_SERVE_REQUEST_TIMEOUT", "30.0")
 )
-# Idle timeout for /event SSE. The reader reconnects (with backoff) if the
-# stream is silent for this long.
+OPENCODE_SERVE_SESSION_INIT_TIMEOUT = 90.0
+# Idle timeout for the raw /event SSE connection to opencode-serve. The
+# reader reconnects (with backoff) if no bytes arrive for this long. Its
+# floor is opencode-serve's own emission cadence on /event — NOT our
+# downstream UI keepalive, which is synthesized after the bus and never
+# reaches this connection.
 OPENCODE_SERVE_EVENT_READ_TIMEOUT = float(
     os.environ.get("OPENCODE_SERVE_EVENT_READ_TIMEOUT", "60.0")
 )
 
-# ============================================================================
-# Rate Limiting Configuration
-# ============================================================================
+# ==============================================================================
+# User Library (user-uploaded raw files: xlsx, pptx, docx, etc.)
+# ==============================================================================
 
-# Base rate limit for paid/subscribed users (messages per week)
-# Free users always get 5 messages total (not configurable)
-# Per-user overrides are managed via PostHog feature flag "craft-has-usage-limits"
-CRAFT_PAID_USER_RATE_LIMIT = int(os.environ.get("CRAFT_PAID_USER_RATE_LIMIT", "25"))
-
-# ============================================================================
-# User Library Configuration
-# For user-uploaded raw files (xlsx, pptx, docx, etc.) in Craft
-# ============================================================================
-
-# Maximum size per file in MB (default 500MB)
 USER_LIBRARY_MAX_FILE_SIZE_MB = int(
     os.environ.get("USER_LIBRARY_MAX_FILE_SIZE_MB", "500")
 )
 USER_LIBRARY_MAX_FILE_SIZE_BYTES = USER_LIBRARY_MAX_FILE_SIZE_MB * 1024 * 1024
 
-# Maximum total storage per user in GB (default 10GB)
 USER_LIBRARY_MAX_TOTAL_SIZE_GB = int(
     os.environ.get("USER_LIBRARY_MAX_TOTAL_SIZE_GB", "10")
 )
 USER_LIBRARY_MAX_TOTAL_SIZE_BYTES = USER_LIBRARY_MAX_TOTAL_SIZE_GB * 1024 * 1024 * 1024
 
-# Maximum files per single upload request (default 100)
 USER_LIBRARY_MAX_FILES_PER_UPLOAD = int(
     os.environ.get("USER_LIBRARY_MAX_FILES_PER_UPLOAD", "100")
 )
 
-# String constants for User Library entities
 USER_LIBRARY_CONNECTOR_NAME = "User Library"
 USER_LIBRARY_CREDENTIAL_NAME = "User Library Credential"
 USER_LIBRARY_SOURCE_DIR = "user_library"

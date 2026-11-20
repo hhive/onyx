@@ -5,6 +5,7 @@
   const TITLEBAR_ID = "onyx-desktop-titlebar";
   const TITLEBAR_HEIGHT = 36;
   const STYLE_ID = "onyx-desktop-titlebar-style";
+  const HISTORY_NAV_ID = "onyx-desktop-history-nav";
   const VIEWPORT_VAR = "--onyx-desktop-viewport-height";
 
   // Wait for DOM to be ready
@@ -60,39 +61,77 @@
         }
       }
 
-      html,
-      body {
-        height: var(--onyx-desktop-viewport-height);
-        min-height: var(--onyx-desktop-viewport-height);
-        margin: 0;
-        padding: 0;
-        overflow: hidden;
-      }
-
-      body {
-        padding-top: var(--onyx-desktop-titlebar-height) !important;
+      /* Reserve the native overlay-titlebar strip on the ROOT element. Doing
+         this on <html> (rather than <body>) keeps the reservation working no
+         matter how the embedded web app structures or restyles <body>, and
+         shifts every normal-flow descendant below the titlebar. box-sizing +
+         padding-top carves out the strip; the fixed titlebar element is drawn
+         on top of it. */
+      html {
         box-sizing: border-box;
+        height: var(--onyx-desktop-viewport-height) !important;
+        padding-top: var(--onyx-desktop-titlebar-height) !important;
+        overflow: hidden !important;
       }
 
-      body > div#__next,
-      body > div#root,
-      body > main {
-        height: var(--onyx-desktop-safe-height);
-        min-height: var(--onyx-desktop-safe-height);
-        overflow: auto;
-      }
-
-      /* Override common Tailwind viewport helpers so content fits under the titlebar */
-      .h-screen {
+      body {
         height: var(--onyx-desktop-safe-height) !important;
+        min-height: 0 !important;
+        margin: 0 !important;
+        overflow: hidden !important;
+      }
+
+      /* Clamp full-viewport-height containers to the area BELOW the titlebar so
+         their bottom edge doesn't overflow past the window. Covers raw Tailwind
+         utilities AND the Opal layout classes that bake height:100vh into a
+         compiled class name via @apply (which the utility overrides miss). */
+      .h-screen,
+      .max-h-screen,
+      .opal-root-layout,
+      .opal-sidebar-root__column,
+      .opal-sidebar-root__overlay[data-variant="mobile"],
+      .opal-sidebar-root__overlay[data-variant="small"],
+      .opal-sidebar-root__overlay[data-variant="medium"] {
+        height: var(--onyx-desktop-safe-height) !important;
+        max-height: var(--onyx-desktop-safe-height) !important;
       }
 
       .min-h-screen {
         min-height: var(--onyx-desktop-safe-height) !important;
       }
 
-      .max-h-screen {
-        max-height: var(--onyx-desktop-safe-height) !important;
+      /* Fixed sidebar overlays / backdrops are positioned against the viewport,
+         so inset-y-0 pins them to y=0 (under the traffic lights). Re-anchor them
+         below the titlebar. */
+      .opal-sidebar-root__overlay[data-variant="mobile"],
+      .opal-sidebar-root__overlay[data-variant="small"],
+      .opal-sidebar-root__overlay[data-variant="medium"],
+      .opal-sidebar-root__backdrop {
+        top: var(--onyx-desktop-titlebar-height) !important;
+        bottom: 0 !important;
+      }
+
+      /* Toasts and modals are fixed to the viewport; keep them below the
+         titlebar so it never covers them. */
+      .opal-toast-viewport,
+      [data-testid="toast-container"] {
+        top: calc(var(--onyx-desktop-titlebar-height) + 0.5rem) !important;
+      }
+
+      .opal-modal-positioner[data-position="center"] {
+        --opal-modal-available-height: calc(var(--onyx-desktop-safe-height) - 2rem) !important;
+      }
+
+      .opal-modal-positioner[data-position="center"][data-viewport-centered] {
+        top: calc(var(--onyx-desktop-titlebar-height) + var(--onyx-desktop-safe-height) / 2) !important;
+      }
+
+      .opal-modal-positioner[data-position="top"] {
+        --opal-modal-available-height: calc(var(--onyx-desktop-safe-height) - 72px - 1rem) !important;
+      }
+
+      .opal-modal-positioner[data-position="top"][data-viewport-centered] {
+        top: calc(var(--onyx-desktop-titlebar-height) + 72px) !important;
       }
 
       #${TITLEBAR_ID} {
@@ -102,6 +141,45 @@
         -webkit-app-region: drag;
         background: rgba(255, 255, 255, 0.85);
         height: var(--onyx-desktop-titlebar-height);
+      }
+
+      #${HISTORY_NAV_ID} {
+        position: absolute;
+        left: 80px;
+        top: 0;
+        height: 100%;
+        display: flex;
+        align-items: center;
+        gap: 2px;
+        -webkit-app-region: no-drag;
+      }
+
+      #${HISTORY_NAV_ID} button {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 26px;
+        height: 24px;
+        padding: 0;
+        border: none;
+        border-radius: 6px;
+        background: transparent;
+        color: rgba(0, 0, 0, 0.6);
+        cursor: default;
+      }
+
+      #${HISTORY_NAV_ID} button:hover {
+        background: rgba(0, 0, 0, 0.06);
+        color: rgba(0, 0, 0, 0.85);
+      }
+
+      .dark #${HISTORY_NAV_ID} button {
+        color: rgba(255, 255, 255, 0.65);
+      }
+
+      .dark #${HISTORY_NAV_ID} button:hover {
+        background: rgba(255, 255, 255, 0.08);
+        color: rgba(255, 255, 255, 0.9);
       }
 
       /* Dark mode support */
@@ -137,15 +215,8 @@
 
     titleBar.addEventListener("mousedown", (e) => {
       // Only start drag on left click and not on buttons/inputs
-      const nonDraggable = [
-        "BUTTON",
-        "INPUT",
-        "TEXTAREA",
-        "A",
-        "SELECT",
-        "OPTION",
-      ];
-      if (e.button === 0 && !nonDraggable.includes(e.target.tagName)) {
+      const nonDraggable = "button, input, textarea, a, select, option";
+      if (e.button === 0 && !e.target.closest?.(nonDraggable)) {
         e.preventDefault();
         startWindowDrag();
       }
@@ -184,7 +255,36 @@
     // Apply correct theme
     updateTitleBarTheme(isDark);
 
+    titleBar.appendChild(buildHistoryButtons());
+
     return titleBar;
+  }
+
+  function historyButton(label, path, onClick) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.setAttribute("aria-label", label);
+    button.title = label;
+    button.innerHTML = `<svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="${path}"/></svg>`;
+    button.addEventListener("click", onClick);
+    return button;
+  }
+
+  // Back/forward for pages without their own way back, such as an OAuth
+  // provider the app navigated to.
+  function buildHistoryButtons() {
+    const nav = document.createElement("div");
+    nav.id = HISTORY_NAV_ID;
+    const back = historyButton("Back", "M10 3L5 8l5 5", () => history.back());
+    const forward = historyButton("Forward", "M6 3l5 5-5 5", () =>
+      history.forward(),
+    );
+    nav.append(back, forward);
+
+    // Always enabled: navigation.canGoBack ignores cross-origin entries (e.g.
+    // an OAuth page) and misses bfcache restores, and history.back() at the
+    // first entry is a no-op.
+    return nav;
   }
 
   function mountTitleBar() {

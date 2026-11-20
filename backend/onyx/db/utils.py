@@ -1,16 +1,16 @@
 from enum import Enum
-from typing import Any
-from typing import Final
+from typing import Any, Final, TypeGuard, TypeVar
 
-from psycopg2 import errorcodes
-from psycopg2 import OperationalError
-from psycopg2.errors import ForeignKeyViolation
-from psycopg2.errors import UniqueViolation
-from pydantic import BaseModel
+from asyncpg.exceptions import CheckViolationError as AsyncpgCheckViolationError
+from psycopg2 import OperationalError, errorcodes
+from psycopg2.errors import CheckViolation, ForeignKeyViolation, UniqueViolation
+from pydantic import BaseModel, Field
 from sqlalchemy import inspect
 from sqlalchemy.exc import IntegrityError
 
 from onyx.db.models import Base
+
+_T = TypeVar("_T")
 
 
 class UnsetType:
@@ -26,6 +26,22 @@ class UnsetType:
 UNSET: Final[UnsetType] = UnsetType()
 
 
+def is_set(value: _T | UnsetType) -> TypeGuard[_T]:
+    """True if a patch field was provided. Narrows away ``UnsetType`` so the
+    value can be assigned in the guarded branch."""
+    return not isinstance(value, UnsetType)
+
+
+def none_as_unset(value: _T | None) -> _T | UnsetType:
+    """Map a request field's ``None`` (omitted) to ``UNSET`` for a patch helper.
+
+    ONLY for non-nullable patch fields. If the column is nullable — i.e. ``None``
+    is a legitimate "clear to NULL" value — this silently turns that clear into a
+    no-op; use ``model_fields_set`` to tell omitted from explicit null instead.
+    """
+    return UNSET if value is None else value
+
+
 def is_unique_violation(exc: IntegrityError, constraint: str) -> bool:
     """True iff the IntegrityError came from the named unique constraint/index.
 
@@ -38,19 +54,35 @@ def is_unique_violation(exc: IntegrityError, constraint: str) -> bool:
     orig = exc.orig
     return (
         isinstance(orig, UniqueViolation)
-        and getattr(orig.diag, "constraint_name", None) == constraint
+        and getattr(orig.diag, "constraint_name", None)  # ods: ignore[getattr]
+        == constraint
     )
 
 
-def is_fk_violation(exc: IntegrityError) -> bool:
-    """True iff the IntegrityError is a foreign-key violation."""
-    return isinstance(exc.orig, ForeignKeyViolation)
+def is_check_violation(exc: IntegrityError, constraint: str) -> bool:
+    """True when a database write violates the named check constraint."""
+    if isinstance(exc.orig, CheckViolation):
+        return exc.orig.diag.constraint_name == constraint
+    # SQLAlchemy wraps asyncpg errors and retains the driver error as the cause.
+    cause = exc.orig.__cause__ if exc.orig is not None else None
+    return (
+        isinstance(cause, AsyncpgCheckViolationError)
+        and cause.as_dict().get("constraint_name") == constraint
+    )
+
+
+def is_fk_violation(exc: IntegrityError, constraint: str | None = None) -> bool:
+    """True iff the IntegrityError is a foreign-key violation, of the named
+    constraint when one is given."""
+    if not isinstance(exc.orig, ForeignKeyViolation):
+        return False
+    return constraint is None or exc.orig.diag.constraint_name == constraint
 
 
 def model_to_dict(model: Base) -> dict[str, Any]:
     return {
-        c.key: getattr(model, c.key)
-        for c in inspect(model).mapper.column_attrs  # ty: ignore[unresolved-attribute]
+        c.key: getattr(model, c.key)  # ods: ignore[getattr]
+        for c in inspect(model).mapper.column_attrs
     }
 
 
@@ -67,7 +99,11 @@ RETRYABLE_PG_CODES = {
 def is_retryable_sqlalchemy_error(exc: BaseException) -> bool:
     """Helper function for use with tenacity's retry_if_exception as the callback"""
     if isinstance(exc, OperationalError):
-        pgcode = getattr(getattr(exc, "orig", None), "pgcode", None)
+        pgcode = getattr(  # ods: ignore[getattr]
+            getattr(exc, "orig", None),  # ods: ignore[getattr]
+            "pgcode",
+            None,
+        )
         return pgcode in RETRYABLE_PG_CODES
     return False
 
@@ -76,6 +112,7 @@ class DocumentRow(BaseModel):
     id: str
     doc_metadata: dict[str, Any]
     external_user_group_ids: list[str]
+    external_user_emails: list[str] = Field(default_factory=list)
 
 
 class SortOrder(str, Enum):

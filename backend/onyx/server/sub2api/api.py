@@ -2,21 +2,19 @@ import secrets
 import string
 import uuid
 
-from fastapi import APIRouter
-from fastapi import Depends
-from fastapi import Request
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import RedirectResponse
 from fastapi_users import exceptions
 from fastapi_users.authentication import Strategy
 from sqlalchemy.orm import Session
 
 from onyx.auth.schemas import UserCreate
-from onyx.auth.schemas import UserRole
-from onyx.auth.users import auth_backend
-from onyx.auth.users import get_user_manager
-from onyx.auth.users import UserManager
-from onyx.configs.app_configs import SUB2API_INTEGRATION_ENABLED
-from onyx.configs.app_configs import SUB2API_ONYX_REDIRECT_PATH
+from onyx.auth.users import UserManager, auth_backend, get_user_manager
+from onyx.configs.app_configs import (
+    SUB2API_APP_SECRET,
+    SUB2API_INTEGRATION_ENABLED,
+    SUB2API_ONYX_REDIRECT_PATH,
+)
 from onyx.db.engine.sql_engine import get_session
 from onyx.db.enums import AccountType
 from onyx.db.models import User
@@ -36,7 +34,7 @@ async def sub2api_exchange(
     user_manager: UserManager = Depends(get_user_manager),
     db_session: Session = Depends(get_session),
 ) -> RedirectResponse:
-    if not SUB2API_INTEGRATION_ENABLED:
+    if not SUB2API_INTEGRATION_ENABLED or SUB2API_APP_SECRET:
         raise OnyxError(
             OnyxErrorCode.SERVICE_UNAVAILABLE,
             "Sub2API integration is disabled.",
@@ -106,7 +104,7 @@ async def upsert_onyx_user_from_sub2api(
         UserCreate(
             email=normalized_email,
             password=_generate_secure_password(),
-            role=UserRole.BASIC,
+            is_superuser=False,
             account_type=AccountType.STANDARD,
             is_verified=True,
         )

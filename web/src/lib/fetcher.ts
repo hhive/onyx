@@ -1,7 +1,16 @@
+/** JSON body of a backend error response. `OnyxError` and the request
+ * validation handler both send `error_code` and a string `detail`; the
+ * validation and `ValueError` handlers also send `message`. */
+export interface ErrorResponseBody {
+  detail?: string;
+  error_code?: string;
+  message?: string;
+}
+
 export class FetchError extends Error {
   status: number;
-  info: any;
-  constructor(message: string, status: number, info: any) {
+  info: ErrorResponseBody | null;
+  constructor(message: string, status: number, info: ErrorResponseBody | null) {
     super(message);
     this.status = status;
     this.info = info;
@@ -9,15 +18,58 @@ export class FetchError extends Error {
 }
 
 export class RedirectError extends FetchError {
-  constructor(message: string, status: number, info: any) {
+  constructor(message: string, status: number, info: ErrorResponseBody | null) {
     super(message, status, info);
   }
+}
+
+/** Extract the backend error `detail` from a failed Response, falling back
+ * to `fallback` when the body isn't JSON or carries no detail. */
+export async function parseErrorDetail(
+  res: Response,
+  fallback: string
+): Promise<string> {
+  try {
+    const body = await res.json();
+    return body?.detail ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+/** A `FetchError` for a failed Response, keeping its JSON body when it has one. */
+export async function fetchErrorFrom(
+  res: Response,
+  message: string
+): Promise<FetchError> {
+  const info: ErrorResponseBody | null = await res
+    .json()
+    .catch((): null => null);
+  return new FetchError(message, res.status, info);
+}
+
+/** The backend's text `detail` of a failed request; `null` when it gave none. */
+export function fetchErrorDetail(error: unknown): string | null {
+  if (!(error instanceof FetchError)) return null;
+  const detail: unknown = error.info?.detail;
+  return typeof detail === "string" && detail !== "" ? detail : null;
 }
 
 const DEFAULT_AUTH_ERROR_MSG =
   "An error occurred while fetching the data, related to the user's authentication status.";
 
 const DEFAULT_ERROR_MSG = "An error occurred while fetching the data.";
+
+export function isAuthStatusError(error: unknown): boolean {
+  return (
+    error instanceof FetchError &&
+    (error.status === 401 || error.status === 402 || error.status === 403)
+  );
+}
+
+export function isNotFoundError(error: unknown): boolean {
+  return error instanceof FetchError && error.status === 404;
+}
 
 /**
  * SWR `onErrorRetry` callback that suppresses automatic retries for
@@ -28,11 +80,7 @@ const DEFAULT_ERROR_MSG = "An error occurred while fetching the data.";
 export const skipRetryOnAuthError: NonNullable<
   import("swr").SWRConfiguration["onErrorRetry"]
 > = (error, _key, _config, revalidate, { retryCount }) => {
-  if (
-    error instanceof FetchError &&
-    (error.status === 401 || error.status === 402 || error.status === 403)
-  )
-    return;
+  if (isAuthStatusError(error)) return;
   // For non-auth errors, retry with exponential backoff
   if (
     _config.errorRetryCount !== undefined &&
@@ -40,12 +88,24 @@ export const skipRetryOnAuthError: NonNullable<
   )
     return;
   const delay = Math.min(2000 * 2 ** retryCount, 30000);
-  setTimeout(() => revalidate({ retryCount }), delay);
+  setTimeout(() => {
+    if (typeof document === "undefined" || !document.hidden) {
+      revalidate({ retryCount });
+      return;
+    }
+    // Hidden at retry time: defer until the tab is visible again, so hidden
+    // tabs stay quiet without permanently dropping the retry chain (which
+    // would strand consumers that disable revalidateOnFocus).
+    const retryOnVisible = () => {
+      if (document.hidden) return;
+      document.removeEventListener("visibilitychange", retryOnVisible);
+      revalidate({ retryCount });
+    };
+    document.addEventListener("visibilitychange", retryOnVisible);
+  }, delay);
 };
 
-export const errorHandlingFetcher = async <T>(url: string): Promise<T> => {
-  const res = await fetch(url);
-
+async function parseFetcherResponse<T>(res: Response): Promise<T> {
   if (res.status === 403) {
     const redirect = new RedirectError(
       DEFAULT_AUTH_ERROR_MSG,
@@ -65,4 +125,16 @@ export const errorHandlingFetcher = async <T>(url: string): Promise<T> => {
   }
 
   return res.json();
-};
+}
+
+// One argument only: SWR spreads an array key into its fetcher's arguments.
+export const errorHandlingFetcher = async <T>(url: string): Promise<T> =>
+  parseFetcherResponse<T>(await fetch(url));
+
+/** `errorHandlingFetcher` with request options, such as an abort signal. */
+export async function errorHandlingFetchWith<T>(
+  url: string,
+  init: RequestInit
+): Promise<T> {
+  return parseFetcherResponse<T>(await fetch(url, init));
+}

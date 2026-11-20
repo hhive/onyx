@@ -1,25 +1,30 @@
-from fastapi import APIRouter
-from fastapi import Depends
-from fastapi import HTTPException
+from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
-from ee.onyx.db.standard_answer import fetch_standard_answer
-from ee.onyx.db.standard_answer import fetch_standard_answer_categories
-from ee.onyx.db.standard_answer import fetch_standard_answer_category
-from ee.onyx.db.standard_answer import fetch_standard_answers
-from ee.onyx.db.standard_answer import insert_standard_answer
-from ee.onyx.db.standard_answer import insert_standard_answer_category
-from ee.onyx.db.standard_answer import remove_standard_answer
-from ee.onyx.db.standard_answer import update_standard_answer
-from ee.onyx.db.standard_answer import update_standard_answer_category
+from ee.onyx.db.standard_answer import (
+    fetch_standard_answer,
+    fetch_standard_answer_categories,
+    fetch_standard_answer_category,
+    fetch_standard_answers,
+    insert_standard_answer,
+    insert_standard_answer_category,
+    remove_standard_answer,
+    remove_standard_answer_category,
+    update_standard_answer,
+    update_standard_answer_category,
+)
 from onyx.auth.permissions import require_permission
 from onyx.db.engine.sql_engine import get_session
 from onyx.db.enums import Permission
 from onyx.db.models import User
-from onyx.server.manage.models import StandardAnswer
-from onyx.server.manage.models import StandardAnswerCategory
-from onyx.server.manage.models import StandardAnswerCategoryCreationRequest
-from onyx.server.manage.models import StandardAnswerCreationRequest
+from onyx.error_handling.error_codes import OnyxErrorCode
+from onyx.error_handling.exceptions import OnyxError
+from onyx.server.manage.models import (
+    StandardAnswer,
+    StandardAnswerCategory,
+    StandardAnswerCategoryCreationRequest,
+    StandardAnswerCreationRequest,
+)
 
 router = APIRouter(prefix="/manage")
 
@@ -66,7 +71,7 @@ def patch_standard_answer(
     )
 
     if existing_standard_answer is None:
-        raise HTTPException(status_code=404, detail="Standard answer not found")
+        raise OnyxError(OnyxErrorCode.NOT_FOUND, "Standard answer not found")
 
     standard_answer_model = update_standard_answer(
         standard_answer_id=standard_answer_id,
@@ -132,9 +137,7 @@ def patch_standard_answer_category(
     )
 
     if existing_standard_answer_category is None:
-        raise HTTPException(
-            status_code=404, detail="Standard answer category not found"
-        )
+        raise OnyxError(OnyxErrorCode.NOT_FOUND, "Standard answer category not found")
 
     standard_answer_category_model = update_standard_answer_category(
         standard_answer_category_id=standard_answer_category_id,
@@ -142,3 +145,15 @@ def patch_standard_answer_category(
         db_session=db_session,
     )
     return StandardAnswerCategory.from_model(standard_answer_category_model)
+
+
+@router.delete("/admin/standard-answer/category/{standard_answer_category_id}")
+def delete_standard_answer_category(
+    standard_answer_category_id: int,
+    db_session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+) -> None:
+    remove_standard_answer_category(
+        standard_answer_category_id=standard_answer_category_id,
+        db_session=db_session,
+    )

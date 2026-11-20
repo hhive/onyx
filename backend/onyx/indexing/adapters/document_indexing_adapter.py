@@ -1,31 +1,47 @@
 import contextlib
+import time
 from collections.abc import Generator
 
 from sqlalchemy.orm import Session
 
 from onyx.access.access import get_access_for_documents
 from onyx.access.models import DocumentAccess
-from onyx.configs.constants import DEFAULT_BOOST
-from onyx.connectors.models import Document
-from onyx.connectors.models import IndexAttemptMetadata
+from onyx.configs.constants import DEFAULT_BOOST, DocumentSource
+from onyx.connectors.models import Document, IndexAttemptMetadata
 from onyx.db.chunk import update_chunk_boost_components__no_commit
-from onyx.db.document import fetch_chunk_counts_for_documents
-from onyx.db.document import mark_document_as_indexed_for_cc_pair__no_commit
-from onyx.db.document import prepare_to_modify_documents
-from onyx.db.document import update_docs_chunk_count__no_commit
-from onyx.db.document import update_docs_last_modified__no_commit
-from onyx.db.document import update_docs_updated_at__no_commit
+from onyx.db.document import (
+    fetch_chunk_counts_for_documents,
+    get_cc_pair_ids_for_documents,
+    get_document_source_types,
+    mark_document_as_indexed_for_cc_pair__no_commit,
+    prepare_to_modify_documents,
+    update_docs_chunk_count__no_commit,
+    update_docs_created_at__no_commit,
+    update_docs_last_modified__no_commit,
+    update_docs_updated_at__no_commit,
+)
 from onyx.db.document_set import fetch_document_sets_for_documents
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
-from onyx.indexing.indexing_pipeline import DocumentBatchPrepareContext
-from onyx.indexing.indexing_pipeline import index_doc_batch_prepare
-from onyx.indexing.models import ChunkEnrichmentContext
-from onyx.indexing.models import DocAwareChunk
-from onyx.indexing.models import DocMetadataAwareIndexChunk
-from onyx.indexing.models import IndexChunk
-from onyx.indexing.models import IndexingBatchAdapter
-from onyx.indexing.models import UpdatableChunkData
-from onyx.redis.redis_hierarchy import get_ancestors_from_raw_id
+from onyx.db.index_attempt_metrics import safe_record_single_event_if_set
+from onyx.db.index_attempt_metrics_models import IndexAttemptStage
+from onyx.indexing.indexing_pipeline import (
+    DocumentBatchPrepareContext,
+    index_doc_batch_prepare,
+)
+from onyx.indexing.models import (
+    ChunkEnrichmentContext,
+    DocAwareChunk,
+    DocMetadataAwareIndexChunk,
+    IndexChunk,
+    IndexingBatchAdapter,
+    UpdatableChunkData,
+)
+from onyx.redis.redis_hierarchy import (
+    get_ancestors_from_node_id,
+    get_ancestors_from_raw_id,
+)
+
+# no-direct-redis: allow hierarchy cache of the Celery indexing pipeline
 from onyx.redis.redis_pool import get_redis_client
 from onyx.utils.logger import setup_logger
 
@@ -37,7 +53,7 @@ class DocumentIndexingBatchAdapter(IndexingBatchAdapter):
 
     Keeps orchestration logic in the pipeline and side-effects in the adapter.
     Each phase opens its own short-lived session so no connection is held idle
-    during the long embedding and Vespa-write phases.
+    during the long embedding and document-index-write phases.
     """
 
     def __init__(
@@ -50,10 +66,19 @@ class DocumentIndexingBatchAdapter(IndexingBatchAdapter):
         self.connector_id = connector_id
         self.credential_id = credential_id
         self.tenant_id = tenant_id
-        self.index_attempt_metadata = index_attempt_metadata
+        self._index_attempt_metadata = index_attempt_metadata
+
+    @property
+    def index_attempt_metadata(self) -> IndexAttemptMetadata:
+        return self._index_attempt_metadata
 
     def prepare(
-        self, documents: list[Document], ignore_time_skip: bool
+        self,
+        documents: list[Document],
+        ignore_time_skip: bool,
+        index_to_secondary: bool,
+        force_update: bool = False,
+        skip_document_row_writes: bool = False,
     ) -> DocumentBatchPrepareContext | None:
         """Upsert docs, map CC pairs, return context or mark as indexed if no-op.
 
@@ -66,6 +91,9 @@ class DocumentIndexingBatchAdapter(IndexingBatchAdapter):
                 index_attempt_metadata=self.index_attempt_metadata,
                 db_session=db_session,
                 ignore_time_skip=ignore_time_skip,
+                index_to_secondary=index_to_secondary,
+                force_update=force_update,
+                skip_document_row_writes=skip_document_row_writes,
             )
 
             if not context:
@@ -94,6 +122,7 @@ class DocumentIndexingBatchAdapter(IndexingBatchAdapter):
             with prepare_to_modify_documents(
                 db_session=db_session,
                 document_ids=[doc.id for doc in documents],
+                index_attempt_id=self.index_attempt_metadata.attempt_id,
             ):
                 yield db_session
                 db_session.commit()
@@ -106,11 +135,10 @@ class DocumentIndexingBatchAdapter(IndexingBatchAdapter):
         db_session: Session,
     ) -> "DocumentChunkEnricher":
         """Do all DB lookups once and return a per-chunk enricher."""
+        _enrich_start = time.monotonic()
         updatable_ids = [doc.id for doc in context.updatable_docs]
 
-        doc_id_to_new_chunk_cnt: dict[str, int] = {
-            doc_id: 0 for doc_id in updatable_ids
-        }
+        doc_id_to_new_chunk_cnt: dict[str, int] = dict.fromkeys(updatable_ids, 0)
         for chunk in chunks:
             if chunk.source_document.id in doc_id_to_new_chunk_cnt:
                 doc_id_to_new_chunk_cnt[chunk.source_document.id] += 1
@@ -123,31 +151,43 @@ class DocumentIndexingBatchAdapter(IndexingBatchAdapter):
             is_public=False,
         )
 
-        return DocumentChunkEnricher(
+        enricher = DocumentChunkEnricher(
             doc_id_to_access_info=get_access_for_documents(
                 document_ids=updatable_ids, db_session=db_session
             ),
-            doc_id_to_document_set={
-                document_id: document_sets
-                for document_id, document_sets in fetch_document_sets_for_documents(
+            doc_id_to_document_set=dict(
+                fetch_document_sets_for_documents(
                     document_ids=updatable_ids, db_session=db_session
                 )
-            },
+            ),
             doc_id_to_ancestor_ids=self._get_ancestor_ids_for_documents(
                 context.updatable_docs, tenant_id, db_session
             ),
+            doc_id_to_source_types=get_document_source_types(
+                db_session=db_session,
+                document_ids=updatable_ids,
+            ),
+            doc_id_to_cc_pair_ids=get_cc_pair_ids_for_documents(
+                db_session=db_session,
+                document_ids=updatable_ids,
+            ),
             id_to_boost_map=context.id_to_boost_map,
-            doc_id_to_previous_chunk_cnt={
-                document_id: chunk_count
-                for document_id, chunk_count in fetch_chunk_counts_for_documents(
+            doc_id_to_previous_chunk_cnt=dict(
+                fetch_chunk_counts_for_documents(
                     document_ids=updatable_ids,
                     db_session=db_session,
                 )
-            },
+            ),
             doc_id_to_new_chunk_cnt=dict(doc_id_to_new_chunk_cnt),
             no_access=no_access,
             tenant_id=tenant_id,
         )
+        safe_record_single_event_if_set(
+            IndexAttemptStage.ENRICHMENT_PREP,
+            self.index_attempt_metadata.attempt_id,
+            max(0, int((time.monotonic() - _enrich_start) * 1000)),
+        )
+        return enricher
 
     def _get_ancestor_ids_for_documents(
         self,
@@ -167,18 +207,33 @@ class DocumentIndexingBatchAdapter(IndexingBatchAdapter):
         if not documents:
             return {}
 
+        # no-direct-redis: allow hierarchy cache of the Celery indexing pipeline
         redis_client = get_redis_client(tenant_id=tenant_id)
         result: dict[str, list[int]] = {}
 
         for doc in documents:
-            # Use parent_hierarchy_raw_node_id directly from the document
-            # If None, get_ancestors_from_raw_id will return just the SOURCE node
-            ancestors = get_ancestors_from_raw_id(
-                redis_client=redis_client,
-                source=doc.source,
-                parent_hierarchy_raw_node_id=doc.parent_hierarchy_raw_node_id,
-                db_session=db_session,
-            )
+            # The raw id first: resolving it refreshes the cache on a miss,
+            # so it recovers an ancestry docfetching had to fall back on. Its
+            # fallback is the SOURCE node, which reads here as a document that
+            # really sits at the root. Only a document rebuilt from its stored
+            # row has no raw id, and that one carries the resolved id instead.
+            if (
+                doc.parent_hierarchy_raw_node_id is None
+                and doc.parent_hierarchy_node_id is not None
+            ):
+                ancestors = get_ancestors_from_node_id(
+                    redis_client=redis_client,
+                    source=doc.source,
+                    node_id=doc.parent_hierarchy_node_id,
+                    db_session=db_session,
+                )
+            else:
+                ancestors = get_ancestors_from_raw_id(
+                    redis_client=redis_client,
+                    source=doc.source,
+                    parent_hierarchy_raw_node_id=doc.parent_hierarchy_raw_node_id,
+                    db_session=db_session,
+                )
             result[doc.id] = ancestors
 
         return result
@@ -190,29 +245,51 @@ class DocumentIndexingBatchAdapter(IndexingBatchAdapter):
         filtered_documents: list[Document],
         enrichment: ChunkEnrichmentContext,
         db_session: Session,
+        index_to_secondary: bool,
+        failed_document_ids: set[str],
     ) -> None:
         """Finalize DB updates, store plaintext, and mark docs as indexed."""
         updatable_ids = [doc.id for doc in context.updatable_docs]
         last_modified_ids = []
         ids_to_new_updated_at = {}
+        ids_to_new_created_at = {}
         for doc in context.updatable_docs:
             last_modified_ids.append(doc.id)
             # doc_updated_at is the source's idea (on the other end of the connector)
-            # of when the doc was last modified
-            if doc.doc_updated_at is None:
-                continue
-            ids_to_new_updated_at[doc.id] = doc.doc_updated_at
+            # of when the doc was last modified. It marks the version in the
+            # PRESENT index, so a failed write keeps the old one and is
+            # retried, and a FUTURE write does not set it: a FUTURE attempt
+            # that fails before the swap leaves PRESENT with the old version.
+            if (
+                doc.doc_updated_at is not None
+                and doc.id not in failed_document_ids
+                and not index_to_secondary
+            ):
+                ids_to_new_updated_at[doc.id] = doc.doc_updated_at
+            # doc_created_at is written to the index on this path; persist it so the
+            # DB reflects that this doc's creation time is collected (the backfill
+            # sweep keys off doc_created_at IS NULL).
+            if doc.doc_created_at is not None:
+                ids_to_new_created_at[doc.id] = doc.doc_created_at
 
         update_docs_updated_at__no_commit(
             ids_to_new_updated_at=ids_to_new_updated_at, db_session=db_session
+        )
+
+        update_docs_created_at__no_commit(
+            ids_to_new_created_at=ids_to_new_created_at, db_session=db_session
         )
 
         update_docs_last_modified__no_commit(
             document_ids=last_modified_ids, db_session=db_session
         )
 
+        # Only for documents the index actually took. A failed write left the
+        # old chunks in place, so committing the new count would describe an
+        # index state that does not exist - the same reason the content hash
+        # below is written only for confirmed writes.
         update_docs_chunk_count__no_commit(
-            document_ids=updatable_ids,
+            document_ids=[i for i in updatable_ids if i not in failed_document_ids],
             doc_id_to_chunk_count=enrichment.doc_id_to_new_chunk_cnt,
             db_session=db_session,
         )
@@ -243,6 +320,8 @@ class DocumentChunkEnricher:
         doc_id_to_access_info: dict[str, DocumentAccess],
         doc_id_to_document_set: dict[str, list[str]],
         doc_id_to_ancestor_ids: dict[str, list[int]],
+        doc_id_to_source_types: dict[str, tuple[DocumentSource, ...]],
+        doc_id_to_cc_pair_ids: dict[str, list[int]],
         id_to_boost_map: dict[str, int],
         doc_id_to_previous_chunk_cnt: dict[str, int],
         doc_id_to_new_chunk_cnt: dict[str, int],
@@ -252,6 +331,8 @@ class DocumentChunkEnricher:
         self._doc_id_to_access_info = doc_id_to_access_info
         self._doc_id_to_document_set = doc_id_to_document_set
         self._doc_id_to_ancestor_ids = doc_id_to_ancestor_ids
+        self._doc_id_to_source_types = doc_id_to_source_types
+        self._doc_id_to_cc_pair_ids = doc_id_to_cc_pair_ids
         self._id_to_boost_map = id_to_boost_map
         self._no_access = no_access
         self._tenant_id = tenant_id
@@ -281,4 +362,9 @@ class DocumentChunkEnricher:
             ancestor_hierarchy_node_ids=self._doc_id_to_ancestor_ids[
                 chunk.source_document.id
             ],
+            source_types=self._doc_id_to_source_types.get(
+                chunk.source_document.id,
+                (chunk.source_document.source,),
+            ),
+            cc_pair_ids=self._doc_id_to_cc_pair_ids.get(chunk.source_document.id),
         )
